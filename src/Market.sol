@@ -2,12 +2,12 @@
 pragma solidity ^0.8.30;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IOptionsEngine, OptionType, Side} from "./interfaces/IOptionsEngine.sol";
+import {IMarket, OptionType, Side} from "./interfaces/IMarket.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-struct Market {
+struct Cycle {
   bool active;
   bool isSettled;
   uint256 strike;
@@ -15,7 +15,7 @@ struct Market {
 }
 
 struct Order {
-  uint256 marketId;
+  uint256 cycleId;
   address trader;
   OptionType option;
   Side side;
@@ -25,27 +25,27 @@ struct Order {
   uint256 timestamp;
 }
 
-contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
+contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
 
   string public name;
-  uint256 public activeMarket;
+  uint256 public activeCycle;
 
   address public priceOracle;
   IERC20  public collateralToken;
 
   mapping(uint256 => mapping(uint256 => Order))   public orders;
-  mapping(uint256 => Market)                      public markets;
+  mapping(uint256 => Cycle)                      public cycles;
   mapping(address => uint256)                     public balances;
   mapping(uint256 => mapping(address => uint256)) public lockedCollateral;
 
-  event MarketStarted(uint256 expiry, uint256 strike);
-  event MarketSettled(uint256 marketId);
+  event CycleStarted(uint256 expiry, uint256 strike);
+  event CycleSettled(uint256 cycleId);
 
   event CollateralDeposited(address trader, uint256 amount);
   event CollateralWithdrawn(address trader, uint256 amount);
 
   event OrderPlaced(
-    uint256 marketId,
+    uint256 cycleId,
     uint256 orderId,
     address trader,
     uint256 size,
@@ -53,7 +53,7 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
   );
 
   event Liquidated(
-    uint256 marketId,
+    uint256 cycleId,
     uint256 orderId,
     address trader,
     uint256 collateral,
@@ -62,8 +62,8 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
 
   // Less gas efficient, easier to debug
   string constant INVALID_ORACLE_PRICE = "0";
-  string constant MARKET_ALREADY_STARTED = "1";
-  string constant PREVIOUS_MARKET_NOT_SETTLED = "2";
+  string constant CYCLE_ALREADY_STARTED = "1";
+  string constant PREVIOUS_CYCLE_NOT_SETTLED = "2";
   string constant INVALID_AMOUNT = "3";
   string constant INSUFFICIENT_BALANCE = "4";
 
@@ -85,13 +85,13 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     collateralToken = IERC20(_collateralToken);
   }
   
-  function startMarket(uint256 expiry) external onlyOwner {
-    if (activeMarket != 0) {
-      // If there is an active market, it must be in the past
-      require(activeMarket < block.timestamp, MARKET_ALREADY_STARTED);
+  function startCycle(uint256 expiry) external onlyOwner {
+    if (activeCycle != 0) {
+      // If there is an active cycle, it must be in the past
+      require(activeCycle < block.timestamp, CYCLE_ALREADY_STARTED);
 
-      // The previous market must be settled
-      require(markets[activeMarket].isSettled, PREVIOUS_MARKET_NOT_SETTLED);
+      // The previous cycle must be settled
+      require(cycles[activeCycle].isSettled, PREVIOUS_CYCLE_NOT_SETTLED);
     }
 
     //(, int256 price, , , ) = AggregatorV3Interface(priceOracle).latestRoundData();
@@ -99,7 +99,7 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     require(price > 0, INVALID_ORACLE_PRICE);
     
     // Create new market
-    markets[expiry] = Market({
+    cycles[expiry] = Cycle({
       active: true,
       isSettled: false,
       strike: uint256(price),
@@ -107,9 +107,9 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     });
     
     // Set as current market
-    activeMarket = expiry;
+    activeCycle = expiry;
     
-    emit MarketStarted(expiry, uint256(price));
+    emit CycleStarted(expiry, uint256(price));
   }
   
   function depositCollateral(uint256 amount) external {
@@ -130,7 +130,7 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     require(amount > 0, INVALID_AMOUNT);
 
     address trader = _msgSender();
-    uint256 balance = balances[trader] - lockedCollateral[activeMarket][trader];
+    uint256 balance = balances[trader] - lockedCollateral[activeCycle][trader];
 
     require(balance >= amount, INSUFFICIENT_BALANCE);
     
@@ -144,7 +144,7 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
   }
   
   function placeOrder(
-    uint256 marketId,
+    uint256 cycleId,
     OptionType option,
     Side side,
     uint256 size,
@@ -153,11 +153,11 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     
   }
   
-  function cancelOrder(uint256 marketId, uint256 orderId) external {
+  function cancelOrder(uint256 cycleId, uint256 orderId) external {
     
   }
   
-  function matchOrders(uint256 marketId) external {
+  function matchOrders(uint256 cycleId) external {
     
   }
   
@@ -165,7 +165,7 @@ contract OptionsEngine is IOptionsEngine, UUPSUpgradeable, OwnableUpgradeable, P
     
   }
   
-  function settle(uint256 marketId) external {
+  function settle(uint256 cycleId) external {
     
   }
   

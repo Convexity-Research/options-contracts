@@ -16,6 +16,7 @@ contract MarketTest is Test {
   Token public collateralToken;
 
   address user1 = makeAddr("user1");
+  address feeRecipient = makeAddr("feeRecipient");
 
   function setUp() public {
     // Deploy implementation contract
@@ -25,7 +26,7 @@ contract MarketTest is Test {
 
     // Prepare initialization data
     bytes memory initData =
-      abi.encodeWithSelector(Market.initialize.selector, "BTC", ORACLE_FEED, address(collateralToken));
+      abi.encodeWithSelector(Market.initialize.selector, "BTC", feeRecipient, ORACLE_FEED, address(collateralToken));
 
     // Deploy proxy contract
     ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
@@ -38,16 +39,9 @@ contract MarketTest is Test {
 
   function testDepositCollateral() public {
     // Setup
-    uint256 amount = 1000;
+    uint256 amount = 10 ether;
 
-    // Mint tokens to user
-    collateralToken.mint(user1, amount); // Make sure your token has a mint function
-
-    // Check initial balances
-    assertEq(collateralToken.balanceOf(user1), amount);
-    assertEq(market.balances(user1), 0);
-
-    // Approve market to spend tokens
+    deal(address(collateralToken), user1, amount);
     vm.startPrank(user1);
     collateralToken.approve(address(market), amount);
 

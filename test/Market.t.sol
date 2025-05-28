@@ -4,16 +4,19 @@ pragma solidity ^0.8.13;
 import {Test, console} from "forge-std/Test.sol";
 import {Market} from "../src/Market.sol";
 import {OptionType, Side} from "../src/interfaces/IMarket.sol";
+import {BitScan} from "../src/lib/Bitscan.sol";
 import {Token} from "./mocks/Token.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract MarketTest is Test {
+  using BitScan for uint256;
+
   Market public market;
 
   address public constant ORACLE_FEED = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
-  Token public collateralToken;
+  Token public collateralToken; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
 
   address user1 = makeAddr("user1");
   address feeRecipient = makeAddr("feeRecipient");
@@ -38,7 +41,6 @@ contract MarketTest is Test {
   }
 
   function testDepositCollateral() public {
-    // Setup
     uint256 amount = 10 ether;
 
     deal(address(collateralToken), user1, amount);
@@ -53,5 +55,51 @@ contract MarketTest is Test {
     assertEq(collateralToken.balanceOf(user1), 0);
     assertEq(collateralToken.balanceOf(address(market)), amount);
     assertEq(market.balances(user1), amount);
+  }
+
+  function testPlaceLimitOrder() public {
+    uint256 size = 100; // contracts
+    uint256 price6 = 1_000_000; // 1.00 USDC in 6-dec
+
+    // fund + deposit (unchanged)
+    uint256 quote = 10_000_000; // 10 USDC collateral
+    deal(address(collateralToken), user1, quote);
+    vm.prank(user1);
+    collateralToken.approve(address(market), quote);
+    vm.prank(user1);
+    market.depositCollateral(quote);
+
+    // place limit
+    vm.prank(user1);
+    uint256 nodeId = market.placeOrder(
+      OptionType.CALL,
+      Side.BUY,
+      size,
+      price6 // 6-dec premium
+    );
+
+    // assertions
+    uint32 tick = _tick(price6); // 100
+    uint32 key = _key(tick, false, true);
+
+    (uint128 vol,,) = market.levels(key);
+
+    console.log("nodeId", nodeId);
+    assertEq(nodeId, 1, "nodeId");
+    assertEq(vol, size, "level vol");
+
+    // bitmap summary bit
+    (uint8 l1,,) = BitScan.split(tick);
+
+    uint8 ix = 1; // 0 = CallAsk, 1 = CallBid, 2 = PutAsk, 3 = PutBid
+    assertEq(market.summaries(ix) & BitScan.mask(l1), BitScan.mask(l1));
+  }
+
+  function _tick(uint256 price) internal pure returns (uint32) {
+    return uint32(price / 1e4); // TICK_SZ = 1e4 in contract
+  }
+
+  function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
+    return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 }

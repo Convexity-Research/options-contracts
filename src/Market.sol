@@ -9,11 +9,13 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
+import "forge-std/console.sol";
+
 contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
-  uint256 private constant TICK_SZ = 1e4; // 0.01 USDC → 10 000 wei (6-decimals)
+  uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
   string public name;
   address public priceOracle;
   IERC20 public collateralToken;
@@ -36,21 +38,18 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   uint256 public cursor; // settlement iterator
 
   //------- Orderbook -------
-  mapping(uint32 => Level) levels; // tickKey ⇒ Level
-  mapping(uint16 => Maker) makerQ; // nodeId  ⇒ Maker
+  mapping(uint32 => Level) public levels; // tickKey ⇒ Level
+  mapping(uint16 => Maker) public makerQ; // nodeId  ⇒ Maker
   uint16 nodePtr; // auto-increment id for makers
 
   // summary (L1): which [256*256] blocks have liquidity
-  uint256 summaryCB;
-  uint256 summaryCA;
-  uint256 summaryPB;
-  uint256 summaryPA;
+  uint256[4] public summaries;
 
   // mid (L2): which [256] block has liquidity
-  mapping(uint8 => uint256) midCB;
-  mapping(uint8 => uint256) midCA;
-  mapping(uint8 => uint256) midPB;
-  mapping(uint8 => uint256) midPA;
+  mapping(uint8 => uint256) public midCB;
+  mapping(uint8 => uint256) public midCA;
+  mapping(uint8 => uint256) public midPB;
+  mapping(uint8 => uint256) public midPA;
 
   // detail (L3): which tick has liquidity
   mapping(uint16 => uint256) detCB;
@@ -151,26 +150,43 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint256 size,
     uint256 limitPrice // 0 = market
   ) external returns (uint256 orderId) {
-    uint256 cycleId = activeCycle;
     require(size > 0, Errors.INVALID_AMOUNT);
+    uint256 cycleId = activeCycle;
 
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
 
+    // Convert price  to tick
+    uint32 tick = limitPrice == 0
+      ? 0 // dummy (market)
+      : uint32(limitPrice / TICK_SZ); // 1 tick = 0.01 USDT
+
+    // Market order
     if (limitPrice == 0) {
-      _marketOrder(isBuy, isPut, uint128(size));
+      uint128 unfilled = _marketOrder(isBuy, isPut, uint128(size));
+
+      if (unfilled > 0) {
+        // TODO: Decide if we want to place remaining as limit order or not
+      }
       emit OrderPlaced(cycleId, 0, msg.sender, size, 0);
       return 0;
     }
 
-    uint32 tick = uint32(limitPrice / TICK_SZ);
+    // If opposite side has liquidity and price is crossing
+    uint256 oppSummary = summaries[_summaryIx(!isBuy, isPut)];
 
-    // Check if the order is better than the best order on the opposite side. Treat as market order if it is.
-    (uint32 oppBest,) = _best(!isBuy, isPut);
-    if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-      _marketOrder(isBuy, isPut, uint128(size)); // taker path
-      emit OrderPlaced(cycleId, 0, msg.sender, size, 0);
-      return 0;
+    if (oppSummary != 0) {
+      (uint32 oppBest,) = _best(!isBuy, isPut);
+
+      // If our limit crosses the spread, act as market order
+      if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
+        uint128 leftover = _marketOrder(isBuy, isPut, uint128(size));
+
+        // Decide if we want to place remaining as limit order or not
+
+        emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice);
+        return 0;
+      }
     }
 
     orderId = _insertLimit(isBuy, isPut, tick, uint128(size));
@@ -187,7 +203,12 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   function updateFees(uint16 makerFee, uint16 takerFee) external onlyOwner {}
 
-  // ################## Internal bit manipulation helpers ##################
+  // #######################################################################
+  // #                                                                     #
+  // #                  Internal bit helpers                               #
+  // #                                                                     #
+  // #######################################################################
+
   // Convert tick, isPut, isBid to key
   function _key(uint32 tick, bool isPut, bool isBid) private pure returns (uint32) {
     return (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0) | tick;
@@ -198,36 +219,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     isPut = (key & (1 << 31)) != 0;
     isBid = (key & (1 << 30)) != 0;
     tick = key & 0x3FFF_FFFF;
-  }
-
-  // Returns which of the 4 orderbook sides to use
-  function _maps(bool isBid, bool isPut)
-    private
-    view
-    returns (uint256 summary, mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det)
-  {
-    if (isBid) {
-      if (isPut) {
-        summary = summaryPB;
-        mid = midPB;
-        det = detPB;
-      } else {
-        summary = summaryCB;
-        mid = midCB;
-        det = detCB;
-      }
-    } else {
-      // asks
-      if (isPut) {
-        summary = summaryPA;
-        mid = midPA;
-        det = detPA;
-      } else {
-        summary = summaryCA;
-        mid = midCA;
-        det = detCA;
-      }
-    }
   }
 
   /**
@@ -294,8 +285,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   // Returns the best tick and key for the given side and option type
   function _best(bool isBid, bool isPut) private view returns (uint32 tick, uint32 key) {
-    (uint256 summary, mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) =
-      _maps(isBid, isPut);
+    uint256 summary = summaries[_summaryIx(isBid, isPut)];
+    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
 
     uint8 l1 = isBid ? summary.msb() : summary.lsb();
     uint8 l2 = isBid ? mid[l1].msb() : mid[l1].lsb();
@@ -306,11 +297,30 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     key = _key(tick, isPut, isBid);
   }
 
-  // ################## Internal orderbook helpers ##################
+  // Add bit to summary bitmap
+  function _sumAddBit(bool isBid, bool isPut, uint8 l1) internal {
+    summaries[_summaryIx(isBid, isPut)] |= BitScan.mask(l1);
+  }
+
+  // Clear bit from summary bitmap
+  function _sumClrBit(bool isBid, bool isPut, uint8 l1) internal {
+    summaries[_summaryIx(isBid, isPut)] &= ~BitScan.mask(l1);
+  }
+
+  // Get summary index
+  function _summaryIx(bool isBid, bool isPut) internal pure returns (uint8) {
+    return (isBid ? 1 : 0) | ((isPut ? 1 : 0) << 1); // 0-3
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                  Internal orderbook helpers                         #
+  // #                                                                     #
+  // #######################################################################
+
   function _insertLimit(bool isBuy, bool isPut, uint32 tick, uint128 size) private returns (uint16 nodeId) {
     // pick the right bitmap ladders
-    (uint256 summary, mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) =
-      _maps(isBuy, isPut);
+    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBuy, isPut);
 
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
@@ -319,7 +329,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     // if level empty, set bitmap bits
     if (levels[key].vol == 0) {
       bool firstInL1 = _addBits(det, mid, l1, l2, l3);
-      if (firstInL1) summary |= BitScan.mask(l1);
+      if (firstInL1) _sumAddBit(isBuy, isPut, l1);
     }
 
     // maker node
@@ -330,6 +340,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     if (levels[key].vol == 0) levels[key].head = nodeId;
     else makerQ[levels[key].tail].next = nodeId;
     levels[key].tail = nodeId;
+    console.logBytes32(bytes4(key));
     levels[key].vol += size;
 
     // position table
@@ -343,9 +354,40 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     else isBuy ? P.longCalls += uint96(size) : P.shortCalls += uint96(size);
   }
 
-  function _marketOrder(bool isBuy, bool isPut, uint128 size) private {
+  function _marketOrder(bool isBuy, bool isPut, uint128 size) private returns (uint128) {
     // TODO: Implement market order logic
   }
+
+  // Return the two bitmap ladders for the given side.
+  function _maps(bool isBid, bool isPut)
+    private
+    view
+    returns (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det)
+  {
+    if (isBid) {
+      if (isPut) {
+        mid = midPB;
+        det = detPB;
+      } else {
+        mid = midCB;
+        det = detCB;
+      }
+    } else {
+      if (isPut) {
+        mid = midPA;
+        det = detPA;
+      } else {
+        mid = midCA;
+        det = detCA;
+      }
+    }
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                  Admin functions                                    #
+  // #                                                                     #
+  // #######################################################################
 
   function pause() external override onlyOwner {
     _pause();

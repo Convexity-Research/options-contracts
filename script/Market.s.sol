@@ -15,27 +15,19 @@ contract MarketScript is Script {
 
   function run() public {
     vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-    
+
     // Deploy implementation contract
     Market implementation = new Market();
-    
+
     // Prepare initialization data
-    bytes memory initData = abi.encodeWithSelector(
-      Market.initialize.selector,
-      "BTC",
-      ORACLE_FEED,
-      COLLATERAL_TOKEN
-    );
-    
+    bytes memory initData = abi.encodeWithSelector(Market.initialize.selector, "BTC", ORACLE_FEED, COLLATERAL_TOKEN);
+
     // Deploy proxy contract
-    ERC1967Proxy proxy = new ERC1967Proxy(
-      address(implementation),
-      initData
-    );
-    
+    ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+
     // Cast proxy to Market interface
     market = Market(address(proxy));
-    
+
     vm.stopBroadcast();
   }
 }

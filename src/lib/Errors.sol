@@ -8,4 +8,6 @@ library Errors {
   string constant INVALID_AMOUNT = "INVALID_AMOUNT";
   string constant INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE";
   string constant NOT_OWNER = "NOT_OWNER";
+  string constant NOT_WHITELISTED = "NOT_WHITELISTED";
+  string constant INVALID_SIGNATURE = "INVALID_SIGNATURE";
 }

@@ -69,7 +69,7 @@ contract MarketSuite is Test {
     (uint128 vol,,) = mkt.levels(key);
     assertEq(vol, LOT, "level vol mismatch");
     assertEq(id, 1, "first maker id");
-    
+
     // Test summary (L1) bitmap - l1 is 0, so bit 0 should be set. Which means value of 1
     uint8 sid = 1; // CallBid bucket
     assertEq(mkt.summaries(sid), 1, "summary bit not set correctly");
@@ -88,14 +88,14 @@ contract MarketSuite is Test {
     _fund(u1, 1000 * ONE_COIN);
 
     uint256 price = 700_000_000; // 700 USDT0
-    uint32 expectedTick = 70000;  // 700_000_000 / 10000
+    uint32 expectedTick = 70000; // 700_000_000 / 10000
 
     vm.prank(u1);
     uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price);
 
     uint32 tick = _tick(price);
     assertEq(tick, expectedTick, "tick calculation incorrect");
-    
+
     uint32 key = _key(tick, false, true); // CALL-BID
 
     // Test level volume
@@ -119,7 +119,7 @@ contract MarketSuite is Test {
 
   function testMultipleOrdersAtDifferentPriceLevels() public {
     _fund(u1, 1000 * ONE_COIN);
-    
+
     uint256[] memory prices = new uint256[](3);
     uint8[] memory l1s = new uint8[](3);
     uint8[] memory l2s = new uint8[](3);
@@ -145,13 +145,13 @@ contract MarketSuite is Test {
     l3s[2] = 160;
 
     // Place all orders
-    for (uint i = 0; i < prices.length; i++) {
+    for (uint256 i = 0; i < prices.length; i++) {
       vm.prank(u1);
       mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, prices[i]);
     }
 
     // Check each order's bits individually
-    for (uint i = 0; i < prices.length; i++) {
+    for (uint256 i = 0; i < prices.length; i++) {
       uint32 tick = _tick(prices[i]);
       // Log the high, mid, low bytes of the tick to double check which bits SHOULD be set
       // (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
@@ -160,23 +160,14 @@ contract MarketSuite is Test {
       // console.log("l2 (mid byte):", l2, "in binary:", vm.toString(bytes32(uint256(l2))));
       // console.log("l3 (low byte):", l3, "in binary:", vm.toString(bytes32(uint256(l3))));
 
-      assertTrue(
-        (mkt.summaries(1) & (1 << l1s[i])) != 0,
-        "summary bit not set"
-      );
+      assertTrue((mkt.summaries(1) & (1 << l1s[i])) != 0, "summary bit not set");
 
       // Mid bitmap check - should have its bit set in the correct word
-      assertTrue(
-        (mkt.midCB(l1s[i]) & (1 << l2s[i])) != 0,
-        "mid bit not set"
-      );
+      assertTrue((mkt.midCB(l1s[i]) & (1 << l2s[i])) != 0, "mid bit not set");
 
       // Detail bitmap check - should have its bit set in the correct word
       uint16 detKey = (uint16(l1s[i]) << 8) | l2s[i];
-      assertTrue(
-        (mkt.detCB(detKey) & (1 << l3s[i])) != 0,
-        "detail bit not set"
-      );
+      assertTrue((mkt.detCB(detKey) & (1 << l3s[i])) != 0, "detail bit not set");
 
       // Level check - should have correct volume
       uint32 key = _key(tick, false, true);
@@ -187,7 +178,7 @@ contract MarketSuite is Test {
     // Visual check
     _printBook(true, false);
   }
-  
+
   // #######################################################################
   // #                                                                     #
   // #                        2. Maker <-> Taker match                     #
@@ -196,7 +187,7 @@ contract MarketSuite is Test {
 
   function testCrossAtSameTick() public {
     // Maker (u1) posts bid
-    _fund(u1, 1);
+    _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
     mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, ONE_COIN);
 
@@ -269,7 +260,7 @@ contract MarketSuite is Test {
     assertEq(qBefore.length, 1); // 1 queued
     assertEq(qBefore[0].size, 120);
 
-    // Maker comes with limit Sell 200 @ $1 
+    // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
     mkt.placeOrder(OptionType.PUT, Side.SELL, 200, ONE_COIN);
@@ -306,7 +297,7 @@ contract MarketSuite is Test {
   function testBitscan(uint256 bit) public pure {
     vm.assume(bit < 256);
     assert(BitScan.msb(1) == 0); // bit-0 set
-    // Check that msb returns the correct index 
+    // Check that msb returns the correct index
     assert(BitScan.msb(1 << bit) == bit);
   }
 
@@ -337,12 +328,9 @@ contract MarketSuite is Test {
 
     console.log("\n");
     console.log("============================================");
-    console.log("              %s %s                ", 
-      isPut ? "PUT" : "CALL", 
-      isBid ? "BIDS" : "ASKS"
-    );
+    console.log("              %s %s                ", isPut ? "PUT" : "CALL", isBid ? "BIDS" : "ASKS");
     console.log("============================================");
-    
+
     if (book.length == 0) {
       console.log("            [Empty Book]");
       console.log("============================================\n");
@@ -351,14 +339,10 @@ contract MarketSuite is Test {
 
     console.log("Tick\t\tPrice(6dp)\tVolume");
     console.log("----\t\t----------\t------");
-    
+
     for (uint256 i; i < book.length; ++i) {
       uint256 price6 = uint256(book[i].tick) * 1e4;
-      console.log("%d\t\t%d\t\t%d", 
-        book[i].tick,
-        price6,
-        book[i].vol
-      );
+      console.log("%d\t\t%d\t\t%d", book[i].tick, price6, book[i].vol);
     }
     console.log("============================================\n");
   }

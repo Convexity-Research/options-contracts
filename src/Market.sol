@@ -23,6 +23,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
   int16 public constant makerFeeBps = 10; // +0.10 %, basis points
   int16 public constant takerFeeBps = -40; // –0.40 %, basis points
+  int16 public constant denominator = 10_000;
   string public name;
   address public priceOracle;
   IERC20 public collateralToken;
@@ -404,24 +405,28 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   function _settleFill(
     bool takerIsBuy,
     bool isPut,
-    uint256 price, // 6-decimals
-    uint128 size, // contracts
+    uint256 price, // 6 decimals
+    uint128 size,
     address taker,
     address maker
   ) internal {
-    // Fees accounting
-    int256 premium = int256(price) * int256(uint256(size)); // always +ve
-    int256 makerFee = premium * makerFeeBps / 10_000; // Can be +ve or -ve
-    int256 takerFee = premium * takerFeeBps / 10_000; // Can be +ve or -ve
+    int256 amount = int256(price) * int256(uint256(size)); // always +ve
 
-    int256 cashMaker = premium + makerFee; // maker receives premium
-    int256 cashTaker = -premium + takerFee; // taker pays premium
+    // signed direction: +1 when taker buys, -1 when taker sells
+    int256 dir = takerIsBuy ? int256(1) : int256(-1);
+
+    int256 makerFee = amount * makerFeeBps / denominator;
+    int256 takerFee = amount * takerFeeBps / denominator;
+
+    // flip premium flow with dir
+    int256 cashMaker = dir * amount + makerFee;
+    int256 cashTaker = -dir * amount + takerFee;
 
     _applyCashDelta(maker, cashMaker);
     _applyCashDelta(taker, cashTaker);
 
-    int256 feeHouse = -(makerFee + takerFee); // net to house
-    if (feeHouse != 0) _applyCashDelta(feeRecipient, feeHouse);
+    int256 houseFee = -(makerFee + takerFee); // net to fee recipient
+    if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
 
     // Position acounting
     Pos storage PM = positions[activeCycle | uint256(uint160(maker))];

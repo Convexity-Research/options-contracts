@@ -8,4 +8,5 @@ library Errors {
   string constant INVALID_AMOUNT = "INVALID_AMOUNT";
   string constant INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE";
   string constant NOT_OWNER = "NOT_OWNER";
+  string constant ORACLE_PRICE_CALL_FAILED = "ORACLE_PRICE_CALL_FAILED";
 }

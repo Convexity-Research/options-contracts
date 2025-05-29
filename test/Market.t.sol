@@ -30,7 +30,7 @@ contract MarketSuite is Test {
     mkt = MarketTest(
       address(
         new ERC1967Proxy(
-          address(new Market()), abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt))
+          address(new MarketTest()), abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt))
         )
       )
     );

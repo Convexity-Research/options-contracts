@@ -449,6 +449,15 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
         PM.longCalls += uint96(size);
       }
     }
+
+    emit Trade(
+      uint32(price / TICK_SZ),  // convert price back to tick
+      takerIsBuy,               // isBuy from taker's perspective
+      isPut,
+      size,
+      taker,
+      maker
+    );
   }
 
   /**

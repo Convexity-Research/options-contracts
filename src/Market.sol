@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
-import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side} from "./interfaces/IMarket.sol";
+import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -11,17 +11,22 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 
 import "forge-std/console.sol";
 
+struct OBLevel {
+  uint32 tick; // raw tick
+  uint128 vol; // resting contracts at that tick
+}
+
 contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
   uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
+  int16 public constant makerFeeBps = 10; // +0.10 %, basis points
+  int16 public constant takerFeeBps = -40; // –0.40 %, basis points
   string public name;
   address public priceOracle;
   IERC20 public collateralToken;
-  int16 public makerFeeBps = 10; // +0.10 %, basis points
-  int16 public takerFeeBps = -40; // –0.40 %, basis points
-  address public feeRecipient; //
+  address public feeRecipient;
 
   //------- Vault -------
   mapping(address => uint256) public balances;
@@ -32,10 +37,14 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   mapping(uint256 => Cycle) public cycles;
 
   //------- Trading/Positions -------
+
   address[] public traders;
   mapping(uint256 => Pos) public positions;
   mapping(address => bool) public inList;
   uint256 public cursor; // settlement iterator
+
+  TakerQ[][2][2] private takerQ; // 4 buckets
+  uint256[2][2] private tqHead; // cursor per bucket
 
   //------- Orderbook -------
   mapping(uint32 => Level) public levels; // tickKey ⇒ Level
@@ -156,52 +165,59 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
 
-    // Convert price  to tick
+    console.log("isPut", isPut);
+    console.log("isBuy", isBuy);
+
+    // Convert price to tick
     uint32 tick = limitPrice == 0
       ? 0 // dummy (market)
-      : uint32(limitPrice / TICK_SZ); // 1 tick = 0.01 USDT
+      : uint32(limitPrice / TICK_SZ); // 1 tick = 0.01 USDT0
 
-    // Market order
+    console.log("limitPrice", limitPrice);
+    console.log("tick", tick);
+
+    // Limit price of 0 means market order
     if (limitPrice == 0) {
-      uint128 unfilled = _marketOrder(isBuy, isPut, uint128(size));
+      console.log("is market order");
+      _marketOrder(isBuy, isPut, uint128(size));
 
-      if (unfilled > 0) {
-        // TODO: Decide if we want to place remaining as limit order or not
-      }
       emit OrderPlaced(cycleId, 0, msg.sender, size, 0);
       return 0;
     }
 
-    // If opposite side has liquidity and price is crossing
+    // If opposite side has liquidity and price is crossing, then also treat as market order
     uint256 oppSummary = summaries[_summaryIx(!isBuy, isPut)];
 
     if (oppSummary != 0) {
+      console.log("oppSummary", oppSummary);
       (uint32 oppBest,) = _best(!isBuy, isPut);
 
-      // If our limit crosses the spread, act as market order
       if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        uint128 leftover = _marketOrder(isBuy, isPut, uint128(size));
-
-        // Decide if we want to place remaining as limit order or not
+        console.log("is crossing");
+        _marketOrder(isBuy, isPut, uint128(size));
 
         emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice);
         return 0;
       }
     }
 
-    orderId = _insertLimit(isBuy, isPut, tick, uint128(size));
-    emit OrderPlaced(cycleId, orderId, msg.sender, size, limitPrice);
+    // Is a limit order
+    uint128 qtyLeft = _matchQueuedTakers(isBuy, isPut, uint128(size), uint256(tick) * TICK_SZ);
+
+    if (qtyLeft == 0) {
+      emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice); // fully filled
+      return 0;
+    }
+
+    orderId = _insertLimit(isBuy, isPut, tick, qtyLeft);
+    emit OrderPlaced(cycleId, orderId, msg.sender, qtyLeft, limitPrice);
   }
 
   function cancelOrder(uint256 cycleId, uint256 orderId) external {}
 
-  function matchOrders(uint256 cycleId) external {}
-
   function liquidate(uint256 orderId, address trader) external {}
 
   function settle(uint256 cycleId) external {}
-
-  function updateFees(uint16 makerFee, uint16 takerFee) external onlyOwner {}
 
   // #######################################################################
   // #                                                                     #
@@ -211,7 +227,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   // Convert tick, isPut, isBid to key
   function _key(uint32 tick, bool isPut, bool isBid) private pure returns (uint32) {
-    return (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0) | tick;
+    return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 
   // Convert key to tick, isPut, isBid
@@ -286,24 +302,36 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   // Returns the best tick and key for the given side and option type
   function _best(bool isBid, bool isPut) private view returns (uint32 tick, uint32 key) {
     uint256 summary = summaries[_summaryIx(isBid, isPut)];
+    console.log("_best - Summary bitmap:", summary);
     (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
 
+    // For bids we want highest price (msb), for asks we want lowest price (lsb)
     uint8 l1 = isBid ? summary.msb() : summary.lsb();
+    console.log("_best - Using l1:", l1);
+    console.log("_best - Mid bitmap at l1:", mid[l1]);
+
+    // Same for l2 and l3
     uint8 l2 = isBid ? mid[l1].msb() : mid[l1].lsb();
+    console.log("_best - Found l2:", l2);
     uint16 k12 = (uint16(l1) << 8) | l2;
     uint8 l3 = isBid ? det[k12].msb() : det[k12].lsb();
+    console.log("_best - Found l3:", l3);
 
     tick = BitScan.join(l1, l2, l3);
     key = _key(tick, isPut, isBid);
+    console.log("_best - Final tick and key:", tick, key);
+    return (tick, key);
   }
 
   // Add bit to summary bitmap
   function _sumAddBit(bool isBid, bool isPut, uint8 l1) internal {
+    // Bitwise OR the mask with the summary bitmap, flipping that bit on
     summaries[_summaryIx(isBid, isPut)] |= BitScan.mask(l1);
   }
 
   // Clear bit from summary bitmap
   function _sumClrBit(bool isBid, bool isPut, uint8 l1) internal {
+    // Bitwise AND the inverse of the mask with the summary bitmap, flipping that bit off
     summaries[_summaryIx(isBid, isPut)] &= ~BitScan.mask(l1);
   }
 
@@ -324,13 +352,31 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+    console.log("l1", l1);
+    console.log("l2", l2);
+    console.log("l3", l3);
+    console.log("tick", tick);
     uint32 key = _key(tick, isPut, isBuy);
 
     // if level empty, set bitmap bits
     if (levels[key].vol == 0) {
       bool firstInL1 = _addBits(det, mid, l1, l2, l3);
+      console.log("asserting");
+      assert(mid[l1] & (1 << l2) != 0);
+      console.log("asserted");
+      
+      console.log("Summary bitmap:", summaries[_summaryIx(isBuy, isPut)]);
+      console.log("Mid bitmap for l1:", mid[l1]);
+      console.log("Looking at l1,l2,l3:", l1, l2, l3);
+      
       if (firstInL1) _sumAddBit(isBuy, isPut, l1);
+      
+      console.log("Summary after setting:", summaries[_summaryIx(isBuy, isPut)]);
     }
+
+    (uint32 bestTick, uint32 bestKey) = _best(isBuy, isPut);
+    console.log("bestTick", bestTick);
+    console.log("bestKey", bestKey);
 
     // maker node
     nodeId = ++nodePtr;
@@ -354,8 +400,184 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     else isBuy ? P.longCalls += uint96(size) : P.shortCalls += uint96(size);
   }
 
-  function _marketOrder(bool isBuy, bool isPut, uint128 size) private returns (uint128) {
-    // TODO: Implement market order logic
+  function _settleFill(
+    bool takerIsBuy,
+    bool isPut,
+    uint256 price, // 6-decimals
+    uint128 size, // contracts
+    address taker,
+    address maker
+  ) internal {
+    // Fees accounting
+    int256 premium = int256(price) * int256(uint256(size)); // always +ve
+    int256 makerFee = premium * makerFeeBps / 10_000; // Can be +ve or -ve
+    int256 takerFee = premium * takerFeeBps / 10_000; // Can be +ve or -ve
+
+    int256 cashMaker = premium + makerFee; // maker receives premium
+    int256 cashTaker = -premium + takerFee; // taker pays premium
+
+    _applyCashDelta(maker, cashMaker);
+    _applyCashDelta(taker, cashTaker);
+
+    int256 feeHouse = -(makerFee + takerFee); // net to house
+    if (feeHouse != 0) _applyCashDelta(feeRecipient, feeHouse);
+
+    // Position acounting
+    Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
+    Pos storage PT = positions[activeCycle | uint256(uint160(taker))];
+
+    if (isPut) {
+      if (takerIsBuy) {
+        PT.longPuts += uint96(size);
+        PM.shortPuts += uint96(size);
+      } else {
+        PT.shortPuts += uint96(size);
+        PM.longPuts += uint96(size);
+      }
+    } else {
+      if (takerIsBuy) {
+        PT.longCalls += uint96(size);
+        PM.shortCalls += uint96(size);
+      } else {
+        PT.shortCalls += uint96(size);
+        PM.longCalls += uint96(size);
+      }
+    }
+  }
+
+  /// @dev Fills against the opposite side until either a) qty exhausted, or b) book empty
+  function _marketOrder(bool isBuy, bool isPut, uint128 want) private {
+    uint128 left = want;
+
+    console.log("left", left);
+
+    while (left > 0) {
+      {
+        // Any liquidity left?
+        uint256 sumOpp = summaries[_summaryIx(!isBuy, isPut)];
+        console.log("sumOpp", sumOpp);
+        if (sumOpp == 0) break; // No bits set in summary means empty book
+      }
+
+      // Best price level
+      (uint32 bestTick, uint32 bestKey) = _best(!isBuy, isPut);
+      console.log("bestTick", bestTick);
+      console.log("bestKey", bestKey);
+      Level storage L = levels[bestKey];
+      uint16 node = L.head;
+
+      console.log("bestTick", bestTick);
+      console.log("bestKey", bestKey);
+      console.log("L.vol", L.vol);
+      console.log("L.head", L.head);
+      console.log("L.tail", L.tail);
+      console.log("marketOrder");
+      console.log("isBuy", isBuy);
+      console.log("isPut", isPut);
+      console.log("want", want);
+
+      // Walk FIFO makers at this tick
+      while (left > 0 && node != 0) {
+        Maker storage M = makerQ[node];
+
+        uint128 take = left < M.size ? left : M.size;
+        left -= take;
+        M.size -= take;
+        L.vol -= take;
+
+        _settleFill(
+          isBuy, // taker side
+          isPut,
+          uint256(bestTick) * TICK_SZ, // price
+          take,
+          msg.sender, // taker
+          M.trader // maker
+        );
+
+        if (M.size == 0) {
+          // Remove node from queue
+          uint16 nxt = M.next;
+          if (nxt == 0) L.tail = 0;
+          L.head = nxt;
+          delete makerQ[node];
+          node = nxt;
+        } else {
+          break; // Taker satisfied
+        }
+      }
+
+      // If price level empty, clear bitmaps
+      if (L.vol == 0) {
+        (uint32 tick,,) = _splitKey(bestKey);
+        (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+
+        // The opposite book
+        (mapping(uint8 => uint256) storage midOpp, mapping(uint16 => uint256) storage detOpp) = _maps(!isBuy, isPut);
+
+        // Clear bitmaps
+        bool lastInL1 = _clrBits(detOpp, midOpp, l1, l2, l3);
+        if (lastInL1) _sumClrBit(!isBuy, isPut, l1);
+
+        delete levels[bestKey];
+      }
+    }
+
+    if (left > 0) _queueTaker(isBuy, isPut, left, msg.sender);
+  }
+
+  function _queueTaker(bool isBuy, bool isPut, uint128 qty, address trader) private {
+    takerQ[isPut ? 1 : 0][isBuy ? 1 : 0].push(TakerQ({size: uint96(qty), trader: trader}));
+  }
+
+  function _matchQueuedTakers(
+    bool makerIsBid,
+    bool isPut,
+    uint128 makerSize,
+    uint256 price // maker's price, 6-dec
+  ) private returns (uint128 remainingMakerSize) {
+    console.log("matchQueuedTakers");
+    TakerQ[] storage Q = takerQ[isPut ? 1 : 0][makerIsBid ? 0 : 1];
+    uint256 i = tqHead[isPut ? 1 : 0][makerIsBid ? 0 : 1];
+
+    remainingMakerSize = makerSize;
+
+    console.log("Q.length", Q.length);
+    console.log("i", i);
+
+    while (remainingMakerSize > 0 && i < Q.length) {
+      TakerQ storage T = Q[i];
+      if (T.size == 0) {
+        ++i;
+        continue;
+      } // skip emptied slot
+
+      uint128 take = T.size > remainingMakerSize ? remainingMakerSize : T.size;
+      T.size -= uint96(take);
+      remainingMakerSize -= take;
+
+      _settleFill(
+        !makerIsBid, // same as takerIsBuy
+        isPut,
+        price,
+        take,
+        T.trader, // The (queued) taker
+        msg.sender // The maker
+      );
+
+      if (T.size == 0) ++i; // fully consumed
+    }
+    tqHead[isPut ? 1 : 0][makerIsBid ? 0 : 1] = i; // persist cursor
+  }
+
+  // Safely apply pnl
+  function _applyCashDelta(address user, int256 delta) private {
+    if (delta > 0) {
+      balances[user] += uint256(delta);
+    } else if (delta < 0) {
+      uint256 absVal = uint256(-delta);
+      require(balances[user] >= absVal, "INSUFFICIENT_BALANCE");
+      balances[user] -= absVal;
+    }
   }
 
   // Return the two bitmap ladders for the given side.
@@ -379,6 +601,72 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       } else {
         mid = midCA;
         det = detCA;
+      }
+    }
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                  View functions                                     #
+  // #                                                                     #
+  // #######################################################################
+
+  function viewTakerQueue(bool isBid, bool isPut) external view returns (TakerQ[] memory) {
+    return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
+  }
+
+  // Claude copy pasta. Remove this before deployment, only for visualizing during tests
+  function dumpBook(bool isBid, bool isPut) external view returns (OBLevel[] memory levels_) {
+    // ---------- Pass 1: how many live price-levels? ----------
+    uint256 levelCnt;
+    {
+      uint256 summary = summaries[_summaryIx(isBid, isPut)];
+      (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
+
+      uint256 s = summary;
+      while (s != 0) {
+        uint8 l1 = BitScan.lsb(s); // index of lowest-set bit
+        uint256 m = mid[l1];
+        while (m != 0) {
+          uint8 l2 = BitScan.lsb(m);
+          uint16 detKey = (uint16(l1) << 8) | l2;
+          uint256 d = det[detKey];
+          while (d != 0) {
+            ++levelCnt;
+            d &= d - 1; // clear lowest-set bit
+          }
+          m &= m - 1;
+        }
+        s &= s - 1;
+      }
+    }
+
+    // ---------- Pass 2: write the data ----------
+    levels_ = new OBLevel[](levelCnt);
+    {
+      uint256 idx;
+      uint256 summary = summaries[_summaryIx(isBid, isPut)];
+      (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
+
+      uint256 s = summary;
+      while (s != 0) {
+        uint8 l1 = BitScan.lsb(s);
+        uint256 m = mid[l1];
+        while (m != 0) {
+          uint8 l2 = BitScan.lsb(m);
+          uint16 detKey = (uint16(l1) << 8) | l2;
+          uint256 d = det[detKey];
+          while (d != 0) {
+            uint8 l3 = BitScan.lsb(d);
+            uint32 tick = BitScan.join(l1, l2, l3);
+            uint32 key = _key(tick, isPut, isBid);
+
+            levels_[idx++] = OBLevel({tick: tick, vol: levels[key].vol});
+            d &= d - 1;
+          }
+          m &= m - 1;
+        }
+        s &= s - 1;
       }
     }
   }

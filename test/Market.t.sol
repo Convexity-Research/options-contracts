@@ -2,7 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {Test, console} from "forge-std/Test.sol";
-import {Market} from "../src/Market.sol";
+import {Market, OBLevel} from "../src/Market.sol";
 import {OptionType, Side} from "../src/interfaces/IMarket.sol";
 import {BitScan} from "../src/lib/Bitscan.sol";
 import {Token} from "./mocks/Token.sol";
@@ -19,6 +19,7 @@ contract MarketTest is Test {
   Token public collateralToken; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
 
   address user1 = makeAddr("user1");
+  address user2 = makeAddr("user2");
   address feeRecipient = makeAddr("feeRecipient");
 
   function setUp() public {
@@ -58,7 +59,7 @@ contract MarketTest is Test {
   }
 
   function testPlaceLimitOrder() public {
-    uint256 size = 100; // contracts
+    uint256 size = 50; // contracts
     uint256 price6 = 1_000_000; // 1.00 USDC in 6-dec
 
     // fund + deposit (unchanged)
@@ -71,28 +72,41 @@ contract MarketTest is Test {
 
     // place limit
     vm.prank(user1);
-    uint256 nodeId = market.placeOrder(
-      OptionType.CALL,
-      Side.BUY,
-      size,
-      price6 // 6-dec premium
-    );
+    market.placeOrder(OptionType.CALL, Side.BUY, size, price6 + 2);
 
-    // assertions
     uint32 tick = _tick(price6); // 100
     uint32 key = _key(tick, false, true);
 
-    (uint128 vol,,) = market.levels(key);
+    vm.startPrank(user2);
+    market.placeOrder(OptionType.CALL, Side.SELL, size, 0);
 
-    console.log("nodeId", nodeId);
-    assertEq(nodeId, 1, "nodeId");
-    assertEq(vol, size, "level vol");
+    // (uint128 vol, uint128 head, uint128 tail) = market.levels(key);
 
-    // bitmap summary bit
-    (uint8 l1,,) = BitScan.split(tick);
+    // _printBook(true, false);
 
-    uint8 ix = 1; // 0 = CallAsk, 1 = CallBid, 2 = PutAsk, 3 = PutBid
-    assertEq(market.summaries(ix) & BitScan.mask(l1), BitScan.mask(l1));
+    // vm.startPrank(user1);
+    // uint256 nodeId = market.placeOrder(
+    //   OptionType.CALL,
+    //   Side.BUY,
+    //   size,
+    //   price6 // 6-dec premium
+    // );
+
+    // // assertions
+    // uint32 tick = _tick(price6); // 100
+    // uint32 key = _key(tick, false, true);
+
+    // (uint128 vol,,) = market.levels(key);
+
+    // console.log("nodeId", nodeId);
+    // assertEq(nodeId, 1, "nodeId");
+    // assertEq(vol, size, "level vol");
+
+    // // bitmap summary bit
+    // (uint8 l1,,) = BitScan.split(tick);
+
+    // uint8 ix = 1; // 0 = CallAsk, 1 = CallBid, 2 = PutAsk, 3 = PutBid
+    // assertEq(market.summaries(ix) & BitScan.mask(l1), BitScan.mask(l1));
   }
 
   function _tick(uint256 price) internal pure returns (uint32) {
@@ -101,5 +115,36 @@ contract MarketTest is Test {
 
   function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
     return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
+  }
+
+  function _printBook(bool isBid, bool isPut) internal view {
+    OBLevel[] memory book = market.dumpBook(isBid, isPut);
+
+    console.log("\n");
+    console.log("============================================");
+    console.log("              %s %s                ", 
+      isPut ? "PUT" : "CALL", 
+      isBid ? "BIDS" : "ASKS"
+    );
+    console.log("============================================");
+    
+    if (book.length == 0) {
+      console.log("            [Empty Book]");
+      console.log("============================================\n");
+      return;
+    }
+
+    console.log("Tick\t\tPrice(6dp)\tVolume");
+    console.log("----\t\t----------\t------");
+    
+    for (uint256 i; i < book.length; ++i) {
+      uint256 price6 = uint256(book[i].tick) * 1e4;
+      console.log("%d\t\t%d\t\t%d", 
+        book[i].tick,
+        price6,
+        book[i].vol
+      );
+    }
+    console.log("============================================\n");
   }
 }

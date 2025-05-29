@@ -40,6 +40,11 @@ struct Maker {
   uint16 prev; // back-pointer for cancel
 }
 
+struct TakerQ {
+  address trader;
+  uint96 size;
+}
+
 interface IMarket {
   function name() external view returns (string memory);
   function startCycle(uint256 expiry) external;
@@ -53,11 +58,9 @@ interface IMarket {
     returns (uint256 orderId);
   function cancelOrder(uint256 cycleId, uint256 orderId) external;
 
-  function matchOrders(uint256 cycleId) external;
   function liquidate(uint256 orderId, address trader) external;
   function settle(uint256 cycleId) external;
 
-  function updateFees(uint16 makerFee, uint16 takerFee) external;
   function pause() external;
   function unpause() external;
 }

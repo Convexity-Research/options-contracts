@@ -1,57 +1,92 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.30;
+/**
+ * _____       ___     ___ __           ____  _ __
+ *   / ___/____  / (_)___/ (_) /___  __   / __ )(_) /______
+ *   \__ \/ __ \/ / / __  / / __/ / / /  / __  / / __/ ___/
+ *  ___/ / /_/ / / / /_/ / / /_/ /_/ /  / /_/ / / /_(__  )
+ * /____/\____/_/_/\__,_/_/\__/\__, /  /_____/_/\__/____/
+ *                            /____/
+ *
+ * - npm: https://www.npmjs.com/package/solidity-bits
+ * - github: https://github.com/estarriolvetch/solidity-bits
+ */
+pragma solidity ^0.8.0;
 
-/// @title BitScan
-/// @notice Uses De Bruijn algorithm to determine index of least/most significant set bit
 library BitScan {
-  uint256 private constant DEBR =
-    0x06_2E_90_88_45_45_96_44_1C_1D_F7_1F_DF_BE_5B_BF_77_7C_A6_1B_37_54_AF_F5_CB_1A_EC_DB_8F_BB_BB_4F;
+  uint256 private constant DEBRUIJN_256 = 0x818283848586878898a8b8c8d8e8f929395969799a9b9d9e9faaeb6bedeeff;
+  bytes private constant LOOKUP_TABLE_256 =
+    hex"0001020903110a19042112290b311a3905412245134d2a550c5d32651b6d3a7506264262237d468514804e8d2b95569d0d495ea533a966b11c886eb93bc176c9071727374353637324837e9b47af86c7155181ad4fd18ed32c9096db57d59ee30e2e4a6a5f92a6be3498aae067ddb2eb1d5989b56fd7baf33ca0c2ee77e5caf7ff0810182028303840444c545c646c7425617c847f8c949c48a4a8b087b8c0c816365272829aaec650acd0d28fdad4e22d6991bd97dfdcea58b4d6f29fede4f6fe0f1f2f3f4b5b6b607b8b93a3a7b7bf357199c5abcfd9e168bcdee9b3f1ecf5fd1e3e5a7a8aa2b670c4ced8bbe8f0f4fc3d79a1c3cde7effb78cce6facbf9f8";
 
-  /// Packed 0x00 01 02 … 1F
-  bytes32 private constant LOOK = 0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
-
-  /// @dev return byte `idx` of LOOK (0-31) as uint8
-  function _lookup(uint256 idx) private pure returns (uint8 r) {
-    assembly {
-      r := byte(idx, LOOK)
-    }
-  }
-
-  /// least-significant-set-bit index (0-255).  Reverts on w == 0.
-  function lsb(uint256 w) internal pure returns (uint8) {
+  /**
+   * @dev Isolate the least significant set bit.
+   */
+  function isolateLS1B256(uint256 bb) internal pure returns (uint256) {
+    require(bb > 0);
     unchecked {
-      return _lookup(((w & (~w + 1)) * DEBR) >> 248);
+      return bb & (0 - bb);
     }
   }
 
-  /// most-significant-set-bit index (0-255).  Reverts on w == 0.
-  function msb(uint256 w) internal pure returns (uint8) {
+  /**
+   * @dev Isolate the most significant set bit.
+   */
+  function isolateMS1B256(uint256 bb) internal pure returns (uint256) {
+    require(bb > 0);
     unchecked {
-      w |= w >> 1;
-      w |= w >> 2;
-      w |= w >> 4;
-      w |= w >> 8;
-      w |= w >> 16;
-      w |= w >> 32;
-      w |= w >> 64;
-      w |= w >> 128;
-      uint256 iso = (w + 1) >> 1; // isolate msb
-      return _lookup((iso * DEBR) >> 248);
+      bb |= bb >> 128;
+      bb |= bb >> 64;
+      bb |= bb >> 32;
+      bb |= bb >> 16;
+      bb |= bb >> 8;
+      bb |= bb >> 4;
+      bb |= bb >> 2;
+      bb |= bb >> 1;
+
+      return (bb >> 1) + 1;
     }
   }
+
+  /**
+   * @dev Find the index of the lest significant set bit. (trailing zero count)
+   */
+  function lsb(uint256 bb) internal pure returns (uint8) {
+    unchecked {
+      return uint8(LOOKUP_TABLE_256[(isolateLS1B256(bb) * DEBRUIJN_256) >> 248]);
+    }
+  }
+
+  /**
+   * @dev Find the index of the most significant set bit.
+   */
+  function msb(uint256 bb) internal pure returns (uint8) {
+    require(bb > 0, "msb(0)");
+    unchecked {
+        // isolate MS1B
+        bb = isolateMS1B256(bb);
+        // De-Bruijn branchless log2
+        return uint8(LOOKUP_TABLE_256[(bb * DEBRUIJN_256) >> 248]);
+    }
+}
 
   function mask(uint8 ix) internal pure returns (uint256) {
     return uint256(1) << ix;
   }
 
-  /*—— optional helpers to pack/unpack tick bytes ———*/
+  function log2(uint256 bb) internal pure returns (uint8) {
+    unchecked {
+      return uint8(LOOKUP_TABLE_256[(isolateMS1B256(bb) * DEBRUIJN_256) >> 248]);
+    }
+  }
+
   function split(uint32 t) internal pure returns (uint8 l1, uint8 l2, uint8 l3) {
-    l1 = uint8(t >> 16);
-    l2 = uint8(t >> 8);
-    l3 = uint8(t);
+    // Each level gets 8 bits
+    l1 = uint8((t >> 16) & 0xFF); // high byte
+    l2 = uint8((t >> 8) & 0xFF);  // middle byte
+    l3 = uint8(t & 0xFF);         // low byte
   }
 
   function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32) {
-    return (uint32(l1) << 16) | (uint32(l2) << 8) | l3;
+    // Combine the three 8-bit levels into a 24-bit tick
+    return (uint32(l1 & 0xFF) << 16) | (uint32(l2 & 0xFF) << 8) | uint32(l3 & 0xFF);
   }
 }

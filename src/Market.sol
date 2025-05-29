@@ -410,17 +410,17 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     address taker,
     address maker
   ) internal {
-    int256 amount = int256(price) * int256(uint256(size)); // always +ve
+    int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
 
     // signed direction: +1 when taker buys, -1 when taker sells
     int256 dir = takerIsBuy ? int256(1) : int256(-1);
 
-    int256 makerFee = amount * makerFeeBps / denominator;
-    int256 takerFee = amount * takerFeeBps / denominator;
+    int256 makerFee = notionalPremium * makerFeeBps / denominator;
+    int256 takerFee = notionalPremium * takerFeeBps / denominator;
 
     // flip premium flow with dir
-    int256 cashMaker = dir * amount + makerFee;
-    int256 cashTaker = -dir * amount + takerFee;
+    int256 cashMaker = dir * notionalPremium + makerFee;
+    int256 cashTaker = -dir * notionalPremium + takerFee;
 
     _applyCashDelta(maker, cashMaker);
     _applyCashDelta(taker, cashTaker);

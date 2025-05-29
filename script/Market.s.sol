@@ -8,25 +8,24 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 contract MarketScript is Script {
   Market public market;
 
-  address public constant ORACLE_FEED = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
-  address public constant COLLATERAL_TOKEN = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
+  address public constant USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb;
 
-  function setUp() public {}
+  address feeRecipient = 0xE7Bc1Ed115b368B946d97e45eE79f47a14eBF179; // Luk lol
 
   function run() public {
+    vm.createSelectFork("hyperevm");
     vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
 
     // Deploy implementation contract
     Market implementation = new Market();
 
     // Prepare initialization data
-    bytes memory initData = abi.encodeWithSelector(Market.initialize.selector, "BTC", ORACLE_FEED, COLLATERAL_TOKEN);
+    bytes memory initData = abi.encodeWithSelector(Market.initialize.selector, "BTC", feeRecipient, USDT0);
 
     // Deploy proxy contract
     ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
 
-    // Cast proxy to Market interface
-    market = Market(address(proxy));
+    console.log("Market deployed to", address(proxy));
 
     vm.stopBroadcast();
   }

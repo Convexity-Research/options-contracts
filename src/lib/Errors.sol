@@ -10,4 +10,5 @@ library Errors {
   string constant NOT_OWNER = "NOT_OWNER";
   string constant NOT_WHITELISTED = "NOT_WHITELISTED";
   string constant INVALID_SIGNATURE = "INVALID_SIGNATURE";
+  string constant ORACLE_PRICE_CALL_FAILED = "ORACLE_PRICE_CALL_FAILED";
 }

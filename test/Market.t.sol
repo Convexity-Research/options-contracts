@@ -4,7 +4,7 @@ pragma solidity ^0.8.25;
 import "forge-std/Test.sol";
 import "forge-std/StdUtils.sol";
 import "../src/Market.sol";
-import "../src/interfaces/IMarket.sol";
+import "./mocks/MarketTest.sol";
 import "../src/lib/Bitscan.sol";
 import "./mocks/Token.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -18,19 +18,19 @@ contract MarketSuite is Test {
   address public constant ORACLE_FEED = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
   Token usdt; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
-  Market mkt;
+  MarketTest mkt;
 
   address u1 = makeAddr("alice");
   address u2 = makeAddr("bob");
   address feeSink = makeAddr("feeSink");
 
   function setUp() public {
+    vm.createSelectFork("hyperevm");
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
-    mkt = Market(
+    mkt = MarketTest(
       address(
         new ERC1967Proxy(
-          address(new Market()),
-          abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, ORACLE_FEED, address(usdt))
+          address(new Market()), abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt))
         )
       )
     );
@@ -39,7 +39,7 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
-  // #                Collateral and limit orders paths                      #
+  // #                Collateral and limit orders paths                    #
   // #                                                                     #
   // #######################################################################
 

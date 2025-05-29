@@ -10,23 +10,16 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-import "forge-std/console.sol";
-
-struct OBLevel {
-  uint32 tick; // raw tick
-  uint128 vol; // resting contracts at that tick
-}
-
 contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
+  address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
   uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
   int16 public constant makerFeeBps = 10; // +0.10 %, basis points
   int16 public constant takerFeeBps = -40; // –0.40 %, basis points
   int16 public constant denominator = 10_000;
   string public name;
-  address public priceOracle;
   IERC20 public collateralToken;
   address public feeRecipient;
 
@@ -87,17 +80,13 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     _disableInitializers();
   }
 
-  function initialize(string memory _name, address _feeRecipient, address _oracleFeed, address _collateralToken)
-    external
-    initializer
-  {
+  function initialize(string memory _name, address _feeRecipient, address _collateralToken) external initializer {
     __Ownable_init(_msgSender());
     __Pausable_init();
     __UUPSUpgradeable_init();
 
     name = _name;
     feeRecipient = _feeRecipient;
-    priceOracle = _oracleFeed;
     collateralToken = IERC20(_collateralToken);
   }
 
@@ -110,8 +99,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       require(cycles[activeCycle].isSettled, Errors.PREVIOUS_CYCLE_NOT_SETTLED);
     }
 
-    //(, int256 price, , , ) = AggregatorV3Interface(priceOracle).latestRoundData();
-    int256 price = 1;
+    // BTC index is zero, and returns with 1 decimal place. Multiply by 1e5 to get 6 decimals in USDT0
+    uint64 price = _getOraclePrice(0) * 1e5;
     require(price > 0, Errors.INVALID_ORACLE_PRICE);
 
     // Create new market
@@ -274,7 +263,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   // #######################################################################
 
   // Convert tick, isPut, isBid to key
-  function _key(uint32 tick, bool isPut, bool isBid) private pure returns (uint32) {
+  function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
     return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 
@@ -435,23 +424,25 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     address taker,
     address maker
   ) internal {
-    int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
+    {
+      int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
 
-    // signed direction: +1 when taker buys, -1 when taker sells
-    int256 dir = takerIsBuy ? int256(1) : int256(-1);
+      // signed direction: +1 when taker buys, -1 when taker sells
+      int256 dir = takerIsBuy ? int256(1) : int256(-1);
 
-    int256 makerFee = notionalPremium * makerFeeBps / denominator;
-    int256 takerFee = notionalPremium * takerFeeBps / denominator;
+      int256 makerFee = notionalPremium * makerFeeBps / denominator;
+      int256 takerFee = notionalPremium * takerFeeBps / denominator;
 
-    // flip premium flow with dir
-    int256 cashMaker = dir * notionalPremium + makerFee;
-    int256 cashTaker = -dir * notionalPremium + takerFee;
+      // flip premium flow with dir
+      int256 cashMaker = dir * notionalPremium + makerFee;
+      int256 cashTaker = -dir * notionalPremium + takerFee;
 
-    _applyCashDelta(maker, cashMaker);
-    _applyCashDelta(taker, cashTaker);
+      _applyCashDelta(maker, cashMaker);
+      _applyCashDelta(taker, cashTaker);
 
-    int256 houseFee = -(makerFee + takerFee); // net to fee recipient
-    if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+      int256 houseFee = -(makerFee + takerFee); // net to fee recipient
+      if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+    }
 
     // Position acounting
     Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
@@ -476,8 +467,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
 
     emit Trade(
-      uint32(price / TICK_SZ),  // convert price back to tick
-      takerIsBuy,               // isBuy from taker's perspective
+      uint32(price / TICK_SZ), // convert price back to tick
+      takerIsBuy, // isBuy from taker's perspective
       isPut,
       size,
       taker,
@@ -609,7 +600,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   // Return the mid and detailed bitmaps for the given side.
   function _maps(bool isBid, bool isPut)
-    private
+    internal
     view
     returns (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det)
   {
@@ -630,6 +621,15 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
         det = detCA;
       }
     }
+  }
+
+  function _getOraclePrice(uint32 index) internal view returns (uint64) {
+    // bool success;
+    // bytes memory result;
+    // (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.staticcall(abi.encode(index));
+    // require(success, Errors.ORACLE_PRICE_CALL_FAILED);
+    // return abi.decode(result, (uint64));
+    return 1070000;
   }
 
   // #######################################################################

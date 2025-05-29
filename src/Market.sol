@@ -44,7 +44,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   uint256 public cursor; // settlement iterator
 
   TakerQ[][2][2] private takerQ; // 4 buckets
-  uint256[2][2] private tqHead; // cursor per bucket
+  uint256[2][2] public tqHead; // cursor per bucket
 
   //------- Orderbook -------
   mapping(uint32 => Level) public levels; // tickKey ⇒ Level
@@ -61,10 +61,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   mapping(uint8 => uint256) public midPA;
 
   // detail (L3): which tick has liquidity
-  mapping(uint16 => uint256) detCB;
-  mapping(uint16 => uint256) detCA;
-  mapping(uint16 => uint256) detPB;
-  mapping(uint16 => uint256) detPA;
+  mapping(uint16 => uint256) public detCB;
+  mapping(uint16 => uint256) public detCA;
+  mapping(uint16 => uint256) public detPB;
+  mapping(uint16 => uint256) public detPA;
 
   event CycleStarted(uint256 expiry, uint256 strike);
   event CycleSettled(uint256 cycleId);
@@ -165,20 +165,13 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
 
-    console.log("isPut", isPut);
-    console.log("isBuy", isBuy);
-
     // Convert price to tick
     uint32 tick = limitPrice == 0
       ? 0 // dummy (market)
       : uint32(limitPrice / TICK_SZ); // 1 tick = 0.01 USDT0
 
-    console.log("limitPrice", limitPrice);
-    console.log("tick", tick);
-
     // Limit price of 0 means market order
     if (limitPrice == 0) {
-      console.log("is market order");
       _marketOrder(isBuy, isPut, uint128(size));
 
       emit OrderPlaced(cycleId, 0, msg.sender, size, 0);
@@ -189,11 +182,9 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint256 oppSummary = summaries[_summaryIx(!isBuy, isPut)];
 
     if (oppSummary != 0) {
-      console.log("oppSummary", oppSummary);
       (uint32 oppBest,) = _best(!isBuy, isPut);
 
       if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        console.log("is crossing");
         _marketOrder(isBuy, isPut, uint128(size));
 
         emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice);
@@ -213,9 +204,40 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     emit OrderPlaced(cycleId, orderId, msg.sender, qtyLeft, limitPrice);
   }
 
-  function cancelOrder(uint256 cycleId, uint256 orderId) external {}
+  function cancelOrder(uint256 orderId) external {
+    Maker storage M = makerQ[uint16(orderId)];
 
-  function liquidate(uint256 orderId, address trader) external {}
+    require(M.trader == msg.sender, Errors.NOT_OWNER);
+
+    uint32 key = M.key;
+    Level storage L = levels[key];
+
+    uint16 p = M.prev;
+    uint16 n = M.next;
+
+    // unlink from neighbours
+    if (p == 0) L.head = n; // cancelled head
+
+    else makerQ[p].next = n;
+
+    if (n == 0) L.tail = p; // cancelled tail
+
+    else makerQ[n].prev = p;
+
+    // adjust volume
+    L.vol -= M.size;
+
+    delete makerQ[uint16(orderId)];
+
+    if (L.vol == 0) {
+      (, bool isPut, bool isBid) = _splitKey(key);
+      _clearLevel(isBid, isPut, key);
+    }
+
+    emit Cancel(uint32(orderId), msg.sender, M.size);
+  }
+
+  function liquidate(uint256[] calldata orderIds, address trader) external {}
 
   function settle(uint256 cycleId) external {}
 
@@ -234,7 +256,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   function _splitKey(uint32 key) private pure returns (uint32 tick, bool isPut, bool isBid) {
     isPut = (key & (1 << 31)) != 0;
     isBid = (key & (1 << 30)) != 0;
-    tick = key & 0x3FFF_FFFF;
+    tick = key & 0x00FF_FFFF; // Only take rightmost 24 bits for tick
   }
 
   /**
@@ -250,6 +272,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
    * [isPut, isBid, unused, l1, l2, l3]
    *
    * where l1, l2, l3 are summary, mid, and detail bit index respectively.
+   *
+   * Index system is LSB-based. Meaning that index 0 is right most bit, and index 255 is left most bit.
    */
   function _addBits(
     mapping(uint16 => uint256) storage det, // detail  (L3)  bitmap
@@ -302,24 +326,18 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   // Returns the best tick and key for the given side and option type
   function _best(bool isBid, bool isPut) private view returns (uint32 tick, uint32 key) {
     uint256 summary = summaries[_summaryIx(isBid, isPut)];
-    console.log("_best - Summary bitmap:", summary);
     (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
 
     // For bids we want highest price (msb), for asks we want lowest price (lsb)
     uint8 l1 = isBid ? summary.msb() : summary.lsb();
-    console.log("_best - Using l1:", l1);
-    console.log("_best - Mid bitmap at l1:", mid[l1]);
 
     // Same for l2 and l3
     uint8 l2 = isBid ? mid[l1].msb() : mid[l1].lsb();
-    console.log("_best - Found l2:", l2);
     uint16 k12 = (uint16(l1) << 8) | l2;
     uint8 l3 = isBid ? det[k12].msb() : det[k12].lsb();
-    console.log("_best - Found l3:", l3);
 
     tick = BitScan.join(l1, l2, l3);
     key = _key(tick, isPut, isBid);
-    console.log("_best - Final tick and key:", tick, key);
     return (tick, key);
   }
 
@@ -352,31 +370,15 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
-    console.log("l1", l1);
-    console.log("l2", l2);
-    console.log("l3", l3);
-    console.log("tick", tick);
     uint32 key = _key(tick, isPut, isBuy);
 
     // if level empty, set bitmap bits
     if (levels[key].vol == 0) {
       bool firstInL1 = _addBits(det, mid, l1, l2, l3);
-      console.log("asserting");
       assert(mid[l1] & (1 << l2) != 0);
-      console.log("asserted");
-      
-      console.log("Summary bitmap:", summaries[_summaryIx(isBuy, isPut)]);
-      console.log("Mid bitmap for l1:", mid[l1]);
-      console.log("Looking at l1,l2,l3:", l1, l2, l3);
-      
-      if (firstInL1) _sumAddBit(isBuy, isPut, l1);
-      
-      console.log("Summary after setting:", summaries[_summaryIx(isBuy, isPut)]);
-    }
 
-    (uint32 bestTick, uint32 bestKey) = _best(isBuy, isPut);
-    console.log("bestTick", bestTick);
-    console.log("bestKey", bestKey);
+      if (firstInL1) _sumAddBit(isBuy, isPut, l1);
+    }
 
     // maker node
     nodeId = ++nodePtr;
@@ -386,7 +388,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     if (levels[key].vol == 0) levels[key].head = nodeId;
     else makerQ[levels[key].tail].next = nodeId;
     levels[key].tail = nodeId;
-    console.logBytes32(bytes4(key));
     levels[key].vol += size;
 
     // position table
@@ -445,36 +446,23 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
   }
 
-  /// @dev Fills against the opposite side until either a) qty exhausted, or b) book empty
+  /**
+   * @dev Fills against the opposite side until either a) qty exhausted, or b) book empty
+   */
   function _marketOrder(bool isBuy, bool isPut, uint128 want) private {
     uint128 left = want;
-
-    console.log("left", left);
 
     while (left > 0) {
       {
         // Any liquidity left?
         uint256 sumOpp = summaries[_summaryIx(!isBuy, isPut)];
-        console.log("sumOpp", sumOpp);
         if (sumOpp == 0) break; // No bits set in summary means empty book
       }
 
       // Best price level
       (uint32 bestTick, uint32 bestKey) = _best(!isBuy, isPut);
-      console.log("bestTick", bestTick);
-      console.log("bestKey", bestKey);
       Level storage L = levels[bestKey];
       uint16 node = L.head;
-
-      console.log("bestTick", bestTick);
-      console.log("bestKey", bestKey);
-      console.log("L.vol", L.vol);
-      console.log("L.head", L.head);
-      console.log("L.tail", L.tail);
-      console.log("marketOrder");
-      console.log("isBuy", isBuy);
-      console.log("isPut", isPut);
-      console.log("want", want);
 
       // Walk FIFO makers at this tick
       while (left > 0 && node != 0) {
@@ -498,6 +486,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
           // Remove node from queue
           uint16 nxt = M.next;
           if (nxt == 0) L.tail = 0;
+          else makerQ[nxt].prev = 0;
+
           L.head = nxt;
           delete makerQ[node];
           node = nxt;
@@ -507,19 +497,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       }
 
       // If price level empty, clear bitmaps
-      if (L.vol == 0) {
-        (uint32 tick,,) = _splitKey(bestKey);
-        (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
-
-        // The opposite book
-        (mapping(uint8 => uint256) storage midOpp, mapping(uint16 => uint256) storage detOpp) = _maps(!isBuy, isPut);
-
-        // Clear bitmaps
-        bool lastInL1 = _clrBits(detOpp, midOpp, l1, l2, l3);
-        if (lastInL1) _sumClrBit(!isBuy, isPut, l1);
-
-        delete levels[bestKey];
-      }
+      if (L.vol == 0) _clearLevel(!isBuy, isPut, bestKey);
     }
 
     if (left > 0) _queueTaker(isBuy, isPut, left, msg.sender);
@@ -535,14 +513,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint128 makerSize,
     uint256 price // maker's price, 6-dec
   ) private returns (uint128 remainingMakerSize) {
-    console.log("matchQueuedTakers");
     TakerQ[] storage Q = takerQ[isPut ? 1 : 0][makerIsBid ? 0 : 1];
     uint256 i = tqHead[isPut ? 1 : 0][makerIsBid ? 0 : 1];
 
     remainingMakerSize = makerSize;
-
-    console.log("Q.length", Q.length);
-    console.log("i", i);
 
     while (remainingMakerSize > 0 && i < Q.length) {
       TakerQ storage T = Q[i];
@@ -580,7 +554,21 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
   }
 
-  // Return the two bitmap ladders for the given side.
+  function _clearLevel(bool isBuy, bool isPut, uint32 key) private {
+    (uint32 tick,,) = _splitKey(key);
+    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+
+    // The opposite book
+    (mapping(uint8 => uint256) storage midOpp, mapping(uint16 => uint256) storage detOpp) = _maps(isBuy, isPut);
+
+    // Clear bitmaps
+    bool lastInL1 = _clrBits(detOpp, midOpp, l1, l2, l3);
+    if (lastInL1) _sumClrBit(isBuy, isPut, l1);
+
+    delete levels[key];
+  }
+
+  // Return the mid and detailed bitmaps for the given side.
   function _maps(bool isBid, bool isPut)
     private
     view
@@ -611,11 +599,12 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   // #                                                                     #
   // #######################################################################
 
-  function viewTakerQueue(bool isBid, bool isPut) external view returns (TakerQ[] memory) {
+  function viewTakerQueue(bool isPut, bool isBid) external view returns (TakerQ[] memory) {
     return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
   }
 
-  // Claude copy pasta. Remove this before deployment, only for visualizing during tests
+  // Claude copy pasta. Remove this before deployment, only for visualizing during tests.
+  // Needs IR optimizer for compilation to work.
   function dumpBook(bool isBid, bool isPut) external view returns (OBLevel[] memory levels_) {
     // ---------- Pass 1: how many live price-levels? ----------
     uint256 levelCnt;

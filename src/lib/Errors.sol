@@ -7,4 +7,5 @@ library Errors {
   string constant PREVIOUS_CYCLE_NOT_SETTLED = "PREVIOUS_CYCLE_NOT_SETTLED";
   string constant INVALID_AMOUNT = "INVALID_AMOUNT";
   string constant INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE";
+  string constant NOT_OWNER = "NOT_OWNER";
 }

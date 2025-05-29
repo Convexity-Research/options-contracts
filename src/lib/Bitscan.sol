@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: MIT
-/**
- * _____       ___     ___ __           ____  _ __
- *   / ___/____  / (_)___/ (_) /___  __   / __ )(_) /______
- *   \__ \/ __ \/ / / __  / / __/ / / /  / __  / / __/ ___/
- *  ___/ / /_/ / / / /_/ / / /_/ /_/ /  / /_/ / / /_(__  )
- * /____/\____/_/_/\__,_/_/\__/\__, /  /_____/_/\__/____/
- *                            /____/
- *
- * - npm: https://www.npmjs.com/package/solidity-bits
- * - github: https://github.com/estarriolvetch/solidity-bits
- */
 pragma solidity ^0.8.0;
 
+/**
+ * - Credit to: https://github.com/estarriolvetch/solidity-bits
+ *
+ * Slightly modified to return msb() with LSB-based indexing.
+ */
 library BitScan {
   uint256 private constant DEBRUIJN_256 = 0x818283848586878898a8b8c8d8e8f929395969799a9b9d9e9faaeb6bedeeff;
   bytes private constant LOOKUP_TABLE_256 =
@@ -61,12 +55,12 @@ library BitScan {
   function msb(uint256 bb) internal pure returns (uint8) {
     require(bb > 0, "msb(0)");
     unchecked {
-        // isolate MS1B
-        bb = isolateMS1B256(bb);
-        // De-Bruijn branchless log2
-        return uint8(LOOKUP_TABLE_256[(bb * DEBRUIJN_256) >> 248]);
+      // isolate MS1B
+      bb = isolateMS1B256(bb);
+      // De-Bruijn branchless log2
+      return uint8(LOOKUP_TABLE_256[(bb * DEBRUIJN_256) >> 248]);
     }
-}
+  }
 
   function mask(uint8 ix) internal pure returns (uint256) {
     return uint256(1) << ix;
@@ -81,8 +75,8 @@ library BitScan {
   function split(uint32 t) internal pure returns (uint8 l1, uint8 l2, uint8 l3) {
     // Each level gets 8 bits
     l1 = uint8((t >> 16) & 0xFF); // high byte
-    l2 = uint8((t >> 8) & 0xFF);  // middle byte
-    l3 = uint8(t & 0xFF);         // low byte
+    l2 = uint8((t >> 8) & 0xFF); // middle byte
+    l3 = uint8(t & 0xFF); // low byte
   }
 
   function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32) {

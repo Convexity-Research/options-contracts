@@ -56,9 +56,9 @@ interface IMarket {
   function placeOrder(OptionType option, Side side, uint256 size, uint256 limitPrice)
     external
     returns (uint256 orderId);
-  function cancelOrder(uint256 cycleId, uint256 orderId) external;
+  function cancelOrder(uint256 orderId) external;
 
-  function liquidate(uint256 orderId, address trader) external;
+  function liquidate(uint256[] calldata orderIds, address trader) external;
   function settle(uint256 cycleId) external;
 
   function pause() external;

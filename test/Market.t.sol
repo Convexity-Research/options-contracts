@@ -215,9 +215,12 @@ contract MarketSuite is Test {
   // Market order sweeps 3 price levels and leaves tail in queue
   function testMarketOrderMultiLevelAndQueue() public {
     uint32[3] memory ticks = [_tick(ONE_COIN), _tick(ONE_COIN * 2), _tick(ONE_COIN * 700)];
+    uint256 collatPerContract = 107000000000 / 100 / 1000; // Divide by 100 for 0.01BTC size contract price,
+      // divide by 1000 for 0.1% margin
+    _fund(u1, collatPerContract * LOT * 3);
+
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
-      _fund(u1, 5 * ONE_COIN);
       vm.prank(u1);
       mkt.placeOrder(OptionType.PUT, Side.SELL, LOT, ticks[i] * 1e4); // ask
     }

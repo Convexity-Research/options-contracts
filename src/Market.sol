@@ -5,9 +5,12 @@ import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
 import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+
+import {console} from "forge-std/console.sol";
 
 contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
   using BitScan for uint256;
@@ -15,11 +18,15 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   //------- Meta -------
   address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
   uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
-  int16 public constant makerFeeBps = 10; // +0.10 %, basis points
-  int16 public constant takerFeeBps = -40; // –0.40 %, basis points
-  int16 public constant denominator = 10_000;
+  uint256 constant IM_BPS = 10; // 0.10 % Initial Margin
+  uint256 constant MM_BPS = 10; // 0.10 % Maintenance Margin (same as IM_BPS for now)
+  uint256 constant CONTRACT_SIZE = 100; // 0.01BTC
+  int256 public constant makerFeeBps = 10; // +0.10 %, basis points
+  int256 public constant takerFeeBps = -40; // –0.40 %, basis points
+  uint256 public constant denominator = 10_000;
   string public name;
   IERC20 public collateralToken;
+  uint64 public collateralDecimals;
   address public feeRecipient;
 
   //------- Vault -------
@@ -83,6 +90,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     name = _name;
     feeRecipient = _feeRecipient;
     collateralToken = IERC20(_collateralToken);
+    collateralDecimals = IERC20Metadata(_collateralToken).decimals();
   }
 
   function startCycle(uint256 expiry) external onlyOwner {
@@ -94,15 +102,15 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       require(cycles[activeCycle].isSettled, Errors.PREVIOUS_CYCLE_NOT_SETTLED);
     }
 
-    // BTC index is zero, and returns with 1 decimal place. Multiply by 1e5 to get 6 decimals in USDT0
-    uint64 price = _getOraclePrice(0) * 1e5;
+    // BTC index is zero
+    uint64 price = _getOraclePrice(0);
     require(price > 0, Errors.INVALID_ORACLE_PRICE);
 
     // Create new market
     cycles[expiry] = Cycle({
       active: true,
       isSettled: false,
-      strikePrice: uint96(uint256(price)),
+      strikePrice: price,
       settlementPrice: 0 // Set at cycle end time
     });
 
@@ -130,7 +138,9 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     require(amount > 0, Errors.INVALID_AMOUNT);
 
     address trader = _msgSender();
-    uint256 balance = balances[trader] - lockedCollateral[activeCycle][trader];
+    require(!inList[trader], Errors.IN_TRADER_LIST);
+
+    uint256 balance = balances[trader];
 
     require(balance >= amount, Errors.INSUFFICIENT_BALANCE);
 
@@ -139,7 +149,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // Transfer collateral token from contract to user
     collateralToken.transfer(trader, amount);
-
     emit CollateralWithdrawn(trader, amount);
   }
 
@@ -149,7 +158,26 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint256 size,
     uint256 limitPrice // 0 = market
   ) external returns (uint256 orderId) {
+    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+
     require(size > 0, Errors.INVALID_AMOUNT);
+
+    uint64 price = _getOraclePrice(0);
+
+    // Worst-case extra short exposure introduced by *this* order.
+    //  – buying (long) ⇒ 0
+    //  – selling (short) ⇒ full size
+    uint256 extraShort = side == Side.BUY ? 0 : size;
+
+    uint256 extraMargin = _totalNotional(extraShort, price) * IM_BPS / denominator;
+
+    console.log("extraMargin", extraMargin);
+    console.log("balances[msg.sender]", balances[msg.sender]);
+    console.log("requiredMargin", _requiredMargin(msg.sender, price, IM_BPS));
+    require(
+      balances[msg.sender] >= _requiredMargin(msg.sender, price, IM_BPS) + extraMargin, Errors.INSUFFICIENT_BALANCE
+    );
+
     uint256 cycleId = activeCycle;
 
     bool isPut = (option == OptionType.PUT);
@@ -195,6 +223,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   }
 
   function cancelOrder(uint256 orderId) external {
+    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
     Maker storage M = makerQ[uint16(orderId)];
 
     require(M.trader == msg.sender, Errors.NOT_OWNER);
@@ -227,9 +256,80 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     emit Cancel(uint32(orderId), msg.sender, M.size);
   }
 
-  function liquidate(uint256[] calldata orderIds, address trader) external {}
+  /**
+   * @notice Anyone may call this when a trader’s equity has fallen below maintenance margin.
+   * @param makerIds open maker-order nodeIds that belong to `trader`
+   *                 (pass an empty array if the trader has no orders)
+   */
+  function liquidate(uint16[] calldata makerIds, address trader) external {
+    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+    uint64 price = _getOraclePrice(0);
+    require(_isLiquidatable(trader, price), Errors.STILL_SOLVENT);
 
-  function settle(uint256 cycleId) external {}
+    for (uint256 k; k < makerIds.length; ++k) {
+      uint16 id = makerIds[k];
+      Maker storage M = makerQ[id];
+      if (M.trader != trader) continue; // skip others’ orders
+      _forceCancel(id);
+    }
+
+    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
+    uint256 shortCalls = _netShortCalls(P);
+    uint256 shortPuts = _netShortPuts(P);
+
+    if (shortCalls > 0) _marketOrder(true, false, uint128(shortCalls));
+    if (shortPuts > 0) _marketOrder(true, true, uint128(shortPuts));
+
+    emit Liquidated(activeCycle, 0, trader, balances[trader], true);
+  }
+
+  function fixPrice() external {
+    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+    require(block.timestamp >= activeCycle, Errors.NOT_EXPIRED);
+
+    Cycle storage C = cycles[activeCycle];
+
+    uint64 price = _getOraclePrice(0);
+
+    C.settlementPrice = price;
+    cursor = 0; // reset iterator
+
+    emit PriceFixed(activeCycle, price);
+  }
+
+  function settleChunk(uint256 max) external returns (bool done) {
+    Cycle storage C = cycles[activeCycle];
+    uint64 price = C.settlementPrice;
+    require(price > 0, Errors.PRICE_NOT_FIXED);
+    require(!C.isSettled, Errors.CYCLE_ALREADY_SETTLED);
+
+    uint256 n = traders.length;
+    uint256 i = cursor;
+    uint256 upper = i + max;
+    if (upper > n) upper = n;
+
+    while (i < upper) {
+      address t = traders[i];
+      uint256 key = activeCycle | uint256(uint160(t));
+      _settleTrader(key, price, t);
+      unchecked {
+        ++i;
+      }
+    }
+    cursor = i;
+
+    if (i == n) {
+      /* ─── finished ─── */
+      delete traders;
+      cursor = 0;
+      C.isSettled = true;
+      C.active = false;
+      activeCycle = 0;
+
+      emit CycleSettled(block.timestamp); // or cycleId
+      done = true;
+    }
+  }
 
   // #######################################################################
   // #                                                                     #
@@ -405,8 +505,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       // signed direction: +1 when taker buys, -1 when taker sells
       int256 dir = takerIsBuy ? int256(1) : int256(-1);
 
-      int256 makerFee = notionalPremium * makerFeeBps / denominator;
-      int256 takerFee = notionalPremium * takerFeeBps / denominator;
+      int256 makerFee = notionalPremium * makerFeeBps / int256(denominator);
+      int256 takerFee = notionalPremium * takerFeeBps / int256(denominator);
 
       // flip premium flow with dir
       int256 cashMaker = dir * notionalPremium + makerFee;
@@ -573,6 +673,28 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     delete levels[key];
   }
 
+  function _forceCancel(uint16 nodeId) internal {
+    Maker storage M = makerQ[nodeId];
+    uint32 key = M.key;
+    Level storage L = levels[key];
+
+    uint16 p = M.prev;
+    uint16 n = M.next;
+
+    if (p == 0) L.head = n;
+    else makerQ[p].next = n;
+    if (n == 0) L.tail = p;
+    else makerQ[n].prev = p;
+
+    L.vol -= M.size; // reduce resting volume
+    delete makerQ[nodeId]; // free storage
+
+    if (L.vol == 0) {
+      (, bool isPut, bool isBid) = _splitKey(key);
+      _clearLevel(isBid, isPut, key);
+    }
+  }
+
   // Return the mid and detailed bitmaps for the given side.
   function _maps(bool isBid, bool isPut)
     internal
@@ -598,13 +720,90 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
   }
 
-  function _getOraclePrice(uint32 index) internal view returns (uint64) {
+  // #######################################################################
+  // #                                                                     #
+  // #                  Internal position helpers                          #
+  // #                                                                     #
+  // #######################################################################
+
+  function _getOraclePrice(uint32 index) internal view returns (uint64 price) {
     // bool success;
     // bytes memory result;
-    // (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.staticcall(abi.encode(index));
+    // (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.call(abi.encode(index));
     // require(success, Errors.ORACLE_PRICE_CALL_FAILED);
-    // return abi.decode(result, (uint64));
-    return 1070000;
+    // price = abi.decode(result, (uint64)) / 10;
+    price = 107000 * uint64(10 ** collateralDecimals);
+  }
+
+  function _isMarketLive() internal view returns (bool) {
+    return cycles[activeCycle].settlementPrice == 0;
+  }
+
+  function _totalNotional(uint256 contracts, uint64 spot) internal pure returns (uint256) {
+    // contracts * spot * 0.01 = total notional
+    return contracts * uint256(spot) / CONTRACT_SIZE;
+  }
+
+  function _netShortCalls(Pos memory p) internal pure returns (uint256) {
+    return p.shortCalls > p.longCalls ? p.shortCalls - p.longCalls : 0;
+  }
+
+  function _netShortPuts(Pos memory p) internal pure returns (uint256) {
+    return p.shortPuts > p.longPuts ? p.shortPuts - p.longPuts : 0;
+  }
+
+  function _requiredMargin(address trader, uint64 price, uint256 marginBps) internal view returns (uint256 rm) {
+    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
+
+    uint256 shortCalls = _netShortCalls(P);
+    uint256 shortPuts = _netShortPuts(P);
+
+    uint256 notional = _totalNotional(shortCalls + shortPuts, price);
+
+    rm = notional * marginBps / denominator;
+  }
+
+  function _isLiquidatable(address trader, uint64 price) internal view returns (bool) {
+    uint256 mm6 = _requiredMargin(trader, price, MM_BPS);
+
+    return balances[trader] < mm6;
+  }
+
+  function _settleTrader(uint256 key, uint64 price, address trader) internal {
+    Pos storage P = positions[key];
+    if (P.longCalls | P.shortCalls | P.longPuts | P.shortPuts == 0) {
+      delete positions[key];
+      return;
+    }
+
+    int256 pnl;
+
+    /* intrinsic of calls */
+    int256 diff = int256(uint256(price)) - int256(uint256(cycles[activeCycle].strikePrice));
+    if (diff > 0) {
+      // long calls win
+      pnl += diff * int256(uint256(P.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(P.shortCalls)) / int256(CONTRACT_SIZE);
+    } else {
+      // short calls win
+      pnl += diff * int256(uint256(P.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(P.shortCalls)) / int256(CONTRACT_SIZE);
+    }
+
+    /* intrinsic of puts (mirror) */
+    diff = int256(uint256(cycles[activeCycle].strikePrice)) - int256(uint256(price));
+    if (diff > 0) {
+      pnl += diff * int256(uint256(P.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(P.shortPuts)) / int256(CONTRACT_SIZE);
+    } else {
+      pnl += diff * int256(uint256(P.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(P.shortPuts)) / int256(CONTRACT_SIZE);
+    }
+
+    _applyCashDelta(trader, pnl);
+    emit Settled(trader, pnl);
+
+    delete positions[key]; // gas refund
   }
 
   // #######################################################################
@@ -615,6 +814,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   function viewTakerQueue(bool isPut, bool isBid) external view returns (TakerQ[] memory) {
     return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
+  }
+
+  function getOraclePrice(uint32 index) external view returns (uint64) {
+    return _getOraclePrice(index);
   }
 
   // #######################################################################

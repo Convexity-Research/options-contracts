@@ -9,4 +9,11 @@ library Errors {
   string constant INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE";
   string constant NOT_OWNER = "NOT_OWNER";
   string constant ORACLE_PRICE_CALL_FAILED = "ORACLE_PRICE_CALL_FAILED";
+  string constant CYCLE_ACTIVE = "CYCLE_ACTIVE";
+  string constant STILL_SOLVENT = "STILL_SOLVENT";
+  string constant IN_TRADER_LIST = "IN_TRADER_LIST";
+  string constant NOT_EXPIRED = "NOT_EXPIRED";
+  string constant PRICE_NOT_FIXED = "PRICE_NOT_FIXED";
+  string constant CYCLE_ALREADY_SETTLED = "CYCLE_ALREADY_SETTLED";
+  string constant MARKET_NOT_LIVE = "MARKET_NOT_LIVE";
 }

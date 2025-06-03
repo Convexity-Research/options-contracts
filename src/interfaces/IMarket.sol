@@ -14,8 +14,8 @@ enum OptionType {
 struct Cycle {
   bool active;
   bool isSettled;
-  uint96 strikePrice;
-  uint96 settlementPrice;
+  uint64 strikePrice;
+  uint64 settlementPrice;
 }
 
 struct Pos {
@@ -58,8 +58,8 @@ interface IMarket {
     returns (uint256 orderId);
   function cancelOrder(uint256 orderId) external;
 
-  function liquidate(uint256[] calldata orderIds, address trader) external;
-  function settle(uint256 cycleId) external;
+  // function liquidate(uint256[] calldata orderIds, address trader) external;
+  // function settle(uint256 cycleId) external;
 
   function pause() external;
   function unpause() external;

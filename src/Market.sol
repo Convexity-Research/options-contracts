@@ -31,7 +31,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   //------- Vault -------
   mapping(address => uint256) public balances;
-  mapping(uint256 => mapping(address => uint256)) public lockedCollateral;
 
   //------- Cycle state -------
   uint256 public activeCycle; // expiry unix timestamp as ID
@@ -318,13 +317,16 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
     cursor = i;
 
-    if (i == n) {
-      /* ─── finished ─── */
+    if (i == n) { // Finished settling all traders
       delete traders;
+      delete takerQ;
+      delete tqHead;
+
       cursor = 0;
       C.isSettled = true;
       C.active = false;
       activeCycle = 0;
+      _purgeBook();
 
       emit CycleSettled(block.timestamp); // or cycleId
       done = true;
@@ -720,9 +722,41 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
   }
 
+  function _purgeBook() internal {
+    // Loop over all 4 book sides
+    for (uint8 put = 0; put < 2; ++put) {
+      for (uint8 bid = 0; bid < 2; ++bid) {
+        _purgeSide(bid == 1, put == 1);
+      }
+    }
+  }
+
+  // walk one side of the book, removing every price-level
+  function _purgeSide(bool isBid, bool isPut) private {
+    uint8 sIx = _summaryIx(isBid, isPut);
+
+    // while there is still at least one block with liquidity …
+    while (summaries[sIx] != 0) {
+      // start clearing from best price level
+      (uint32 tick, uint32 key) = _best(isBid, isPut);
+
+      // unlink all maker nodes at that tick
+      Level storage L = levels[key];
+      uint16 node = L.head;
+      while (node != 0) {
+        uint16 nxt = makerQ[node].next;
+        delete makerQ[node];
+        node = nxt;
+      }
+
+      // clear bitmap bits and Level struct
+      _clearLevel(isBid, isPut, key);
+    }
+  }
+
   // #######################################################################
   // #                                                                     #
-  // #                  Internal position helpers                          #
+  // #             Internal position and settlement helpers                #
   // #                                                                     #
   // #######################################################################
 
@@ -801,6 +835,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
 
     _applyCashDelta(trader, pnl);
+    inList[trader] = false;
     emit Settled(trader, pnl);
 
     delete positions[key]; // gas refund

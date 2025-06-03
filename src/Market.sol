@@ -37,7 +37,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   mapping(uint256 => Cycle) public cycles;
 
   //------- Trading/Positions -------
-
   address[] public traders;
   mapping(uint256 => Pos) public positions;
   mapping(address => bool) public inList;
@@ -137,7 +136,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     require(amount > 0, Errors.INVALID_AMOUNT);
 
     address trader = _msgSender();
-    require(!inList[trader], Errors.IN_TRADER_LIST);
+    require(!inList[trader] || _noOpenPositions(trader), Errors.IN_TRADER_LIST);
 
     uint256 balance = balances[trader];
 
@@ -170,9 +169,6 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     uint256 extraMargin = _totalNotional(extraShort, price) * IM_BPS / denominator;
 
-    console.log("extraMargin", extraMargin);
-    console.log("balances[msg.sender]", balances[msg.sender]);
-    console.log("requiredMargin", _requiredMargin(msg.sender, price, IM_BPS));
     require(
       balances[msg.sender] >= _requiredMargin(msg.sender, price, IM_BPS) + extraMargin, Errors.INSUFFICIENT_BALANCE
     );
@@ -839,6 +835,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     emit Settled(trader, pnl);
 
     delete positions[key]; // gas refund
+  }
+
+  function _noOpenPositions(address trader) internal view returns (bool) {
+    uint256 key = activeCycle | uint256(uint160(trader));
+    return positions[key].longCalls | positions[key].shortCalls | positions[key].longPuts | positions[key].shortPuts == 0;
   }
 
   // #######################################################################

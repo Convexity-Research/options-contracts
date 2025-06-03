@@ -5,6 +5,7 @@ import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
 import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -28,6 +29,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   IERC20 public collateralToken;
   uint64 public collateralDecimals;
   address public feeRecipient;
+
+  //------- Whitelist -------
+  address private constant WHITELIST_SIGNER = 0xf059b24cE0C34D44fb271dDC795a7C0E71576fd2;
+  mapping(address => bool) public whitelist;
 
   //------- Vault -------
   mapping(address => uint256) public balances;
@@ -154,8 +159,28 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     OptionType option,
     Side side,
     uint256 size,
+    uint256 limitPrice, // 0 = market
+    bytes memory signature
+  ) external isValidSignature(signature) returns (uint256 orderId) {
+    whitelist[_msgSender()] = true;
+    return _placeOrder(option, side, size, limitPrice);
+  }
+
+  function placeOrder(
+    OptionType option,
+    Side side,
+    uint256 size,
     uint256 limitPrice // 0 = market
-  ) external returns (uint256 orderId) {
+  ) external onlyWhitelisted returns (uint256 orderId) {
+    return _placeOrder(option, side, size, limitPrice);
+  }
+
+  function _placeOrder(
+    OptionType option,
+    Side side,
+    uint256 size,
+    uint256 limitPrice // 0 = market
+  ) private returns (uint256 orderId) {
     require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
 
     require(size > 0, Errors.INVALID_AMOUNT);
@@ -850,6 +875,16 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   function viewTakerQueue(bool isPut, bool isBid) external view returns (TakerQ[] memory) {
     return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
+  }
+
+  modifier onlyWhitelisted() {
+    require(whitelist[_msgSender()], Errors.NOT_WHITELISTED);
+    _;
+  }
+
+  modifier isValidSignature(bytes memory signature) {
+    require(WHITELIST_SIGNER == ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature), Errors.INVALID_SIGNATURE);
+    _;
   }
 
   function getOraclePrice(uint32 index) external view returns (uint64) {

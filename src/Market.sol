@@ -598,41 +598,41 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
     }
 
-    uint256 cycleId = activeCycle;
-
     // Position acounting
-    Pos storage PM = positions[cycleId | uint256(uint160(maker))];
-    Pos storage PT = positions[cycleId | uint256(uint160(taker))];
+    {
+      Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
+      Pos storage PT = positions[activeCycle | uint256(uint160(taker))];
 
-    if (isPut) {
-      if (takerIsBuy) {
-        PT.longPuts += uint32(size);
-        PM.shortPuts += uint32(size);
-        if (!isTakerQueue) PM.pendingShortPuts -= uint32(size);
-        else PT.pendingLongPuts -= uint32(size);
+      if (isPut) {
+        if (takerIsBuy) {
+          PT.longPuts += uint32(size);
+          PM.shortPuts += uint32(size);
+          if (!isTakerQueue) PM.pendingShortPuts -= uint32(size);
+          else PT.pendingLongPuts -= uint32(size);
+        } else {
+          PT.shortPuts += uint32(size);
+          PM.longPuts += uint32(size);
+          if (!isTakerQueue) PM.pendingLongPuts -= uint32(size);
+          else PT.pendingShortPuts -= uint32(size);
+        }
       } else {
-        PT.shortPuts += uint32(size);
-        PM.longPuts += uint32(size);
-        if (!isTakerQueue) PM.pendingLongPuts -= uint32(size);
-        else PT.pendingShortPuts -= uint32(size);
-      }
-    } else {
-      if (takerIsBuy) {
-        PT.longCalls += uint32(size);
-        PM.shortCalls += uint32(size);
-        if (!isTakerQueue) PM.pendingShortCalls -= uint32(size);
-        else PT.pendingLongCalls -= uint32(size);
-      } else {
-        PT.shortCalls += uint32(size);
-        PM.longCalls += uint32(size);
-        if (!isTakerQueue) PM.pendingLongCalls -= uint32(size);
-        else PT.pendingShortCalls -= uint32(size);
+        if (takerIsBuy) {
+          PT.longCalls += uint32(size);
+          PM.shortCalls += uint32(size);
+          if (!isTakerQueue) PM.pendingShortCalls -= uint32(size);
+          else PT.pendingLongCalls -= uint32(size);
+        } else {
+          PT.shortCalls += uint32(size);
+          PM.longCalls += uint32(size);
+          if (!isTakerQueue) PM.pendingLongCalls -= uint32(size);
+          else PT.pendingShortCalls -= uint32(size);
+        }
       }
     }
 
     // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool
     // isPut, address indexed taker, address indexed maker);
-    emit OrderFilled(cycleId, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
+    emit OrderFilled(activeCycle, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
 
     return size;
   }

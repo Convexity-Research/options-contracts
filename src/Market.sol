@@ -18,10 +18,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
   //------- Meta -------
   address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
-  uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (6-decimals)
+  uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 constant IM_BPS = 10; // 0.10 % Initial Margin
   uint256 constant MM_BPS = 10; // 0.10 % Maintenance Margin (same as IM_BPS for now)
-  uint256 constant CONTRACT_SIZE = 100; // 0.01BTC
+  uint256 public constant CONTRACT_SIZE = 100; // 0.01BTC
   int256 public constant makerFeeBps = 10; // +0.10 %, basis points
   int256 public constant takerFeeBps = -40; // –0.40 %, basis points
   uint256 public constant denominator = 10_000;
@@ -70,16 +70,16 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   mapping(uint16 => uint256) public detPB;
   mapping(uint16 => uint256) public detPA;
 
-  event CycleStarted(uint256 expiry, uint256 strike);
-  event CycleSettled(uint256 cycleId);
-  event CollateralDeposited(address trader, uint256 amount);
-  event CollateralWithdrawn(address trader, uint256 amount);
-  event OrderPlaced(uint256 cycleId, uint256 orderId, address trader, uint256 size, uint256 limitPrice);
-  event Liquidated(uint256 cycleId, uint256 orderId, address trader, uint256 collateral, bool completed);
-  event PriceFixed(uint256 expiry, uint64 price);
-  event Trade(uint32 tick, bool isBuy, bool isPut, uint128 size, address taker, address maker);
-  event Cancel(uint32 nodeId, address maker, uint128 vol);
-  event Settled(address trader, int256 pnl);
+  event CycleStarted(uint256 indexed cycleId, uint256 strike);
+  event CycleSettled(uint256 indexed cycleId);
+  event CollateralDeposited(address indexed trader, uint256 amount);
+  event CollateralWithdrawn(address indexed trader, uint256 amount);
+  event OrderPlaced(uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed maker);
+  event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker);
+  event OrderCancelled(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker);
+  event Liquidated(uint256 indexed cycleId, address indexed trader);
+  event PriceFixed(uint256 indexed cycleId, uint64 price);
+  event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
 
   constructor() {
     _disableInitializers();
@@ -210,9 +210,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // Limit price of 0 means market order
     if (limitPrice == 0) {
-      _marketOrder(isBuy, isPut, uint128(size));
-
-      emit OrderPlaced(cycleId, 0, msg.sender, size, 0);
+      _marketOrder(isBuy, isPut, uint128(size), msg.sender);
       return 0;
     }
 
@@ -223,9 +221,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       (uint32 oppBest,) = _best(!isBuy, isPut);
 
       if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        _marketOrder(isBuy, isPut, uint128(size));
-
-        emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice);
+        _marketOrder(isBuy, isPut, uint128(size), msg.sender);
         return 0;
       }
     }
@@ -233,13 +229,9 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     // Is a limit order
     uint128 qtyLeft = _matchQueuedTakers(isBuy, isPut, uint128(size), uint256(tick) * TICK_SZ);
 
-    if (qtyLeft == 0) {
-      emit OrderPlaced(cycleId, 0, msg.sender, size, limitPrice); // fully filled
-      return 0;
-    }
+    if (qtyLeft == 0) return 0;
 
     orderId = _insertLimit(isBuy, isPut, tick, qtyLeft);
-    emit OrderPlaced(cycleId, orderId, msg.sender, qtyLeft, limitPrice);
   }
 
   function cancelOrder(uint256 orderId) external {
@@ -248,8 +240,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     require(M.trader == msg.sender, Errors.NOT_OWNER);
 
-    uint32 key = M.key;
-    Level storage L = levels[key];
+    uint32 tickKey = M.key;
+    Level storage L = levels[tickKey];
 
     uint16 p = M.prev;
     uint16 n = M.next;
@@ -266,14 +258,14 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     // adjust volume
     L.vol -= M.size;
 
-    delete makerQ[uint16(orderId)];
 
+    (uint32 tick, bool isPut, bool isBid) = _splitKey(tickKey);
     if (L.vol == 0) {
-      (, bool isPut, bool isBid) = _splitKey(key);
-      _clearLevel(isBid, isPut, key);
+      _clearLevel(isBid, isPut, tickKey);
     }
 
-    emit Cancel(uint32(orderId), msg.sender, M.size);
+    emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
+    delete makerQ[uint16(orderId)];
   }
 
   /**
@@ -297,10 +289,10 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint256 shortCalls = _netShortCalls(P);
     uint256 shortPuts = _netShortPuts(P);
 
-    if (shortCalls > 0) _marketOrder(true, false, uint128(shortCalls));
-    if (shortPuts > 0) _marketOrder(true, true, uint128(shortPuts));
+    if (shortCalls > 0) _marketOrder(true, false, uint128(shortCalls), trader);
+    if (shortPuts > 0) _marketOrder(true, true, uint128(shortPuts), trader);
 
-    emit Liquidated(activeCycle, 0, trader, balances[trader], true);
+    emit Liquidated(activeCycle, trader);
   }
 
   function fixPrice() external {
@@ -318,7 +310,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   }
 
   function settleChunk(uint256 max) external returns (bool done) {
-    Cycle storage C = cycles[activeCycle];
+    uint256 cycleId = activeCycle;
+    Cycle storage C = cycles[cycleId];
     uint64 price = C.settlementPrice;
     require(price > 0, Errors.PRICE_NOT_FIXED);
     require(!C.isSettled, Errors.CYCLE_ALREADY_SETTLED);
@@ -330,8 +323,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     while (i < upper) {
       address t = traders[i];
-      uint256 key = activeCycle | uint256(uint160(t));
-      _settleTrader(key, price, t);
+      uint256 key = cycleId | uint256(uint160(t));
+      _settleTrader(cycleId, key, price, t);
       unchecked {
         ++i;
       }
@@ -515,6 +508,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   }
 
   function _settleFill(
+    uint32 orderId,
     bool takerIsBuy,
     bool isPut,
     uint256 price, // 6 decimals
@@ -542,9 +536,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
     }
 
+    uint256 cycleId = activeCycle;
+
     // Position acounting
-    Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
-    Pos storage PT = positions[activeCycle | uint256(uint160(taker))];
+    Pos storage PM = positions[cycleId | uint256(uint160(maker))];
+    Pos storage PT = positions[cycleId | uint256(uint160(taker))];
 
     if (isPut) {
       if (takerIsBuy) {
@@ -564,20 +560,14 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       }
     }
 
-    emit Trade(
-      uint32(price / TICK_SZ), // convert price back to tick
-      takerIsBuy, // isBuy from taker's perspective
-      isPut,
-      size,
-      taker,
-      maker
-    );
+    // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker);
+    emit OrderMatched(cycleId, orderId, size, price, takerIsBuy, isPut, taker, maker);
   }
 
   /**
    * @dev Fills against the opposite side until either a) qty exhausted, or b) book empty
    */
-  function _marketOrder(bool isBuy, bool isPut, uint128 want) private {
+  function _marketOrder(bool isBuy, bool isPut, uint128 want, address taker) private {
     uint128 left = want;
 
     while (left > 0) {
@@ -590,11 +580,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       // Best price level
       (uint32 bestTick, uint32 bestKey) = _best(!isBuy, isPut);
       Level storage L = levels[bestKey];
-      uint16 node = L.head;
+      uint16 nodeId = L.head; // nodeId = orderId
 
       // Walk FIFO makers at this tick
-      while (left > 0 && node != 0) {
-        Maker storage M = makerQ[node];
+      while (left > 0 && nodeId != 0) {
+        Maker storage M = makerQ[nodeId];
 
         uint128 take = left < M.size ? left : M.size;
         left -= take;
@@ -602,11 +592,12 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
         L.vol -= take;
 
         _settleFill(
+          nodeId,
           isBuy, // taker side
           isPut,
           uint256(bestTick) * TICK_SZ, // price
           take,
-          msg.sender, // taker
+          taker, // taker
           M.trader // maker
         );
 
@@ -617,8 +608,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
           else makerQ[nxt].prev = 0;
 
           L.head = nxt;
-          delete makerQ[node];
-          node = nxt;
+          delete makerQ[nodeId];
+          nodeId = nxt;
         } else {
           break; // Taker satisfied
         }
@@ -628,7 +619,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       if (L.vol == 0) _clearLevel(!isBuy, isPut, bestKey);
     }
 
-    if (left > 0) _queueTaker(isBuy, isPut, left, msg.sender);
+    if (left > 0) _queueTaker(isBuy, isPut, left, taker);
   }
 
   function _queueTaker(bool isBuy, bool isPut, uint128 qty, address trader) private {
@@ -658,6 +649,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       remainingMakerSize -= take;
 
       _settleFill(
+        0, // Imaginary orderId to denote that this is a takerQueue match
         !makerIsBid, // same as takerIsBuy
         isPut,
         price,
@@ -696,8 +688,8 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     delete levels[key];
   }
 
-  function _forceCancel(uint16 nodeId) internal {
-    Maker storage M = makerQ[nodeId];
+  function _forceCancel(uint16 orderId) internal {
+    Maker storage M = makerQ[orderId];
     uint32 key = M.key;
     Level storage L = levels[key];
 
@@ -710,12 +702,14 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     else makerQ[n].prev = p;
 
     L.vol -= M.size; // reduce resting volume
-    delete makerQ[nodeId]; // free storage
+    delete makerQ[orderId]; // free storage
 
+    (uint32 tick, bool isPut, bool isBid) = _splitKey(key);
     if (L.vol == 0) {
-      (, bool isPut, bool isBid) = _splitKey(key);
       _clearLevel(isBid, isPut, key);
     }
+
+    emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
   }
 
   // Return the mid and detailed bitmaps for the given side.
@@ -824,7 +818,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     return balances[trader] < mm6;
   }
 
-  function _settleTrader(uint256 key, uint64 price, address trader) internal {
+  function _settleTrader(uint256 cycleId, uint256 key, uint64 price, address trader) internal {
     Pos storage P = positions[key];
     if (P.longCalls | P.shortCalls | P.longPuts | P.shortPuts == 0) {
       delete positions[key];
@@ -857,7 +851,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     _applyCashDelta(trader, pnl);
     inList[trader] = false;
-    emit Settled(trader, pnl);
+    emit Settled(cycleId, trader, pnl);
 
     delete positions[key]; // gas refund
   }

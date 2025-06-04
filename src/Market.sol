@@ -411,6 +411,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
   // Convert tick, isPut, isBid to key
   function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
+    require(tick < 1<<24, Errors.TICK_TOO_LARGE);
     return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 

@@ -18,4 +18,5 @@ library Errors {
   string constant PRICE_NOT_FIXED = "PRICE_NOT_FIXED";
   string constant CYCLE_ALREADY_SETTLED = "CYCLE_ALREADY_SETTLED";
   string constant MARKET_NOT_LIVE = "MARKET_NOT_LIVE";
+  string constant TICK_TOO_LARGE = "TICK_TOO_LARGE";
 }

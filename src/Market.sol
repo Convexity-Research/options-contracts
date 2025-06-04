@@ -31,6 +31,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   IERC20 public collateralToken;
   uint64 public collateralDecimals;
   address public feeRecipient;
+  uint256 public badDebt; // grows whenever we meet an under-collateralised loser
+  uint256 public paidOut; // raw sum of *gross* positive deltas we have met so far
 
   //------- Gasless TX -------
   address private _trustedForwarder;
@@ -314,7 +316,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     (uint32 tick, bool isPut, bool isBid) = _splitKey(tickKey);
     if (L.vol == 0) _clearLevel(isBid, isPut, tickKey);
-    
+
     Pos storage P = positions[activeCycle | uint256(uint160(M.trader))];
     if (isPut) isBid ? P.pendingLongPuts -= uint32(M.size) : P.pendingShortPuts -= uint32(M.size);
     else isBid ? P.pendingLongCalls -= uint32(M.size) : P.pendingShortCalls -= uint32(M.size);
@@ -398,6 +400,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       activeCycle = 0;
       _purgeBook();
 
+      badDebt = 0;
+      paidOut = 0;
+
       emit CycleSettled(block.timestamp); // or cycleId
       done = true;
     }
@@ -411,7 +416,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
   // Convert tick, isPut, isBid to key
   function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
-    require(tick < 1<<24, Errors.TICK_TOO_LARGE);
+    require(tick < 1 << 24, Errors.TICK_TOO_LARGE);
     return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 
@@ -589,12 +594,10 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       int256 cashTaker = -dir * notionalPremium + takerFee;
 
       // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && balances[taker] < uint256((cashTaker*-1))) {
-        return 0;
-      }
+      if (isTakerQueue && balances[taker] < uint256((cashTaker * -1))) return 0;
 
-      _applyCashDelta(maker, cashMaker);
-      _applyCashDelta(taker, cashTaker);
+      _applyCashDeltaSocial(maker, cashMaker);
+      _applyCashDeltaSocial(taker, cashTaker);
 
       int256 houseFee = -(makerFee + takerFee); // net to fee recipient
       if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
@@ -674,7 +677,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
           false // isTakerQueue
         );
 
-        require(taken>0, Errors.INSUFFICIENT_BALANCE);
+        require(taken > 0, Errors.INSUFFICIENT_BALANCE);
 
         left -= taken;
         M.size -= taken;
@@ -756,6 +759,45 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       require(balances[user] >= absVal, Errors.INSUFFICIENT_BALANCE);
       balances[user] -= absVal;
     }
+  }
+
+  function _applyCashDeltaSocial(address u, int256 d) internal {
+    if (d < 0) {
+      uint256 debit = uint256(-d);
+      uint256 bal = balances[u];
+      if (bal >= debit) {
+        balances[u] = bal - debit;
+      } else {
+        balances[u] = 0;
+        badDebt += debit - bal;
+      }
+      return;
+    }
+
+    uint256 credit = uint256(d);
+    uint256 newPaid = paidOut + credit;
+
+    if (badDebt == 0) {
+      balances[u] += credit;
+      paidOut = newPaid;
+      return;
+    }
+
+    if (newPaid <= badDebt) {
+      // still underwater – winner gets nothing yet
+      paidOut = newPaid;
+      return;
+    }
+
+    // partially underwater: distribute only the surplus
+    uint256 distributable = newPaid - badDebt; // > 0
+    uint256 give = credit * distributable / newPaid;
+
+    balances[u] += give;
+
+    // plug the hole and keep only the surplus as new paidOut
+    paidOut = distributable;
+    badDebt = 0;
   }
 
   function _clearLevel(bool isBuy, bool isPut, uint32 key) private {
@@ -939,7 +981,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       pnl -= diff * int256(uint256(P.shortPuts)) / int256(CONTRACT_SIZE);
     }
 
-    _applyCashDelta(trader, pnl);
+    _applyCashDeltaSocial(trader, pnl);
     inList[trader] = false;
     emit Settled(cycleId, trader, pnl);
 

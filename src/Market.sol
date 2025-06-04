@@ -31,7 +31,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   address public feeRecipient;
 
   //------- Whitelist -------
-  address private constant WHITELIST_SIGNER = 0xf059b24cE0C34D44fb271dDC795a7C0E71576fd2;
+  address private constant WHITELIST_SIGNER = 0x6E12D8C87503D4287c294f2Fdef96ACd9DFf6bd2;
   mapping(address => bool) public whitelist;
 
   //------- Vault -------

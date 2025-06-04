@@ -23,8 +23,11 @@ contract MarketSuite is Test {
   address u1 = makeAddr("alice");
   address u2 = makeAddr("bob");
   address feeSink = makeAddr("feeSink");
+  address signer;
+  uint256 signerKey;
 
   function setUp() public {
+    (signer, signerKey) = makeAddrAndKey("signer");
     vm.createSelectFork("hyperevm");
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
     mkt = MarketTest(
@@ -60,7 +63,7 @@ contract MarketSuite is Test {
     uint256 price = 2e6; // 2 USDT0
 
     vm.prank(u1);
-    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price);
+    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price, _createSignature(u1));
 
     uint32 tick = _tick(price); // tick = 2e6 / 1e4 = 200
     uint32 key = _key(tick, false, true); // CALL-BID
@@ -91,7 +94,7 @@ contract MarketSuite is Test {
     uint32 expectedTick = 70000; // 700_000_000 / 10000
 
     vm.prank(u1);
-    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price);
+    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price, _createSignature(u1));
 
     uint32 tick = _tick(price);
     assertEq(tick, expectedTick, "tick calculation incorrect");
@@ -147,7 +150,7 @@ contract MarketSuite is Test {
     // Place all orders
     for (uint256 i = 0; i < prices.length; i++) {
       vm.prank(u1);
-      mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, prices[i]);
+      mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, prices[i], _createSignature(u1));
     }
 
     // Check each order's bits individually
@@ -189,14 +192,14 @@ contract MarketSuite is Test {
     // Maker (u1) posts bid
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, ONE_COIN);
+    mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, ONE_COIN, _createSignature(u1));
 
     uint256 balSinkBefore = mkt.balances(feeSink);
 
     // Taker (u2) hits bid
     _fund(u2, 1000 * ONE_COIN); // writer needs no upfront USDT premium
     vm.prank(u2);
-    mkt.placeOrder(OptionType.CALL, Side.SELL, LOT, ONE_COIN); // Price crossed since same price as maker
+    mkt.placeOrder(OptionType.CALL, Side.SELL, LOT, ONE_COIN, _createSignature(u2)); // Price crossed since same price as maker
 
     // Queues empty, level deleted
     uint32 key = _key(_tick(ONE_COIN), false, true);
@@ -222,13 +225,13 @@ contract MarketSuite is Test {
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
       vm.prank(u1);
-      mkt.placeOrder(OptionType.PUT, Side.SELL, LOT, ticks[i] * 1e4); // ask
+      mkt.placeOrder(OptionType.PUT, Side.SELL, LOT, ticks[i] * 1e4, _createSignature(u1)); // ask
     }
 
     // Taker buys 250 contracts market –> eats 2.5 levels
     _fund(u2, 1000000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(OptionType.PUT, Side.BUY, 250, 0); // market
+    mkt.placeOrder(OptionType.PUT, Side.BUY, 250, 0, _createSignature(u2)); // market
 
     // level[0] & level[1] empty, level[2] partial 50 left
     uint32 key0 = _key(ticks[0], true, false);
@@ -257,7 +260,7 @@ contract MarketSuite is Test {
     // Taker market order, book empty, 120 contracts queued
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.PUT, Side.BUY, 120, 0); // book is blank
+    mkt.placeOrder(OptionType.PUT, Side.BUY, 120, 0, _createSignature(u1)); // book is blank
 
     (TakerQ[] memory qBefore) = mkt.viewTakerQueue(true, true);
     assertEq(qBefore.length, 1); // 1 queued
@@ -266,7 +269,7 @@ contract MarketSuite is Test {
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(OptionType.PUT, Side.SELL, 200, ONE_COIN);
+    mkt.placeOrder(OptionType.PUT, Side.SELL, 200, ONE_COIN, _createSignature(u2));
 
     // The first 120 matched immediately, only 80 rest on book
     uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
@@ -290,7 +293,7 @@ contract MarketSuite is Test {
 
     _fund(u1, 1e24);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.CALL, Side.BUY, amount, price);
+    mkt.placeOrder(OptionType.CALL, Side.BUY, amount, price, _createSignature(u1));
 
     uint32 tick = _tick(price);
     (uint8 l1,,) = BitScan.split(tick);
@@ -325,6 +328,12 @@ contract MarketSuite is Test {
   function _key(uint32 t, bool put, bool bid) internal pure returns (uint32) {
     return t | (put ? 1 << 31 : 0) | (bid ? 1 << 30 : 0);
   }
+
+  function _createSignature(address user) internal view returns (bytes memory) {
+     bytes32 messageHash = keccak256(abi.encodePacked(user));
+     (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, messageHash);
+     return abi.encodePacked(r, s, v);
+   }
 
   function _printBook(bool isBid, bool isPut) internal view {
     OBLevel[] memory book = mkt.dumpBook(isBid, isPut);

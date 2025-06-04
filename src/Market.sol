@@ -8,12 +8,14 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
+
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-
+import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
 import {console} from "forge-std/console.sol";
 
-contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
+contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
@@ -29,6 +31,9 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   IERC20 public collateralToken;
   uint64 public collateralDecimals;
   address public feeRecipient;
+
+  //------- Gasless TX -------
+  address private _trustedForwarder;
 
   //------- Whitelist -------
   address private constant WHITELIST_SIGNER = 0x6E12D8C87503D4287c294f2Fdef96ACd9DFf6bd2;
@@ -81,11 +86,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
 
-  constructor() {
+  constructor() ERC2771ContextUpgradeable(address(0)) {
     _disableInitializers();
   }
 
-  function initialize(string memory _name, address _feeRecipient, address _collateralToken) external initializer {
+  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder) external initializer {
     __Ownable_init(_msgSender());
     __Pausable_init();
     __UUPSUpgradeable_init();
@@ -94,6 +99,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     feeRecipient = _feeRecipient;
     collateralToken = IERC20(_collateralToken);
     collateralDecimals = IERC20Metadata(_collateralToken).decimals();
+    _trustedForwarder = _forwarder;
   }
 
   function startCycle(uint256 expiry) external onlyOwner {
@@ -231,7 +237,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     uint256 extraMargin = _totalNotional(extraShort, price) * IM_BPS / denominator;
 
     require(
-      balances[msg.sender] >= _requiredMargin(msg.sender, price, IM_BPS) + extraMargin, Errors.INSUFFICIENT_BALANCE
+      balances[_msgSender()] >= _requiredMargin(_msgSender(), price, IM_BPS) + extraMargin, Errors.INSUFFICIENT_BALANCE
     );
 
     uint256 cycleId = activeCycle;
@@ -246,7 +252,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // Limit price of 0 means market order
     if (limitPrice == 0) {
-      _marketOrder(isBuy, isPut, uint128(size), msg.sender);
+      _marketOrder(isBuy, isPut, uint128(size), _msgSender());
       return 0;
     }
 
@@ -257,7 +263,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       (uint32 oppBest,) = _best(!isBuy, isPut);
 
       if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        _marketOrder(isBuy, isPut, uint128(size), msg.sender);
+        _marketOrder(isBuy, isPut, uint128(size), _msgSender());  
         return 0;
       }
     }
@@ -274,7 +280,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
     Maker storage M = makerQ[uint16(orderId)];
 
-    require(M.trader == msg.sender, Errors.NOT_OWNER);
+    require(M.trader == _msgSender(), Errors.NOT_OWNER);
 
     uint32 tickKey = M.key;
     Level storage L = levels[tickKey];
@@ -305,7 +311,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   }
 
   /**
-   * @notice Anyone may call this when a trader’s equity has fallen below maintenance margin.
+   * @notice Anyone may call this when a trader's equity has fallen below maintenance margin.
    * @param makerIds open maker-order nodeIds that belong to `trader`
    *                 (pass an empty array if the trader has no orders)
    */
@@ -317,7 +323,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     for (uint256 k; k < makerIds.length; ++k) {
       uint16 id = makerIds[k];
       Maker storage M = makerQ[id];
-      if (M.trader != trader) continue; // skip others’ orders
+      if (M.trader != trader) continue; // skip others' orders
       _forceCancel(id);
     }
 
@@ -524,7 +530,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
 
     // maker node
     nodeId = ++nodePtr;
-    makerQ[nodeId] = Maker(msg.sender, size, 0, key, levels[key].tail);
+    makerQ[nodeId] = Maker(_msgSender(), size, 0, key, levels[key].tail);
 
     // FIFO queue link
     if (levels[key].vol == 0) levels[key].head = nodeId;
@@ -533,11 +539,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     levels[key].vol += size;
 
     // position table
-    if (!inList[msg.sender]) {
-      inList[msg.sender] = true;
-      traders.push(msg.sender);
+    if (!inList[_msgSender()]) {
+      inList[_msgSender()] = true;
+      traders.push(_msgSender());
     }
-    Pos storage P = positions[activeCycle | uint256(uint160(msg.sender))]; // key by cycle+trader
+    Pos storage P = positions[activeCycle | uint256(uint160(_msgSender()))]; // key by cycle+trader
 
     if (isPut) isBuy ? P.longPuts += uint96(size) : P.shortPuts += uint96(size);
     else isBuy ? P.longCalls += uint96(size) : P.shortCalls += uint96(size);
@@ -691,7 +697,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
         price,
         take,
         T.trader, // The (queued) taker
-        msg.sender // The maker
+        _msgSender() // The maker
       );
 
       if (T.size == 0) ++i; // fully consumed
@@ -924,11 +930,31 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     return _getOraclePrice(index);
   }
 
+  function trustedForwarder() public override view returns (address) {
+    return _trustedForwarder;
+  }
+
+  function _msgSender() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (address sender) {
+    return ERC2771ContextUpgradeable._msgSender();
+  }
+
+  function _msgData() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (bytes calldata) {
+    return ERC2771ContextUpgradeable._msgData();
+  }
+
+  function _contextSuffixLength() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (uint256) {
+    return ERC2771ContextUpgradeable._contextSuffixLength();
+  }
+
   // #######################################################################
   // #                                                                     #
   // #                  Admin functions                                    #
   // #                                                                     #
   // #######################################################################
+
+  function setTrustedForwarder(address _forwarder) external onlyOwner {
+    _trustedForwarder = _forwarder;
+  }
 
   function pause() external override onlyOwner {
     _pause();

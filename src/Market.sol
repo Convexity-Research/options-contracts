@@ -21,7 +21,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 constant IM_BPS = 10; // 0.10 % Initial Margin
   uint256 constant MM_BPS = 10; // 0.10 % Maintenance Margin (same as IM_BPS for now)
-  uint256 public constant CONTRACT_SIZE = 100; // 0.01BTC
+  uint256 public constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 public constant makerFeeBps = 10; // +0.10 %, basis points
   int256 public constant takerFeeBps = -40; // –0.40 %, basis points
   uint256 public constant denominator = 10_000;
@@ -75,7 +75,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
   event OrderPlaced(uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed maker);
-  event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker);
+  event OrderFilled(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker, uint256 btcPrice);
   event OrderCancelled(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker);
   event Liquidated(uint256 indexed cycleId, address indexed trader);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
@@ -153,6 +153,42 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     // Transfer collateral token from contract to user
     collateralToken.transfer(trader, amount);
     emit CollateralWithdrawn(trader, amount);
+  }
+
+  function long(uint256 size, bytes memory signature) external isValidSignature(signature) {
+    whitelist[_msgSender()] = true;
+
+    // Long call
+    _placeOrder(OptionType.CALL, Side.BUY, size, 0);
+
+    // Short put
+    _placeOrder(OptionType.PUT, Side.SELL, size, 0);
+  }
+
+  function long(uint256 size) external onlyWhitelisted {
+    // Long call
+    _placeOrder(OptionType.CALL, Side.BUY, size, 0);
+
+    // Short put
+    _placeOrder(OptionType.PUT, Side.SELL, size, 0);
+  }
+
+  function short(uint256 size, bytes memory signature) external isValidSignature(signature) {
+    whitelist[_msgSender()] = true;
+
+    // Long put
+    _placeOrder(OptionType.PUT, Side.BUY, size, 0);
+
+    // Short call
+    _placeOrder(OptionType.CALL, Side.SELL, size, 0);
+  }
+
+  function short(uint256 size) external onlyWhitelisted {
+    // Long put
+    _placeOrder(OptionType.PUT, Side.BUY, size, 0);
+
+    // Short call
+    _placeOrder(OptionType.CALL, Side.SELL, size, 0);
   }
 
   function placeOrder(
@@ -561,7 +597,7 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
     }
 
     // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker);
-    emit OrderMatched(cycleId, orderId, size, price, takerIsBuy, isPut, taker, maker);
+    emit OrderFilled(cycleId, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
   }
 
   /**
@@ -669,8 +705,11 @@ contract Market is IMarket, UUPSUpgradeable, OwnableUpgradeable, PausableUpgrade
       balances[user] += uint256(delta);
     } else if (delta < 0) {
       uint256 absVal = uint256(-delta);
-      require(balances[user] >= absVal, "INSUFFICIENT_BALANCE");
-      balances[user] -= absVal;
+      if (balances[user] < absVal) {
+        balances[user] = 0;
+      } else {
+        balances[user] -= absVal;
+      }
     }
   }
 

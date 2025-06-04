@@ -252,11 +252,6 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     uint64 price = _getOraclePrice(0);
 
-    // Worst-case extra short exposure introduced by *this* order.
-    //  – buying (long) ⇒ 0
-    //  – selling (short) ⇒ full size
-    uint256 extraShort = side == Side.BUY ? 0 : size;
-
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
 
@@ -666,7 +661,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
         uint128 take = left < M.size ? left : M.size;
 
-        _settleFill(
+        uint128 taken = _settleFill(
           nodeId,
           isBuy, // taker side
           isPut,
@@ -677,9 +672,11 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
           false // isTakerQueue
         );
 
-        left -= take;
-        M.size -= take;
-        L.vol -= take;
+        require(taken>0, Errors.INSUFFICIENT_BALANCE);
+
+        left -= taken;
+        M.size -= taken;
+        L.vol -= taken;
 
         if (M.size == 0) {
           // Remove node from queue

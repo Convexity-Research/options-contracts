@@ -79,9 +79,29 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   event CycleSettled(uint256 indexed cycleId);
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
-  event OrderPlaced(uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed maker);
-  event OrderFilled(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker, uint256 btcPrice);
-  event OrderCancelled(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker);
+  event OrderPlaced(
+    uint256 indexed cycleId,
+    uint256 orderId,
+    uint256 size,
+    uint256 limitPrice,
+    bool isBuy,
+    bool isPut,
+    address indexed maker
+  );
+  event OrderFilled(
+    uint256 indexed cycleId,
+    uint256 orderId,
+    uint128 size,
+    uint256 limitPrice,
+    bool isBuy,
+    bool isPut,
+    address indexed taker,
+    address indexed maker,
+    uint256 btcPrice
+  );
+  event OrderCancelled(
+    uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker
+  );
   event Liquidated(uint256 indexed cycleId, address indexed trader);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
@@ -90,7 +110,10 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     _disableInitializers();
   }
 
-  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder) external initializer {
+  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder)
+    external
+    initializer
+  {
     __Ownable_init(_msgSender());
     __Pausable_init();
     __UUPSUpgradeable_init();
@@ -147,7 +170,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     require(amount > 0, Errors.INVALID_AMOUNT);
 
     address trader = _msgSender();
-    require(!inList[trader] || _noOpenPositions(trader), Errors.IN_TRADER_LIST);
+    require(_noOpenPositionsOrOrders(trader), Errors.IN_TRADER_LIST);
 
     uint256 balance = balances[trader];
 
@@ -234,14 +257,6 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     //  – selling (short) ⇒ full size
     uint256 extraShort = side == Side.BUY ? 0 : size;
 
-    uint256 extraMargin = _totalNotional(extraShort, price) * IM_BPS / denominator;
-
-    require(
-      balances[_msgSender()] >= _requiredMargin(_msgSender(), price, IM_BPS) + extraMargin, Errors.INSUFFICIENT_BALANCE
-    );
-
-    uint256 cycleId = activeCycle;
-
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
 
@@ -263,7 +278,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       (uint32 oppBest,) = _best(!isBuy, isPut);
 
       if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        _marketOrder(isBuy, isPut, uint128(size), _msgSender());  
+        _marketOrder(isBuy, isPut, uint128(size), _msgSender());
         return 0;
       }
     }
@@ -274,6 +289,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     if (qtyLeft == 0) return 0;
 
     orderId = _insertLimit(isBuy, isPut, tick, qtyLeft);
+
+    require(balances[_msgSender()] >= _requiredMargin(_msgSender(), price, IM_BPS), Errors.INSUFFICIENT_BALANCE);
   }
 
   function cancelOrder(uint256 orderId) external {
@@ -300,11 +317,12 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     // adjust volume
     L.vol -= M.size;
 
-
     (uint32 tick, bool isPut, bool isBid) = _splitKey(tickKey);
-    if (L.vol == 0) {
-      _clearLevel(isBid, isPut, tickKey);
-    }
+    if (L.vol == 0) _clearLevel(isBid, isPut, tickKey);
+    
+    Pos storage P = positions[activeCycle | uint256(uint160(M.trader))];
+    if (isPut) isBid ? P.pendingLongPuts -= uint32(M.size) : P.pendingShortPuts -= uint32(M.size);
+    else isBid ? P.pendingLongCalls -= uint32(M.size) : P.pendingShortCalls -= uint32(M.size);
 
     emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
     delete makerQ[uint16(orderId)];
@@ -373,7 +391,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     }
     cursor = i;
 
-    if (i == n) { // Finished settling all traders
+    if (i == n) {
+      // Finished settling all traders
       delete traders;
       delete takerQ;
       delete tqHead;
@@ -545,8 +564,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     }
     Pos storage P = positions[activeCycle | uint256(uint160(_msgSender()))]; // key by cycle+trader
 
-    if (isPut) isBuy ? P.longPuts += uint96(size) : P.shortPuts += uint96(size);
-    else isBuy ? P.longCalls += uint96(size) : P.shortCalls += uint96(size);
+    if (isPut) isBuy ? P.pendingLongPuts += uint32(size) : P.pendingShortPuts += uint32(size);
+    else isBuy ? P.pendingLongCalls += uint32(size) : P.pendingShortCalls += uint32(size);
   }
 
   function _settleFill(
@@ -556,8 +575,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint256 price, // 6 decimals
     uint128 size,
     address taker,
-    address maker
-  ) internal {
+    address maker,
+    bool isTakerQueue
+  ) internal returns (uint128) {
     {
       int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
 
@@ -570,6 +590,11 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       // flip premium flow with dir
       int256 cashMaker = dir * notionalPremium + makerFee;
       int256 cashTaker = -dir * notionalPremium + takerFee;
+
+      // Check if taker has enough cash to pay premium. If not, return 0
+      if (isTakerQueue && balances[taker] < uint256((cashTaker*-1))) {
+        return 0;
+      }
 
       _applyCashDelta(maker, cashMaker);
       _applyCashDelta(taker, cashTaker);
@@ -586,24 +611,35 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     if (isPut) {
       if (takerIsBuy) {
-        PT.longPuts += uint96(size);
-        PM.shortPuts += uint96(size);
+        PT.longPuts += uint32(size);
+        PM.shortPuts += uint32(size);
+        if (!isTakerQueue) PM.pendingShortPuts -= uint32(size);
+        else PT.pendingLongPuts -= uint32(size);
       } else {
-        PT.shortPuts += uint96(size);
-        PM.longPuts += uint96(size);
+        PT.shortPuts += uint32(size);
+        PM.longPuts += uint32(size);
+        if (!isTakerQueue) PM.pendingLongPuts -= uint32(size);
+        else PT.pendingShortPuts -= uint32(size);
       }
     } else {
       if (takerIsBuy) {
-        PT.longCalls += uint96(size);
-        PM.shortCalls += uint96(size);
+        PT.longCalls += uint32(size);
+        PM.shortCalls += uint32(size);
+        if (!isTakerQueue) PM.pendingShortCalls -= uint32(size);
+        else PT.pendingLongCalls -= uint32(size);
       } else {
-        PT.shortCalls += uint96(size);
-        PM.longCalls += uint96(size);
+        PT.shortCalls += uint32(size);
+        PM.longCalls += uint32(size);
+        if (!isTakerQueue) PM.pendingLongCalls -= uint32(size);
+        else PT.pendingShortCalls -= uint32(size);
       }
     }
 
-    // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool isPut, address indexed taker, address indexed maker);
+    // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool
+    // isPut, address indexed taker, address indexed maker);
     emit OrderFilled(cycleId, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
+
+    return size;
   }
 
   /**
@@ -629,9 +665,6 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
         Maker storage M = makerQ[nodeId];
 
         uint128 take = left < M.size ? left : M.size;
-        left -= take;
-        M.size -= take;
-        L.vol -= take;
 
         _settleFill(
           nodeId,
@@ -640,8 +673,13 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
           uint256(bestTick) * TICK_SZ, // price
           take,
           taker, // taker
-          M.trader // maker
+          M.trader, // maker
+          false // isTakerQueue
         );
+
+        left -= take;
+        M.size -= take;
+        L.vol -= take;
 
         if (M.size == 0) {
           // Remove node from queue
@@ -666,6 +704,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
   function _queueTaker(bool isBuy, bool isPut, uint128 qty, address trader) private {
     takerQ[isPut ? 1 : 0][isBuy ? 1 : 0].push(TakerQ({size: uint96(qty), trader: trader}));
+    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
+    if (isPut) isBuy ? P.pendingLongPuts += uint32(qty) : P.pendingShortPuts += uint32(qty);
+    else isBuy ? P.pendingLongCalls += uint32(qty) : P.pendingShortCalls += uint32(qty);
   }
 
   function _matchQueuedTakers(
@@ -687,18 +728,20 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       } // skip emptied slot
 
       uint128 take = T.size > remainingMakerSize ? remainingMakerSize : T.size;
-      T.size -= uint96(take);
-      remainingMakerSize -= take;
 
-      _settleFill(
+      uint128 taken = _settleFill(
         0, // Imaginary orderId to denote that this is a takerQueue match
         !makerIsBid, // same as takerIsBuy
         isPut,
         price,
         take,
         T.trader, // The (queued) taker
-        _msgSender() // The maker
+        _msgSender(), // The maker
+        true // isTakerQueue
       );
+
+      T.size -= uint96(taken);
+      remainingMakerSize -= taken;
 
       if (T.size == 0) ++i; // fully consumed
     }
@@ -711,11 +754,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       balances[user] += uint256(delta);
     } else if (delta < 0) {
       uint256 absVal = uint256(-delta);
-      if (balances[user] < absVal) {
-        balances[user] = 0;
-      } else {
-        balances[user] -= absVal;
-      }
+      require(balances[user] >= absVal, Errors.INSUFFICIENT_BALANCE);
+      balances[user] -= absVal;
     }
   }
 
@@ -747,12 +787,14 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     else makerQ[n].prev = p;
 
     L.vol -= M.size; // reduce resting volume
+    Pos storage P = positions[activeCycle | uint256(uint160(M.trader))];
+    (uint32 tick, bool isPut, bool isBid) = _splitKey(M.key);
+
+    if (isPut) isBid ? P.pendingLongPuts -= uint32(M.size) : P.pendingShortPuts -= uint32(M.size);
+    else isBid ? P.pendingLongCalls -= uint32(M.size) : P.pendingShortCalls -= uint32(M.size);
     delete makerQ[orderId]; // free storage
 
-    (uint32 tick, bool isPut, bool isBid) = _splitKey(key);
-    if (L.vol == 0) {
-      _clearLevel(isBid, isPut, key);
-    }
+    if (L.vol == 0) _clearLevel(isBid, isPut, key);
 
     emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
   }
@@ -839,11 +881,15 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   function _netShortCalls(Pos memory p) internal pure returns (uint256) {
-    return p.shortCalls > p.longCalls ? p.shortCalls - p.longCalls : 0;
+    return (p.shortCalls + p.pendingShortCalls) > (p.longCalls + p.pendingLongCalls)
+      ? (p.shortCalls + p.pendingShortCalls) - (p.longCalls + p.pendingLongCalls)
+      : 0;
   }
 
   function _netShortPuts(Pos memory p) internal pure returns (uint256) {
-    return p.shortPuts > p.longPuts ? p.shortPuts - p.longPuts : 0;
+    return (p.shortPuts + p.pendingShortPuts) > (p.longPuts + p.pendingLongPuts)
+      ? (p.shortPuts + p.pendingShortPuts) - (p.longPuts + p.pendingLongPuts)
+      : 0;
   }
 
   function _requiredMargin(address trader, uint64 price, uint256 marginBps) internal view returns (uint256 rm) {
@@ -901,9 +947,11 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     delete positions[key]; // gas refund
   }
 
-  function _noOpenPositions(address trader) internal view returns (bool) {
+  function _noOpenPositionsOrOrders(address trader) internal view returns (bool) {
     uint256 key = activeCycle | uint256(uint160(trader));
-    return positions[key].longCalls | positions[key].shortCalls | positions[key].longPuts | positions[key].shortPuts == 0;
+    return positions[key].longCalls | positions[key].shortCalls | positions[key].longPuts | positions[key].shortPuts
+      | positions[key].pendingLongCalls | positions[key].pendingShortCalls | positions[key].pendingLongPuts
+      | positions[key].pendingShortPuts == 0;
   }
 
   // #######################################################################
@@ -922,7 +970,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   modifier isValidSignature(bytes memory signature) {
-    require(WHITELIST_SIGNER == ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature), Errors.INVALID_SIGNATURE);
+    require(
+      WHITELIST_SIGNER == ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature), Errors.INVALID_SIGNATURE
+    );
     _;
   }
 
@@ -930,7 +980,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     return _getOraclePrice(index);
   }
 
-  function trustedForwarder() public override view returns (address) {
+  function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
   }
 
@@ -942,7 +992,12 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     return ERC2771ContextUpgradeable._msgData();
   }
 
-  function _contextSuffixLength() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (uint256) {
+  function _contextSuffixLength()
+    internal
+    view
+    override(ERC2771ContextUpgradeable, ContextUpgradeable)
+    returns (uint256)
+  {
     return ERC2771ContextUpgradeable._contextSuffixLength();
   }
 

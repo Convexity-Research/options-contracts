@@ -19,10 +19,14 @@ struct Cycle {
 }
 
 struct Pos {
-  uint96 longCalls;
-  uint96 shortCalls;
-  uint96 longPuts;
-  uint96 shortPuts;
+  uint32 longCalls;
+  uint32 shortCalls;
+  uint32 longPuts;
+  uint32 shortPuts;
+  uint32 pendingLongCalls;
+  uint32 pendingShortCalls;
+  uint32 pendingLongPuts;
+  uint32 pendingShortPuts;
 }
 
 struct Level {

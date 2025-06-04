@@ -28,7 +28,6 @@ contract MarketSuite is Test {
 
   function setUp() public {
     (signer, signerKey) = makeAddrAndKey("signer");
-    vm.createSelectFork("hyperevm");
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
     mkt = MarketTest(
       address(
@@ -199,7 +198,8 @@ contract MarketSuite is Test {
     // Taker (u2) hits bid
     _fund(u2, 1000 * ONE_COIN); // writer needs no upfront USDT premium
     vm.prank(u2);
-    mkt.placeOrder(OptionType.CALL, Side.SELL, LOT, ONE_COIN, _createSignature(u2)); // Price crossed since same price as maker
+    mkt.placeOrder(OptionType.CALL, Side.SELL, LOT, ONE_COIN, _createSignature(u2)); // Price crossed since same price
+      // as maker
 
     // Queues empty, level deleted
     uint32 key = _key(_tick(ONE_COIN), false, true);
@@ -330,10 +330,10 @@ contract MarketSuite is Test {
   }
 
   function _createSignature(address user) internal view returns (bytes memory) {
-     bytes32 messageHash = keccak256(abi.encodePacked(user));
-     (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, messageHash);
-     return abi.encodePacked(r, s, v);
-   }
+    bytes32 messageHash = keccak256(abi.encodePacked(user));
+    (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, messageHash);
+    return abi.encodePacked(r, s, v);
+  }
 
   function _printBook(bool isBid, bool isPut) internal view {
     OBLevel[] memory book = mkt.dumpBook(isBid, isPut);

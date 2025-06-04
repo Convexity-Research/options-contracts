@@ -573,6 +573,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     address maker,
     bool isTakerQueue
   ) internal returns (uint128) {
+    // Fees accounting
     {
       int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
 
@@ -598,7 +599,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
     }
 
-    // Position acounting
+    // Position accounting
     {
       Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
       Pos storage PT = positions[activeCycle | uint256(uint160(taker))];

@@ -64,7 +64,4 @@ interface IMarket {
 
   // function liquidate(uint256[] calldata orderIds, address trader) external;
   // function settle(uint256 cycleId) external;
-
-  function pause() external;
-  function unpause() external;
 }

@@ -6,38 +6,34 @@ import {Errors} from "./lib/Errors.sol";
 import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
+import {Context} from "@openzeppelin/contracts/utils/Context.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC2771Context} from "@openzeppelin/contracts/metatx/ERC2771Context.sol";
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
-
-contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
+contract MarketNonUpgradeable is ERC2771Context, Ownable {
   using BitScan for uint256;
 
   //------- Meta -------
-  address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
-  uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
+  string public name;
+  IERC20 collateralToken;
+  uint64 constant collateralDecimals = 6;
+  address immutable ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
+  uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 constant IM_BPS = 10; // 0.10 % Initial Margin
   uint256 constant MM_BPS = 10; // 0.10 % Maintenance Margin (same as IM_BPS for now)
-  uint256 public constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 public constant makerFeeBps = 10; // +0.10 %, basis points
-  int256 public constant takerFeeBps = -40; // –0.40 %, basis points
-  uint256 public constant denominator = 10_000;
-  string public name;
-  IERC20 public collateralToken;
-  uint64 public collateralDecimals;
-  address public feeRecipient;
-  uint256 public badDebt; // grows whenever we meet an under-collateralised loser
-  uint256 public paidOut; // raw sum of *gross* positive deltas we have met so far
+  uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
+  int256 constant makerFeeBps = 10; // +0.10 %, basis points
+  int256 constant takerFeeBps = -40; // –0.40 %, basis points
+  uint256 constant denominator = 10_000;
+  address feeRecipient;
+  uint256 badDebt; // grows whenever we meet an under-collateralised loser
+  uint256 paidOut; // raw sum of *gross* positive deltas we have met so far
 
   //------- Gasless TX -------
   address private _trustedForwarder;
 
   //------- Whitelist -------
-  address private constant WHITELIST_SIGNER = 0x6E12D8C87503D4287c294f2Fdef96ACd9DFf6bd2;
+  address whitelistSigner;
   mapping(address => bool) public whitelist;
 
   //------- Vault -------
@@ -50,8 +46,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   //------- Trading/Positions -------
   address[] public traders;
   mapping(uint256 => Pos) public positions;
-  mapping(address => bool) public inList;
-  uint256 public cursor; // settlement iterator
+  mapping(address => bool) inList;
+  uint256 cursor; // settlement iterator
 
   TakerQ[][2][2] private takerQ; // 4 buckets
   uint256[2][2] public tqHead; // cursor per bucket
@@ -75,6 +71,20 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   mapping(uint16 => uint256) public detCA;
   mapping(uint16 => uint256) public detPB;
   mapping(uint16 => uint256) public detPA;
+
+  /**
+   * `summaryIdx` (0-3)  →  L1-byte  → bitmap
+   *     0 : call-asks (CA)
+   *     1 : call-bids (CB)
+   *     2 : put-asks  (PA)
+   *     3 : put-bids  (PB)
+   */
+  mapping(uint8 => mapping(uint8 => uint256)) private mid; // mid[summaryIdx][l1]
+
+  /**
+   * `summaryIdx` (0-3)  →  detKey (= l1<<8 | l2)  → bitmap
+   */
+  mapping(uint8 => mapping(uint16 => uint256)) private det; // det[summaryIdx][detKey]
 
   event CycleStarted(uint256 indexed cycleId, uint256 strike);
   event CycleSettled(uint256 indexed cycleId);
@@ -107,37 +117,32 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
 
-  constructor() ERC2771ContextUpgradeable(address(0)) {
-    _disableInitializers();
-  }
-
-  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder)
-    external
-    initializer
-  {
-    __Ownable_init(_msgSender());
-    __Pausable_init();
-    __UUPSUpgradeable_init();
-
+  constructor(
+    string memory _name,
+    address _feeRecipient,
+    address _collateralToken,
+    address _forwarder,
+    address _whitelistSigner
+  ) ERC2771Context(address(0)) Ownable(msg.sender) {
     name = _name;
     feeRecipient = _feeRecipient;
     collateralToken = IERC20(_collateralToken);
-    collateralDecimals = IERC20Metadata(_collateralToken).decimals();
     _trustedForwarder = _forwarder;
+    whitelistSigner = _whitelistSigner;
   }
 
   function startCycle(uint256 expiry) external onlyOwner {
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
-      require(activeCycle < block.timestamp, Errors.CYCLE_ALREADY_STARTED);
+      if (activeCycle >= block.timestamp) revert Errors.CycleAlreadyStarted();
 
       // The previous cycle must be settled
-      require(cycles[activeCycle].isSettled, Errors.PREVIOUS_CYCLE_NOT_SETTLED);
+      if (!cycles[activeCycle].isSettled) revert Errors.PreviousCycleNotSettled();
     }
 
     // BTC index is zero
     uint64 price = _getOraclePrice(0);
-    require(price > 0, Errors.INVALID_ORACLE_PRICE);
+    if (price == 0) revert Errors.InvalidOraclePrice();
 
     // Create new market
     cycles[expiry] = Cycle({
@@ -154,7 +159,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   function depositCollateral(uint256 amount) external {
-    require(amount > 0, Errors.INVALID_AMOUNT);
+    if (amount == 0) revert Errors.InvalidAmount();
 
     address trader = _msgSender();
 
@@ -168,14 +173,14 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   function withdrawCollateral(uint256 amount) external {
-    require(amount > 0, Errors.INVALID_AMOUNT);
+    if (amount == 0) revert Errors.InvalidAmount();
 
     address trader = _msgSender();
-    require(_noOpenPositionsOrOrders(trader), Errors.IN_TRADER_LIST);
+    if (!_noOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
 
     uint256 balance = balances[trader];
 
-    require(balance >= amount, Errors.INSUFFICIENT_BALANCE);
+    if (balance < amount) revert Errors.InsufficientBalance();
 
     // Update user's balance
     balances[trader] -= amount;
@@ -247,9 +252,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint256 size,
     uint256 limitPrice // 0 = market
   ) private returns (uint256 orderId) {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
 
-    require(size > 0, Errors.INVALID_AMOUNT);
+    if (size == 0) revert Errors.InvalidAmount();
 
     uint64 price = _getOraclePrice(0);
 
@@ -286,14 +291,14 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     orderId = _insertLimit(isBuy, isPut, tick, qtyLeft);
 
-    require(balances[_msgSender()] >= _requiredMargin(_msgSender(), price, IM_BPS), Errors.INSUFFICIENT_BALANCE);
+    if (balances[_msgSender()] < _requiredMargin(_msgSender(), price, IM_BPS)) revert Errors.InsufficientBalance();
   }
 
   function cancelOrder(uint256 orderId) external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
     Maker storage M = makerQ[uint16(orderId)];
 
-    require(M.trader == _msgSender(), Errors.NOT_OWNER);
+    if (M.trader != _msgSender()) revert Errors.NotOwner();
 
     uint32 tickKey = M.key;
     Level storage L = levels[tickKey];
@@ -330,9 +335,9 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
    *                 (pass an empty array if the trader has no orders)
    */
   function liquidate(uint16[] calldata makerIds, address trader) external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
     uint64 price = _getOraclePrice(0);
-    require(_isLiquidatable(trader, price), Errors.STILL_SOLVENT);
+    if (!_isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     for (uint256 k; k < makerIds.length; ++k) {
       uint16 id = makerIds[k];
@@ -352,8 +357,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   function fixPrice() external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
-    require(block.timestamp >= activeCycle, Errors.NOT_EXPIRED);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    if (block.timestamp < activeCycle) revert Errors.NotExpired();
 
     Cycle storage C = cycles[activeCycle];
 
@@ -369,8 +374,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
     uint64 price = C.settlementPrice;
-    require(price > 0, Errors.PRICE_NOT_FIXED);
-    require(!C.isSettled, Errors.CYCLE_ALREADY_SETTLED);
+    if (price == 0) revert Errors.PriceNotFixed();
+    if (C.isSettled) revert Errors.CycleAlreadySettled();
 
     uint256 n = traders.length;
     uint256 i = cursor;
@@ -415,7 +420,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
   // Convert tick, isPut, isBid to key
   function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
-    require(tick < 1 << 24, Errors.TICK_TOO_LARGE);
+    if (tick >= 1 << 24) revert Errors.TickTooLarge();
     return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
   }
 
@@ -676,7 +681,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
           false // isTakerQueue
         );
 
-        require(taken > 0, Errors.INSUFFICIENT_BALANCE);
+        if (taken == 0) revert Errors.InsufficientBalance();
 
         left -= taken;
         M.size -= taken;
@@ -755,7 +760,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       balances[user] += uint256(delta);
     } else if (delta < 0) {
       uint256 absVal = uint256(-delta);
-      require(balances[user] >= absVal, Errors.INSUFFICIENT_BALANCE);
+      if (balances[user] < absVal) revert Errors.InsufficientBalance();
       balances[user] -= absVal;
     }
   }
@@ -1005,14 +1010,14 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   }
 
   modifier onlyWhitelisted() {
-    require(whitelist[_msgSender()], Errors.NOT_WHITELISTED);
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
     _;
   }
 
   modifier isValidSignature(bytes memory signature) {
-    require(
-      WHITELIST_SIGNER == ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature), Errors.INVALID_SIGNATURE
-    );
+    if (whitelistSigner != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
+      revert Errors.InvalidSignature();
+    }
     _;
   }
 
@@ -1024,21 +1029,16 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     return _trustedForwarder;
   }
 
-  function _msgSender() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (address sender) {
-    return ERC2771ContextUpgradeable._msgSender();
+  function _msgSender() internal view override(ERC2771Context, Context) returns (address sender) {
+    return ERC2771Context._msgSender();
   }
 
-  function _msgData() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (bytes calldata) {
-    return ERC2771ContextUpgradeable._msgData();
+  function _msgData() internal view override(ERC2771Context, Context) returns (bytes calldata) {
+    return ERC2771Context._msgData();
   }
 
-  function _contextSuffixLength()
-    internal
-    view
-    override(ERC2771ContextUpgradeable, ContextUpgradeable)
-    returns (uint256)
-  {
-    return ERC2771ContextUpgradeable._contextSuffixLength();
+  function _contextSuffixLength() internal view override(ERC2771Context, Context) returns (uint256) {
+    return ERC2771Context._contextSuffixLength();
   }
 
   // #######################################################################
@@ -1050,20 +1050,4 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   function setTrustedForwarder(address _forwarder) external onlyOwner {
     _trustedForwarder = _forwarder;
   }
-
-  function pause() external onlyOwner {
-    _pause();
-  }
-
-  function unpause() external onlyOwner {
-    _unpause();
-  }
-
-  /**
-   * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract.
-   * Called by
-   * {upgradeTo} and {upgradeToAndCall}.
-   * @param newImplementation Address of the new implementation contract
-   */
-  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

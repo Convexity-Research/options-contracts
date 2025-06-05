@@ -10,7 +10,7 @@ import {Context} from "@openzeppelin/contracts/utils/Context.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC2771Context} from "@openzeppelin/contracts/metatx/ERC2771Context.sol";
 
-contract MarketNonUpgradeable is ERC2771Context, Ownable {
+contract MarketNonUpgradeable is ERC2771Context {
   using BitScan for uint256;
 
   //------- Meta -------
@@ -49,7 +49,7 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
   mapping(address => bool) inList;
   uint256 cursor; // settlement iterator
 
-  TakerQ[][2][2] private takerQ; // 4 buckets
+  TakerQ[][2][2] internal takerQ; // 4 buckets
   uint256[2][2] public tqHead; // cursor per bucket
 
   //------- Orderbook -------
@@ -59,18 +59,6 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
 
   // summary (L1): which [256*256] blocks have liquidity
   uint256[4] public summaries;
-
-  // mid (L2): which [256] block has liquidity
-  mapping(uint8 => uint256) public midCB;
-  mapping(uint8 => uint256) public midCA;
-  mapping(uint8 => uint256) public midPB;
-  mapping(uint8 => uint256) public midPA;
-
-  // detail (L3): which tick has liquidity
-  mapping(uint16 => uint256) public detCB;
-  mapping(uint16 => uint256) public detCA;
-  mapping(uint16 => uint256) public detPB;
-  mapping(uint16 => uint256) public detPA;
 
   /**
    * `summaryIdx` (0-3)  →  L1-byte  → bitmap
@@ -123,7 +111,7 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
     address _collateralToken,
     address _forwarder,
     address _whitelistSigner
-  ) ERC2771Context(address(0)) Ownable(msg.sender) {
+  ) ERC2771Context(address(0)) {
     name = _name;
     feeRecipient = _feeRecipient;
     collateralToken = IERC20(_collateralToken);
@@ -131,7 +119,7 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
     whitelistSigner = _whitelistSigner;
   }
 
-  function startCycle(uint256 expiry) external onlyOwner {
+  function startCycle(uint256 expiry) external {
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
       if (activeCycle >= block.timestamp) revert Errors.CycleAlreadyStarted();
@@ -448,8 +436,8 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
    * Index system is LSB-based. Meaning that index 0 is right most bit, and index 255 is left most bit.
    */
   function _addBits(
-    mapping(uint16 => uint256) storage det, // detail  (L3)  bitmap
-    mapping(uint8 => uint256) storage mid, // mid     (L2)  bitmap
+    mapping(uint16 => uint256) storage dett, // detail  (L3)  bitmap
+    mapping(uint8 => uint256) storage midd, // mid     (L2)  bitmap
     uint8 l1, // high    byte
     uint8 l2, // middle  byte
     uint8 l3 // low     byte
@@ -458,13 +446,13 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
     uint256 m3 = BitScan.mask(l3); // Isolate bit l3
 
     // If this is the very first order at (l1,l2,l3) …
-    if (det[detKey] & m3 == 0) {
-      det[detKey] |= m3; // Flip the detail bit
+    if (dett[detKey] & m3 == 0) {
+      dett[detKey] |= m3; // Flip the detail bit
 
       uint256 m2 = BitScan.mask(l2); // Bit mask for mid bitmap
       // If this tick is the first in its 256-tick block
-      if (mid[l1] & m2 == 0) {
-        mid[l1] |= m2; // Set the mid-level bit
+      if (midd[l1] & m2 == 0) {
+        midd[l1] |= m2; // Set the mid-level bit
         return true; // Caller must set summary bit for l1
       }
     }
@@ -477,20 +465,20 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
    *       Returns false -> summary still has other blocks.
    */
   function _clrBits(
-    mapping(uint16 => uint256) storage det,
-    mapping(uint8 => uint256) storage mid,
+    mapping(uint16 => uint256) storage dett,
+    mapping(uint8 => uint256) storage midd,
     uint8 l1,
     uint8 l2,
     uint8 l3
   ) internal returns (bool lastInL1) {
     uint16 detKey = (uint16(l1) << 8) | l2; // Locate detail word
-    det[detKey] &= ~BitScan.mask(l3); // Clear bit l3
+    dett[detKey] &= ~BitScan.mask(l3); // Clear bit l3
 
     // If no ticks left in this 256-tick word
-    if (det[detKey] == 0) {
-      mid[l1] &= ~BitScan.mask(l2); // Clear mid-level bit
+    if (dett[detKey] == 0) {
+      midd[l1] &= ~BitScan.mask(l2); // Clear mid-level bit
       // If no 256-tick words left in this 65 k-tick block
-      if (mid[l1] == 0) return true; // Caller must clear summary bit
+      if (midd[l1] == 0) return true; // Caller must clear summary bit
     }
     return false;
   }
@@ -498,15 +486,15 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
   // Returns the best tick and key for the given side and option type
   function _best(bool isBid, bool isPut) private view returns (uint32 tick, uint32 key) {
     uint256 summary = summaries[_summaryIx(isBid, isPut)];
-    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
+    (mapping(uint8 => uint256) storage midd, mapping(uint16 => uint256) storage dett) = _maps(isBid, isPut);
 
     // For bids we want highest price (msb), for asks we want lowest price (lsb)
     uint8 l1 = isBid ? summary.msb() : summary.lsb();
 
     // Same for l2 and l3
-    uint8 l2 = isBid ? mid[l1].msb() : mid[l1].lsb();
+    uint8 l2 = isBid ? midd[l1].msb() : midd[l1].lsb();
     uint16 k12 = (uint16(l1) << 8) | l2;
-    uint8 l3 = isBid ? det[k12].msb() : det[k12].lsb();
+    uint8 l3 = isBid ? dett[k12].msb() : dett[k12].lsb();
 
     tick = BitScan.join(l1, l2, l3);
     key = _key(tick, isPut, isBid);
@@ -538,7 +526,7 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
 
   function _insertLimit(bool isBuy, bool isPut, uint32 tick, uint128 size) private returns (uint16 nodeId) {
     // pick the right bitmap ladders
-    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBuy, isPut);
+    (mapping(uint8 => uint256) storage midd, mapping(uint16 => uint256) storage dett) = _maps(isBuy, isPut);
 
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
@@ -546,8 +534,8 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
 
     // if level empty, set bitmap bits
     if (levels[key].vol == 0) {
-      bool firstInL1 = _addBits(det, mid, l1, l2, l3);
-      assert(mid[l1] & (1 << l2) != 0);
+      bool firstInL1 = _addBits(dett, midd, l1, l2, l3);
+      assert(midd[l1] & (1 << l2) != 0);
 
       if (firstInL1) _sumAddBit(isBuy, isPut, l1);
     }
@@ -848,25 +836,11 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
   function _maps(bool isBid, bool isPut)
     internal
     view
-    returns (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det)
+    returns (mapping(uint8 => uint256) storage midMap, mapping(uint16 => uint256) storage detMap)
   {
-    if (isBid) {
-      if (isPut) {
-        mid = midPB;
-        det = detPB;
-      } else {
-        mid = midCB;
-        det = detCB;
-      }
-    } else {
-      if (isPut) {
-        mid = midPA;
-        det = detPA;
-      } else {
-        mid = midCA;
-        det = detCA;
-      }
-    }
+    uint8 idx = _summaryIx(isBid, isPut); // 0-3
+    midMap = mid[idx]; // one “column” of the nested mapping
+    detMap = det[idx];
   }
 
   function _purgeBook() internal {
@@ -1004,11 +978,6 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
   // #                  View functions                                     #
   // #                                                                     #
   // #######################################################################
-
-  function viewTakerQueue(bool isPut, bool isBid) external view returns (TakerQ[] memory) {
-    return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
-  }
-
   modifier onlyWhitelisted() {
     if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
     _;
@@ -1021,23 +990,19 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
     _;
   }
 
-  function getOraclePrice(uint32 index) external view returns (uint64) {
-    return _getOraclePrice(index);
-  }
-
   function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
   }
 
-  function _msgSender() internal view override(ERC2771Context, Context) returns (address sender) {
+  function _msgSender() internal view override(ERC2771Context) returns (address sender) {
     return ERC2771Context._msgSender();
   }
 
-  function _msgData() internal view override(ERC2771Context, Context) returns (bytes calldata) {
+  function _msgData() internal view override(ERC2771Context) returns (bytes calldata) {
     return ERC2771Context._msgData();
   }
 
-  function _contextSuffixLength() internal view override(ERC2771Context, Context) returns (uint256) {
+  function _contextSuffixLength() internal view override(ERC2771Context) returns (uint256) {
     return ERC2771Context._contextSuffixLength();
   }
 
@@ -1047,7 +1012,7 @@ contract MarketNonUpgradeable is ERC2771Context, Ownable {
   // #                                                                     #
   // #######################################################################
 
-  function setTrustedForwarder(address _forwarder) external onlyOwner {
-    _trustedForwarder = _forwarder;
-  }
+  // function setTrustedForwarder(address _forwarder) external onlyOwner {
+  //   _trustedForwarder = _forwarder;
+  // }
 }

@@ -15,7 +15,7 @@ contract MarketNonUpgradeable is ERC2771Context {
 
   //------- Meta -------
   string public name;
-  IERC20 collateralToken;
+  IERC20 public collateralToken;
   uint64 constant collateralDecimals = 6;
   address immutable ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
@@ -53,7 +53,7 @@ contract MarketNonUpgradeable is ERC2771Context {
   uint256[2][2] public tqHead; // cursor per bucket
 
   //------- Orderbook -------
-  mapping(uint32 => Level) public levels; // tickKey ⇒ Level
+  mapping(uint32 => Level) levels; // tickKey ⇒ Level
   mapping(uint16 => Maker) public makerQ; // nodeId  ⇒ Maker
   uint16 nodePtr; // auto-increment id for makers
 

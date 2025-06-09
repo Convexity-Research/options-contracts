@@ -128,8 +128,7 @@ contract MarketNonUpgradeable is ERC2771Context {
       if (!cycles[activeCycle].isSettled) revert Errors.PreviousCycleNotSettled();
     }
 
-    // BTC index is zero
-    uint64 price = _getOraclePrice(0);
+    uint64 price = _getOraclePrice();
     if (price == 0) revert Errors.InvalidOraclePrice();
 
     // Create new market
@@ -244,7 +243,7 @@ contract MarketNonUpgradeable is ERC2771Context {
 
     if (size == 0) revert Errors.InvalidAmount();
 
-    uint64 price = _getOraclePrice(0);
+    uint64 price = _getOraclePrice();
 
     bool isPut = (option == OptionType.PUT);
     bool isBuy = (side == Side.BUY);
@@ -324,7 +323,7 @@ contract MarketNonUpgradeable is ERC2771Context {
    */
   function liquidate(uint16[] calldata makerIds, address trader) external {
     if (!_isMarketLive()) revert Errors.MarketNotLive();
-    uint64 price = _getOraclePrice(0);
+    uint64 price = _getOraclePrice();
     if (!_isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     for (uint256 k; k < makerIds.length; ++k) {
@@ -344,25 +343,16 @@ contract MarketNonUpgradeable is ERC2771Context {
     emit Liquidated(activeCycle, trader);
   }
 
-  function fixPrice() external {
-    if (!_isMarketLive()) revert Errors.MarketNotLive();
-    if (block.timestamp < activeCycle) revert Errors.NotExpired();
-
-    Cycle storage C = cycles[activeCycle];
-
-    uint64 price = _getOraclePrice(0);
-
-    C.settlementPrice = price;
-    cursor = 0; // reset iterator
-
-    emit PriceFixed(activeCycle, price);
-  }
-
   function settleChunk(uint256 max) external returns (bool done) {
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
-    uint64 price = C.settlementPrice;
-    if (price == 0) revert Errors.PriceNotFixed();
+    uint64 settlementPrice = C.settlementPrice;
+
+    if (settlementPrice == 0) {
+      if (block.timestamp < activeCycle) revert Errors.NotExpired();
+      C.settlementPrice = _getOraclePrice();
+      emit PriceFixed(activeCycle, C.settlementPrice);
+    }
     if (C.isSettled) revert Errors.CycleAlreadySettled();
 
     uint256 n = traders.length;
@@ -373,7 +363,7 @@ contract MarketNonUpgradeable is ERC2771Context {
     while (i < upper) {
       address t = traders[i];
       uint256 key = cycleId | uint256(uint160(t));
-      _settleTrader(cycleId, key, price, t);
+      _settleTrader(cycleId, key, settlementPrice, t);
       unchecked {
         ++i;
       }
@@ -395,7 +385,7 @@ contract MarketNonUpgradeable is ERC2771Context {
       badDebt = 0;
       paidOut = 0;
 
-      emit CycleSettled(block.timestamp); // or cycleId
+      emit CycleSettled(cycleId);
       done = true;
     }
   }
@@ -629,7 +619,7 @@ contract MarketNonUpgradeable is ERC2771Context {
 
     // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool
     // isPut, address indexed taker, address indexed maker);
-    emit OrderFilled(activeCycle, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
+    emit OrderFilled(activeCycle, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice() / 10000000);
 
     return size;
   }
@@ -881,17 +871,23 @@ contract MarketNonUpgradeable is ERC2771Context {
   // #                                                                     #
   // #######################################################################
 
-  function _getOraclePrice(uint32 index) internal view returns (uint64 price) {
-    // bool success;
-    // bytes memory result;
-    // (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.call(abi.encode(index));
-    // require(success, Errors.ORACLE_PRICE_CALL_FAILED);
-    // price = abi.decode(result, (uint64)) / 10;
-    price = 107000 * uint64(10 ** collateralDecimals);
+  function _getOraclePrice() internal view returns (uint64) {
+    bool success;
+    bytes memory result;
+    (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.staticcall(abi.encode(0));
+    if (!success) revert Errors.OraclePriceCallFailed();
+    uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1)); // Price always returned with
+      // 1 extra decimal, so subtract by 1 from USDT0 decimals.
+    return price;
   }
 
+  /**
+   * @dev Check if the market is live by checking timestamp
+   * @return true if the market is live, false otherwise.
+   * @dev Market is live if the settlement price is not set.
+   */
   function _isMarketLive() internal view returns (bool) {
-    return cycles[activeCycle].settlementPrice == 0;
+    return block.timestamp < activeCycle;
   }
 
   function _totalNotional(uint256 contracts, uint64 spot) internal pure returns (uint256) {
@@ -978,16 +974,8 @@ contract MarketNonUpgradeable is ERC2771Context {
   // #                  View functions                                     #
   // #                                                                     #
   // #######################################################################
-  modifier onlyWhitelisted() {
-    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
-    _;
-  }
-
-  modifier isValidSignature(bytes memory signature) {
-    if (whitelistSigner != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      revert Errors.InvalidSignature();
-    }
-    _;
+  function getNumTraders() public view returns (uint256) {
+    return traders.length;
   }
 
   function trustedForwarder() public view override returns (address) {
@@ -1004,6 +992,18 @@ contract MarketNonUpgradeable is ERC2771Context {
 
   function _contextSuffixLength() internal view override(ERC2771Context) returns (uint256) {
     return ERC2771Context._contextSuffixLength();
+  }
+
+  modifier onlyWhitelisted() {
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
+    _;
+  }
+
+  modifier isValidSignature(bytes memory signature) {
+    if (whitelistSigner != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
+      revert Errors.InvalidSignature();
+    }
+    _;
   }
 
   // #######################################################################

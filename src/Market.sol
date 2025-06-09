@@ -26,6 +26,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   int256 public constant makerFeeBps = 10; // +0.10 %, basis points
   int256 public constant takerFeeBps = -40; // –0.40 %, basis points
   uint256 public constant denominator = 10_000;
+  uint256 public constant EXPIRY_TIME = 1 minutes;
   string public name;
   IERC20 public collateralToken;
   uint64 public collateralDecimals;
@@ -126,7 +127,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     _trustedForwarder = _forwarder;
   }
 
-  function startCycle(uint256 expiry) external onlyOwner {
+  function startCycle() external onlyOwner {
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
       require(activeCycle < block.timestamp, Errors.CYCLE_ALREADY_STARTED);
@@ -138,6 +139,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     // BTC index is zero
     uint64 price = _getOraclePrice(0);
     require(price > 0, Errors.INVALID_ORACLE_PRICE);
+
+    uint256 expiry = block.timestamp + EXPIRY_TIME;
 
     // Create new market
     cycles[expiry] = Cycle({

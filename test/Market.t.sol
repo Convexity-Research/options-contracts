@@ -36,7 +36,7 @@ contract MarketSuite is Test {
         )
       )
     );
-    mkt.startCycle(block.timestamp);
+    mkt.startCycle();
   }
 
   // #######################################################################

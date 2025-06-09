@@ -51,7 +51,7 @@ struct TakerQ {
 
 interface IMarket {
   function name() external view returns (string memory);
-  function startCycle(uint256 expiry) external;
+  function startCycle() external;
   function activeCycle() external view returns (uint256);
 
   function depositCollateral(uint256 amount) external;

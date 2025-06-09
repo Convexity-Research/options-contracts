@@ -29,7 +29,7 @@ contract MarketSuite is Test {
     (signer, signerKey) = makeAddrAndKey("signer");
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
     mkt = new MockMarketNonUpgradeable("BTC", feeSink, address(usdt), address(0), signer);
-    mkt.startCycle(block.timestamp);
+    mkt.startCycle();
   }
 
   // #######################################################################

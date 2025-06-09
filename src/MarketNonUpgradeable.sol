@@ -25,6 +25,7 @@ contract MarketNonUpgradeable is ERC2771Context {
   int256 constant makerFeeBps = 10; // +0.10 %, basis points
   int256 constant takerFeeBps = -40; // –0.40 %, basis points
   uint256 constant denominator = 10_000;
+  uint256 public constant EXPIRY_TIME = 1 minutes;
   address feeRecipient;
   uint256 badDebt; // grows whenever we meet an under-collateralised loser
   uint256 paidOut; // raw sum of *gross* positive deltas we have met so far
@@ -119,7 +120,7 @@ contract MarketNonUpgradeable is ERC2771Context {
     whitelistSigner = _whitelistSigner;
   }
 
-  function startCycle(uint256 expiry) external {
+  function startCycle() external {
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
       if (activeCycle >= block.timestamp) revert Errors.CycleAlreadyStarted();
@@ -131,6 +132,8 @@ contract MarketNonUpgradeable is ERC2771Context {
     // BTC index is zero
     uint64 price = _getOraclePrice(0);
     if (price == 0) revert Errors.InvalidOraclePrice();
+
+    uint256 expiry = block.timestamp + EXPIRY_TIME;
 
     // Create new market
     cycles[expiry] = Cycle({

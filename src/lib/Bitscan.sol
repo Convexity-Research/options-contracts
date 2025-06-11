@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
+import {MarketSide} from "../MarketNew.sol";
+
 /**
  * - Credit to: https://github.com/estarriolvetch/solidity-bits
  *
@@ -73,14 +75,34 @@ library BitScan {
   }
 
   function split(uint32 t) internal pure returns (uint8 l1, uint8 l2, uint8 l3) {
-    // Each level gets 8 bits
-    l1 = uint8((t >> 16) & 0xFF); // high byte
-    l2 = uint8((t >> 8) & 0xFF); // middle byte
-    l3 = uint8(t & 0xFF); // low byte
+    assembly {
+      // byte(i, x) returns the i-th byte of x (0 = most-significant,
+      // 31 = least-significant).  A uint32 sits in the low 4 bytes of
+      // the 32-byte word, so the three bytes we care about are 29-31.
+      l1 := byte(29, t)
+      l2 := byte(30, t)
+      l3 := byte(31, t)
+    }
   }
 
-  function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32) {
-    // Combine the three 8-bit levels into a 24-bit tick
-    return (uint32(l1 & 0xFF) << 16) | (uint32(l2 & 0xFF) << 8) | uint32(l3 & 0xFF);
+  function splitKey(uint32 key) internal pure returns (uint32 tick, MarketSide side) {
+    bool isPut = (key & (1 << 31)) != 0;
+    bool isBid = (key & (1 << 30)) != 0;
+    tick = key & 0x00FF_FFFF; // Only take rightmost 24 bits for tick
+    
+    // Convert bools to MarketSide enum
+    // CALL_BUY=0, CALL_SELL=1, PUT_BUY=2, PUT_SELL=3
+    side = MarketSide((isPut ? 2 : 0) | (isBid ? 0 : 1));
+}
+
+  function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32 result) {
+    assembly {
+      // Shift into their 24-bit positions:
+      let p1 := shl(16, l1) // l1 << 16
+      let p2 := shl(8, l2) // l2 << 8
+
+      // Combine: (l1<<16) | (l2<<8) | l3
+      result := or(or(p1, p2), l3)
+    }
   }
 }

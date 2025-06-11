@@ -133,7 +133,6 @@ contract MarketNonUpgradeable is ERC2771Context {
 
     // Create new market
     cycles[expiry] = Cycle({
-      active: true,
       isSettled: false,
       strikePrice: price,
       settlementPrice: 0 // Set at cycle end time
@@ -378,7 +377,6 @@ contract MarketNonUpgradeable is ERC2771Context {
 
       cursor = 0;
       C.isSettled = true;
-      C.active = false;
       activeCycle = 0;
       _purgeBook();
 

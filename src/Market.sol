@@ -62,7 +62,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   uint16 nodePtr; // auto-increment id for makers
 
   // summary (L1): which [256*256] blocks have liquidity
-  uint256[4] public summaries;
+  uint256[4] public summaries; // [PUT_BUY, PUT_SELL, CALL_BUY, CALL_SELL]
 
   // mid (L2): which [256] block has liquidity
   mapping(uint8 => uint256) public midCB;
@@ -141,7 +141,6 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     // Create new market
     cycles[expiry] = Cycle({
-      active: true,
       isSettled: false,
       strikePrice: price,
       settlementPrice: 0 // Set at cycle end time
@@ -395,7 +394,6 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
       cursor = 0;
       C.isSettled = true;
-      C.active = false;
       activeCycle = 0;
       _purgeBook();
 
@@ -478,16 +476,25 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint8 l2,
     uint8 l3
   ) internal returns (bool lastInL1) {
-    uint16 detKey = (uint16(l1) << 8) | l2; // Locate detail word
-    det[detKey] &= ~BitScan.mask(l3); // Clear bit l3
+    assembly {
+      mstore(0x00, or(shl(8, l1), l2))
+      mstore(0x20, det.slot)
+      let pDet := keccak256(0x00, 0x40)
 
-    // If no ticks left in this 256-tick word
-    if (det[detKey] == 0) {
-      mid[l1] &= ~BitScan.mask(l2); // Clear mid-level bit
-      // If no 256-tick words left in this 65 k-tick block
-      if (mid[l1] == 0) return true; // Caller must clear summary bit
+      let word := sload(pDet)
+      let newW := and(word, not(shl(l3, 1)))
+      sstore(pDet, newW)
+
+      if iszero(newW) {
+        // clear mid
+        mstore8(0x00, l1)
+        mstore(0x20, mid.slot)
+        let pMid := keccak256(0x00, 0x20)
+        let newM := and(sload(pMid), not(shl(l2, 1)))
+        sstore(pMid, newM)
+        if iszero(newM) { lastInL1 := 1 }
+      }
     }
-    return false;
   }
 
   // Returns the best tick and key for the given side and option type
@@ -516,8 +523,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
   // Clear bit from summary bitmap
   function _sumClrBit(bool isBid, bool isPut, uint8 l1) internal {
-    // Bitwise AND the inverse of the mask with the summary bitmap, flipping that bit off
-    summaries[_summaryIx(isBid, isPut)] &= ~BitScan.mask(l1);
+    uint8 idx = (isPut ? 2 : 0) | (isBid ? 1 : 0);
+    summaries[idx] &= ~(1 << l1);
   }
 
   // Get summary index

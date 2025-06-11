@@ -11,8 +11,14 @@ enum OptionType {
   PUT
 }
 
+enum MarketSide {
+  CALL_BUY,
+  CALL_SELL,
+  PUT_BUY,
+  PUT_SELL
+}
+
 struct Cycle {
-  bool active;
   bool isSettled;
   uint64 strikePrice;
   uint64 settlementPrice;
@@ -51,16 +57,16 @@ struct TakerQ {
 
 interface IMarket {
   function name() external view returns (string memory);
-  function startCycle(uint256 expiry) external;
-  function activeCycle() external view returns (uint256);
+  // function startCycle(uint256 expiry) external;
+  // function activeCycle() external view returns (uint256);
 
-  function depositCollateral(uint256 amount) external;
-  function withdrawCollateral(uint256 amount) external;
+  // function depositCollateral(uint256 amount) external;
+  // function withdrawCollateral(uint256 amount) external;
 
-  function placeOrder(OptionType option, Side side, uint256 size, uint256 limitPrice)
-    external
-    returns (uint256 orderId);
-  function cancelOrder(uint256 orderId) external;
+  // function placeOrder(OptionType option, Side side, uint256 size, uint256 limitPrice)
+  //   external
+  //   returns (uint256 orderId);
+  // function cancelOrder(uint256 orderId) external;
 
   // function liquidate(uint256[] calldata orderIds, address trader) external;
   // function settle(uint256 cycleId) external;

@@ -923,8 +923,16 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
   // #                                                                     #
   // #######################################################################
 
+  function getNumTraders() public view returns (uint256) {
+    return traders.length;
+  }
+
   function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
+  }
+
+  function setTrustedForwarder(address _forwarder) external onlyOwner {
+    _trustedForwarder = _forwarder;
   }
 
   function _msgSender() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (address sender) {

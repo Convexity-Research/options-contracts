@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
-import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ, MarketSide} from "./interfaces/IMarket.sol";
+import {IMarket, Cycle, Level, Maker, TakerQ, MarketSide} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -524,6 +524,8 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint16(size);
     else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint16(size);
     else revert();
+
+    emit OrderPlaced(ac, nodeId, size, tick * TICK_SZ, side, trader);
   }
 
   function _settleFill(
@@ -551,7 +553,9 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
       int256 cashTaker = -dir * premium + takerFee;
 
       // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && userAccounts[taker].balance < uint256((cashTaker * -1))) return 0;
+      if (isTakerQueue && cashTaker < 0) {
+        if (userAccounts[taker].balance < uint256(-cashTaker)) return 0;
+      }
 
       _applyCashDelta(maker, cashMaker);
       _applyCashDelta(taker, cashTaker);
@@ -846,7 +850,7 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
   }
 
   function _applyCashDeltaSocial(address u, int256 d) internal {
-    UserAccount memory ua = userAccounts[u];
+    UserAccount storage ua = userAccounts[u];
     if (d < 0) {
       uint256 debit = uint256(-d);
       uint256 bal = ua.balance;

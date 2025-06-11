@@ -241,7 +241,7 @@ contract MarketSuite is Test {
   // Market order sweeps 3 price levels and leaves tail in queue
   function testMarketOrderMultiLevelAndQueue() public {
     uint32[3] memory ticks = [_tick(ONE_COIN), _tick(ONE_COIN * 2), _tick(ONE_COIN * 700)];
-    uint256 collatPerContract = btcPrice * 10**6 / 100 / 1000; // Divide by 100 for 0.01BTC size contract price,
+    uint256 collatPerContract = btcPrice * 10 ** 6 / 100 / 1000; // Divide by 100 for 0.01BTC size contract price,
       // divide by 1000 for 0.1% margin
     _fund(u1, collatPerContract * LOT * 3);
 

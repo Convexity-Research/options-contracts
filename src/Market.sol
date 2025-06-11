@@ -60,6 +60,7 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
 
   //------- Trading/Settlement -------
   address[] public traders;
+  mapping(address => uint16[]) public userOrders; // Track all order IDs per user
   uint256 public cursor; // settlement iterator
 
   TakerQ[][4] internal takerQ; // 4 buckets
@@ -207,21 +208,31 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint16(M.size);
     else revert();
 
+    // Remove from user's order tracking
+    _removeOrderFromTracking(M.trader, uint16(orderId));
+
     emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
     delete makerNodes[uint16(orderId)];
   }
 
-  function liquidate(uint16[] calldata makerIds, address trader) external {
+  function liquidate(address trader) external {
     if (!_isMarketLive()) revert Errors.MarketNotLive();
     uint64 price = _getOraclePrice();
-    if (!_isLiquidatable(trader, price)) revert Errors.StillSolvent();
+    if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
-    for (uint256 k; k < makerIds.length; ++k) {
-      uint16 id = makerIds[k];
-      Maker storage M = ob[activeCycle].makerNodes[id];
-      if (M.trader != trader) continue; // skip others' orders
-      _forceCancel(id);
+    // Cancel all maker orders
+    uint16[] memory orderIds = userOrders[trader];
+    for (uint256 k; k < orderIds.length; ++k) {
+      uint16 id = orderIds[k];
+      // Check if order still exists before cancelling
+      if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
     }
+
+    // Clear all taker queue entries for this trader
+    _clearTakerQueueEntries(trader);
+
+    // Clear user's order tracking
+    delete userOrders[trader];
 
     UserAccount storage ua = userAccounts[trader];
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
@@ -430,6 +441,10 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
           else makerQ[nxt].prev = 0;
 
           L.head = nxt;
+
+          // Remove from user's order tracking
+          _removeOrderFromTracking(M.trader, nodeId);
+
           delete makerQ[nodeId];
           nodeId = nxt;
         } else {
@@ -502,9 +517,15 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     }
 
     // maker node
-    nodeId = ++_ob.nodePtr;
+    unchecked {
+      nodeId = ++_ob.nodePtr; // Shouldn't overflow in a single minute
+    }
+
     address trader = _msgSender();
     _ob.makerNodes[nodeId] = Maker(trader, size, 0, key, levels[key].tail);
+
+    // Track order for user
+    userOrders[trader].push(nodeId);
 
     // FIFO queue link
     if (levels[key].vol == 0) levels[key].head = nodeId;
@@ -553,9 +574,7 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
       int256 cashTaker = -dir * premium + takerFee;
 
       // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && cashTaker < 0) {
-        if (userAccounts[taker].balance < uint256(-cashTaker)) return 0;
-      }
+      if (isTakerQueue && cashTaker < 0) if (userAccounts[taker].balance < uint256(-cashTaker)) return 0;
 
       _applyCashDelta(maker, cashMaker);
       _applyCashDelta(taker, cashTaker);
@@ -642,6 +661,51 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     if (L.vol == 0) _clearLevel(side, key);
 
     emit OrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
+
+    // Remove from user's order tracking
+    _removeOrderFromTracking(M.trader, orderId);
+  }
+
+  function _clearTakerQueueEntries(address trader) internal {
+    UserAccount storage ua = userAccounts[trader];
+
+    // Loop through all 4 taker queue buckets
+    for (uint256 i = 0; i < 4; ++i) {
+      TakerQ[] storage queue = takerQ[i];
+      uint256 j = tqHead[i];
+      uint256 end = queue.length;
+      while (j < end) {
+        if (queue[j].trader == trader && queue[j].size > 0) {
+          uint96 size = queue[j].size;
+
+          // Update pending positions based on market side
+          MarketSide side = MarketSide(i);
+          if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint16(size);
+          else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint16(size);
+          else if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint16(size);
+          else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint16(size);
+
+          // Set size to 0 but don't remove to preserve queue ordering
+          queue[j].size = 0;
+        }
+
+        ++j;
+      }
+    }
+  }
+
+  function _removeOrderFromTracking(address trader, uint16 orderId) internal {
+    uint16[] storage orders = userOrders[trader];
+    uint256 length = orders.length;
+
+    // Find and remove the order ID (swap with last element and pop for gas efficiency)
+    for (uint256 i = 0; i < length; ++i) {
+      if (orders[i] == orderId) {
+        orders[i] = orders[length - 1]; // Move last element to current position
+        orders.pop(); // Remove last element
+        break;
+      }
+    }
   }
 
   // #######################################################################
@@ -904,7 +968,7 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     return notional * marginBps / denominator;
   }
 
-  function _isLiquidatable(address trader, uint64 price) internal view returns (bool) {
+  function isLiquidatable(address trader, uint64 price) public view returns (bool) {
     UserAccount storage ua = userAccounts[trader];
     return ua.balance < _requiredMarginForLiquidation(trader, price, MM_BPS);
   }

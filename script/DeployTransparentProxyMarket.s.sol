@@ -5,7 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {console} from "forge-std/console.sol";
 import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
-import {MarketNew} from "../src/MarketNew.sol";
+import {Market} from "../src/Market.sol";
 
 contract DeployTransparentProxy is Script {
   address public constant ADMIN = 0xE7Bc1Ed115b368B946d97e45eE79f47a14eBF179;
@@ -20,7 +20,7 @@ contract DeployTransparentProxy is Script {
     console.log("Account balance:", deployer.balance);
 
     // 1. Deploy the implementation contract
-    MarketNew implementation = new MarketNew();
+    Market implementation = new Market();
     console.log("Implementation deployed at:", address(implementation));
 
     // 2. Deploy ProxyAdmin (this will be the admin of the proxy)
@@ -28,7 +28,7 @@ contract DeployTransparentProxy is Script {
     console.log("ProxyAdmin deployed at:", address(proxyAdmin));
 
     // 3. Prepare initialization data
-    bytes memory initData = abi.encodeWithSelector(MarketNew.initialize.selector, "BTC Market", ADMIN);
+    bytes memory initData = abi.encodeWithSelector(Market.initialize.selector, "BTC Market", ADMIN);
 
     // 4. Deploy the Transparent Upgradeable Proxy
     TransparentUpgradeableProxy proxy =
@@ -37,7 +37,7 @@ contract DeployTransparentProxy is Script {
     console.log("Proxy deployed at:", address(proxy));
 
     // 5. Verify the proxy is working by calling functions through it
-    MarketNew market = MarketNew(address(proxy));
+    Market market = Market(address(proxy));
 
     console.log("Market name:", market.name());
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import {MarketSide} from "../MarketNew.sol";
+import {MarketSide} from "../interfaces/IMarket.sol";
 
 /**
  * - Credit to: https://github.com/estarriolvetch/solidity-bits
@@ -89,11 +89,11 @@ library BitScan {
     bool isPut = (key & (1 << 31)) != 0;
     bool isBid = (key & (1 << 30)) != 0;
     tick = key & 0x00FF_FFFF; // Only take rightmost 24 bits for tick
-    
+
     // Convert bools to MarketSide enum
     // CALL_BUY=0, CALL_SELL=1, PUT_BUY=2, PUT_SELL=3
     side = MarketSide((isPut ? 2 : 0) | (isBid ? 0 : 1));
-}
+  }
 
   function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32 result) {
     assembly {

@@ -3,35 +3,32 @@ pragma solidity ^0.8.30;
 
 import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
-import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ} from "./interfaces/IMarket.sol";
+import {IMarket, Cycle, Pos, Level, Maker, OptionType, Side, TakerQ, MarketSide} from "./interfaces/IMarket.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
-
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
 
-contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable {
+import {console2} from "forge-std/console2.sol";
+
+contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeable, ERC2771ContextUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
-  address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
-  uint256 private constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
-  uint256 constant IM_BPS = 10; // 0.10 % Initial Margin
-  uint256 constant MM_BPS = 10; // 0.10 % Maintenance Margin (same as IM_BPS for now)
-  uint256 public constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 public constant makerFeeBps = 10; // +0.10 %, basis points
-  int256 public constant takerFeeBps = -40; // –0.40 %, basis points
-  uint256 public constant denominator = 10_000;
   string public name;
-  IERC20 public collateralToken;
-  uint64 public collateralDecimals;
   address public feeRecipient;
-  uint256 public badDebt; // grows whenever we meet an under-collateralised loser
-  uint256 public paidOut; // raw sum of *gross* positive deltas we have met so far
+  address public collateralToken;
+  uint256 constant collateralDecimals = 6;
+  address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
+  uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
+  uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
+  uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
+  int256 constant makerFeeBps = 10; // +0.10 %, basis points
+  int256 constant takerFeeBps = -40; // –0.40 %, basis points
+  uint256 constant denominator = 10_000;
 
   //------- Gasless TX -------
   address private _trustedForwarder;
@@ -40,62 +37,70 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   address private constant WHITELIST_SIGNER = 0x6E12D8C87503D4287c294f2Fdef96ACd9DFf6bd2;
   mapping(address => bool) public whitelist;
 
-  //------- Vault -------
-  mapping(address => uint256) public balances;
+  //------- user account -------
+  mapping(address => UserAccount) public userAccounts;
+
+  struct UserAccount {
+    bool activeInCycle;
+    uint56 _gap; // 56 remaining bits for future use. Makes settling logic simpler to gap this here.
+    uint64 balance;
+    uint16 longCalls;
+    uint16 shortCalls;
+    uint16 longPuts;
+    uint16 shortPuts;
+    uint16 pendingLongCalls;
+    uint16 pendingShortCalls;
+    uint16 pendingLongPuts;
+    uint16 pendingShortPuts;
+  }
 
   //------- Cycle state -------
   uint256 public activeCycle; // expiry unix timestamp as ID
   mapping(uint256 => Cycle) public cycles;
 
-  //------- Trading/Positions -------
+  //------- Trading/Settlement -------
   address[] public traders;
-  mapping(uint256 => Pos) public positions;
-  mapping(address => bool) public inList;
   uint256 public cursor; // settlement iterator
 
-  TakerQ[][2][2] private takerQ; // 4 buckets
-  uint256[2][2] public tqHead; // cursor per bucket
+  TakerQ[][4] internal takerQ; // 4 buckets
+  uint256[4] public tqHead; // cursor per bucket
+
+  uint256 badDebt; // grows whenever we meet an under-collateralised loser
+  uint256 paidOut; // raw sum of *gross* positive deltas we have met so far
 
   //------- Orderbook -------
-  mapping(uint32 => Level) public levels; // tickKey ⇒ Level
-  mapping(uint16 => Maker) public makerQ; // nodeId  ⇒ Maker
-  uint16 nodePtr; // auto-increment id for makers
+  mapping(uint256 => OrderbookState) internal ob;
 
-  // summary (L1): which [256*256] blocks have liquidity
-  uint256[4] public summaries; // [PUT_BUY, PUT_SELL, CALL_BUY, CALL_SELL]
+  struct OrderbookState {
+    // summary level of orderbook (L1): which [256*256] blocks have liquidity
+    uint256[4] summaries;
+    // mid level of orderbook (L2): which [256] block has liquidity
+    mapping(MarketSide => mapping(uint8 => uint256)) mids;
+    // detail level of orderbook (L3): which tick has liquidity
+    mapping(MarketSide => mapping(uint16 => uint256)) dets;
+    // mappings to fetch relevant orderbook data
+    mapping(uint32 => Level) levels; // tickKey ⇒ Level
+    mapping(uint16 => Maker) makerNodes; // nodeId  ⇒ Maker
+    uint16 nodePtr; // auto-increment id for maker orders
+  }
 
-  // mid (L2): which [256] block has liquidity
-  mapping(uint8 => uint256) public midCB;
-  mapping(uint8 => uint256) public midCA;
-  mapping(uint8 => uint256) public midPB;
-  mapping(uint8 => uint256) public midPA;
-
-  // detail (L3): which tick has liquidity
-  mapping(uint16 => uint256) public detCB;
-  mapping(uint16 => uint256) public detCA;
-  mapping(uint16 => uint256) public detPB;
-  mapping(uint16 => uint256) public detPA;
-
+  //------- Events -------
   event CycleStarted(uint256 indexed cycleId, uint256 strike);
   event CycleSettled(uint256 indexed cycleId);
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
+  event Liquidated(uint256 indexed cycleId, address indexed trader);
+  event PriceFixed(uint256 indexed cycleId, uint64 price);
+  event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
   event OrderPlaced(
-    uint256 indexed cycleId,
-    uint256 orderId,
-    uint256 size,
-    uint256 limitPrice,
-    bool isBuy,
-    bool isPut,
-    address indexed maker
+    uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, MarketSide side, address indexed maker
   );
   event OrderFilled(
     uint256 indexed cycleId,
     uint256 orderId,
-    uint128 size,
+    uint256 size,
     uint256 limitPrice,
-    bool isBuy,
-    bool isPut,
+    MarketSide side,
     address indexed taker,
     address indexed maker,
     uint256 btcPrice
@@ -103,10 +108,8 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   event OrderCancelled(
     uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker
   );
-  event Liquidated(uint256 indexed cycleId, address indexed trader);
-  event PriceFixed(uint256 indexed cycleId, uint64 price);
-  event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
 
+  /// @custom:oz-upgrades-unsafe-allow constructor
   constructor() ERC2771ContextUpgradeable(address(0)) {
     _disableInitializers();
   }
@@ -117,185 +120,66 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
   {
     __Ownable_init(_msgSender());
     __Pausable_init();
-    __UUPSUpgradeable_init();
 
     name = _name;
     feeRecipient = _feeRecipient;
-    collateralToken = IERC20(_collateralToken);
-    collateralDecimals = IERC20Metadata(_collateralToken).decimals();
+    collateralToken = _collateralToken;
     _trustedForwarder = _forwarder;
   }
 
-  function startCycle(uint256 expiry) external onlyOwner {
-    if (activeCycle != 0) {
-      // If there is an active cycle, it must be in the past
-      require(activeCycle < block.timestamp, Errors.CYCLE_ALREADY_STARTED);
-
-      // The previous cycle must be settled
-      require(cycles[activeCycle].isSettled, Errors.PREVIOUS_CYCLE_NOT_SETTLED);
-    }
-
-    // BTC index is zero
-    uint64 price = _getOraclePrice(0);
-    require(price > 0, Errors.INVALID_ORACLE_PRICE);
-
-    // Create new market
-    cycles[expiry] = Cycle({
-      isSettled: false,
-      strikePrice: price,
-      settlementPrice: 0 // Set at cycle end time
-    });
-
-    // Set as current market
-    activeCycle = expiry;
-
-    emit CycleStarted(expiry, uint256(price));
-  }
-
-  function depositCollateral(uint256 amount) external {
-    require(amount > 0, Errors.INVALID_AMOUNT);
-
+  // #######################################################################
+  // #                                                                     #
+  // #                  Public functions                                   #
+  // #                                                                     #
+  // #######################################################################
+  function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) {
     address trader = _msgSender();
-
-    // Transfer collateral token from user to contract
-    collateralToken.transferFrom(trader, address(this), amount);
-
-    // Update user's balance
-    balances[trader] += amount;
-
-    emit CollateralDeposited(trader, amount);
+    whitelist[trader] = true;
+    _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external {
-    require(amount > 0, Errors.INVALID_AMOUNT);
-
+  function depositCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
-    require(_noOpenPositionsOrOrders(trader), Errors.IN_TRADER_LIST);
-
-    uint256 balance = balances[trader];
-
-    require(balance >= amount, Errors.INSUFFICIENT_BALANCE);
-
-    // Update user's balance
-    balances[trader] -= amount;
-
-    // Transfer collateral token from contract to user
-    collateralToken.transfer(trader, amount);
-    emit CollateralWithdrawn(trader, amount);
+    _depositCollateral(amount, trader);
   }
 
-  function long(uint256 size, bytes memory signature) external isValidSignature(signature) {
-    whitelist[_msgSender()] = true;
-
-    // Long call
-    _placeOrder(OptionType.CALL, Side.BUY, size, 0);
-
-    // Short put
-    _placeOrder(OptionType.PUT, Side.SELL, size, 0);
+  function withdrawCollateral(uint256 amount) external onlyWhitelisted {
+    address trader = _msgSender();
+    _withdrawCollateral(amount, trader);
   }
 
   function long(uint256 size) external onlyWhitelisted {
-    // Long call
-    _placeOrder(OptionType.CALL, Side.BUY, size, 0);
+    address trader = _msgSender();
 
-    // Short put
-    _placeOrder(OptionType.PUT, Side.SELL, size, 0);
-  }
-
-  function short(uint256 size, bytes memory signature) external isValidSignature(signature) {
-    whitelist[_msgSender()] = true;
-
-    // Long put
-    _placeOrder(OptionType.PUT, Side.BUY, size, 0);
-
-    // Short call
-    _placeOrder(OptionType.CALL, Side.SELL, size, 0);
+    _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
+    _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
   function short(uint256 size) external onlyWhitelisted {
-    // Long put
-    _placeOrder(OptionType.PUT, Side.BUY, size, 0);
+    address trader = _msgSender();
 
-    // Short call
-    _placeOrder(OptionType.CALL, Side.SELL, size, 0);
+    _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
+    _placeOrder(MarketSide.CALL_SELL, size, 0, trader);
   }
 
-  function placeOrder(
-    OptionType option,
-    Side side,
-    uint256 size,
-    uint256 limitPrice, // 0 = market
-    bytes memory signature
-  ) external isValidSignature(signature) returns (uint256 orderId) {
-    whitelist[_msgSender()] = true;
-    return _placeOrder(option, side, size, limitPrice);
-  }
-
-  function placeOrder(
-    OptionType option,
-    Side side,
-    uint256 size,
-    uint256 limitPrice // 0 = market
-  ) external onlyWhitelisted returns (uint256 orderId) {
-    return _placeOrder(option, side, size, limitPrice);
-  }
-
-  function _placeOrder(
-    OptionType option,
-    Side side,
-    uint256 size,
-    uint256 limitPrice // 0 = market
-  ) private returns (uint256 orderId) {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
-
-    require(size > 0, Errors.INVALID_AMOUNT);
-
-    uint64 price = _getOraclePrice(0);
-
-    bool isPut = (option == OptionType.PUT);
-    bool isBuy = (side == Side.BUY);
-
-    // Convert price to tick
-    uint32 tick = limitPrice == 0
-      ? 0 // dummy (market)
-      : uint32(limitPrice / TICK_SZ); // 1 tick = 0.01 USDT0
-
-    // Limit price of 0 means market order
-    if (limitPrice == 0) {
-      _marketOrder(isBuy, isPut, uint128(size), _msgSender());
-      return 0;
-    }
-
-    // If opposite side has liquidity and price is crossing, then also treat as market order
-    uint256 oppSummary = summaries[_summaryIx(!isBuy, isPut)];
-
-    if (oppSummary != 0) {
-      (uint32 oppBest,) = _best(!isBuy, isPut);
-
-      if ((isBuy && tick >= oppBest) || (!isBuy && tick <= oppBest)) {
-        _marketOrder(isBuy, isPut, uint128(size), _msgSender());
-        return 0;
-      }
-    }
-
-    // Is a limit order
-    uint128 qtyLeft = _matchQueuedTakers(isBuy, isPut, uint128(size), uint256(tick) * TICK_SZ);
-
-    if (qtyLeft == 0) return 0;
-
-    orderId = _insertLimit(isBuy, isPut, tick, qtyLeft);
-
-    require(balances[_msgSender()] >= _requiredMargin(_msgSender(), price, IM_BPS), Errors.INSUFFICIENT_BALANCE);
+  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice)
+    external
+    onlyWhitelisted
+    returns (uint256 orderId)
+  {
+    address trader = _msgSender();
+    return _placeOrder(side, size, limitPrice, trader);
   }
 
   function cancelOrder(uint256 orderId) external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
-    Maker storage M = makerQ[uint16(orderId)];
-
-    require(M.trader == _msgSender(), Errors.NOT_OWNER);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    Maker storage M = ob[activeCycle].makerNodes[uint16(orderId)];
+    if (M.trader != _msgSender()) revert Errors.NotOwner();
 
     uint32 tickKey = M.key;
-    Level storage L = levels[tickKey];
+    Level storage L = ob[activeCycle].levels[tickKey];
+
+    mapping(uint16 => Maker) storage makerNodes = ob[activeCycle].makerNodes;
 
     uint16 p = M.prev;
     uint16 n = M.next;
@@ -303,73 +187,65 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     // unlink from neighbours
     if (p == 0) L.head = n; // cancelled head
 
-    else makerQ[p].next = n;
+    else makerNodes[p].next = n;
 
     if (n == 0) L.tail = p; // cancelled tail
 
-    else makerQ[n].prev = p;
+    else makerNodes[n].prev = p;
 
     // adjust volume
     L.vol -= M.size;
 
-    (uint32 tick, bool isPut, bool isBid) = _splitKey(tickKey);
-    if (L.vol == 0) _clearLevel(isBid, isPut, tickKey);
+    (uint32 tick, MarketSide side) = BitScan.splitKey(tickKey);
+    if (L.vol == 0) _clearLevel(side, tick);
 
-    Pos storage P = positions[activeCycle | uint256(uint160(M.trader))];
-    if (isPut) isBid ? P.pendingLongPuts -= uint32(M.size) : P.pendingShortPuts -= uint32(M.size);
-    else isBid ? P.pendingLongCalls -= uint32(M.size) : P.pendingShortCalls -= uint32(M.size);
+    UserAccount storage P = userAccounts[M.trader];
+
+    if (side == MarketSide.PUT_BUY) P.pendingLongPuts -= uint16(M.size);
+    else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint16(M.size);
+    else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint16(M.size);
+    else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint16(M.size);
+    else revert();
 
     emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
-    delete makerQ[uint16(orderId)];
+    delete makerNodes[uint16(orderId)];
   }
 
-  /**
-   * @notice Anyone may call this when a trader's equity has fallen below maintenance margin.
-   * @param makerIds open maker-order nodeIds that belong to `trader`
-   *                 (pass an empty array if the trader has no orders)
-   */
   function liquidate(uint16[] calldata makerIds, address trader) external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
-    uint64 price = _getOraclePrice(0);
-    require(_isLiquidatable(trader, price), Errors.STILL_SOLVENT);
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    uint64 price = _getOraclePrice();
+    if (!_isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     for (uint256 k; k < makerIds.length; ++k) {
       uint16 id = makerIds[k];
-      Maker storage M = makerQ[id];
+      Maker storage M = ob[activeCycle].makerNodes[id];
       if (M.trader != trader) continue; // skip others' orders
       _forceCancel(id);
     }
 
-    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
-    uint256 shortCalls = _netShortCalls(P);
-    uint256 shortPuts = _netShortPuts(P);
+    UserAccount storage ua = userAccounts[trader];
+    uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
+    uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
-    if (shortCalls > 0) _marketOrder(true, false, uint128(shortCalls), trader);
-    if (shortPuts > 0) _marketOrder(true, true, uint128(shortPuts), trader);
+    if (shortCalls > 0) _marketOrder(MarketSide.CALL_SELL, uint128(shortCalls), trader);
+    if (shortPuts > 0) _marketOrder(MarketSide.PUT_SELL, uint128(shortPuts), trader);
 
     emit Liquidated(activeCycle, trader);
-  }
-
-  function fixPrice() external {
-    require(_isMarketLive(), Errors.MARKET_NOT_LIVE);
-    require(block.timestamp >= activeCycle, Errors.NOT_EXPIRED);
-
-    Cycle storage C = cycles[activeCycle];
-
-    uint64 price = _getOraclePrice(0);
-
-    C.settlementPrice = price;
-    cursor = 0; // reset iterator
-
-    emit PriceFixed(activeCycle, price);
   }
 
   function settleChunk(uint256 max) external returns (bool done) {
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
-    uint64 price = C.settlementPrice;
-    require(price > 0, Errors.PRICE_NOT_FIXED);
-    require(!C.isSettled, Errors.CYCLE_ALREADY_SETTLED);
+    uint64 settlementPrice = C.settlementPrice;
+
+    if (settlementPrice == 0) {
+      if (block.timestamp < activeCycle) revert Errors.NotExpired();
+      settlementPrice = _getOraclePrice();
+      C.settlementPrice = settlementPrice;
+      emit PriceFixed(activeCycle, settlementPrice);
+    }
+
+    if (C.isSettled) revert Errors.CycleAlreadySettled();
 
     uint256 n = traders.length;
     uint256 i = cursor;
@@ -378,8 +254,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
     while (i < upper) {
       address t = traders[i];
-      uint256 key = cycleId | uint256(uint160(t));
-      _settleTrader(cycleId, key, price, t);
+      _settleTrader(cycleId, settlementPrice, t);
       unchecked {
         ++i;
       }
@@ -395,274 +270,133 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       cursor = 0;
       C.isSettled = true;
       activeCycle = 0;
-      _purgeBook();
 
       badDebt = 0;
       paidOut = 0;
 
-      emit CycleSettled(block.timestamp); // or cycleId
+      emit CycleSettled(cycleId);
       done = true;
     }
   }
 
-  // #######################################################################
-  // #                                                                     #
-  // #                  Internal bit helpers                               #
-  // #                                                                     #
-  // #######################################################################
+  function startCycle(uint256 expiry) external {
+    if (activeCycle != 0) {
+      // If there is an active cycle, it must be in the past
+      if (activeCycle >= block.timestamp) revert Errors.CycleAlreadyStarted();
 
-  // Convert tick, isPut, isBid to key
-  function _key(uint32 tick, bool isPut, bool isBid) internal pure returns (uint32) {
-    require(tick < 1 << 24, Errors.TICK_TOO_LARGE);
-    return tick | (isPut ? 1 << 31 : 0) | (isBid ? 1 << 30 : 0);
-  }
-
-  // Convert key to tick, isPut, isBid
-  function _splitKey(uint32 key) private pure returns (uint32 tick, bool isPut, bool isBid) {
-    isPut = (key & (1 << 31)) != 0;
-    isBid = (key & (1 << 30)) != 0;
-    tick = key & 0x00FF_FFFF; // Only take rightmost 24 bits for tick
-  }
-
-  /**
-   * @notice Add bits to the orderbook on mid and detail level, and return bool to indicate if caller must set the
-   * summary bit for l1.
-   * @dev  Mark tick (l1,l2,l3) as non-empty.
-   *       Returns true  -> caller must set the summary bit for l1.
-   *       Returns false -> No change needed to summary bit.
-   *
-   * ticks are defined as [uint8, uint8, uint8] from the rightmost 24 bits of the tickKey:
-   *
-   * [1bit, 1bit, 6bits, 8bits, 8bits, 8bits]
-   * [isPut, isBid, unused, l1, l2, l3]
-   *
-   * where l1, l2, l3 are summary, mid, and detail bit index respectively.
-   *
-   * Index system is LSB-based. Meaning that index 0 is right most bit, and index 255 is left most bit.
-   */
-  function _addBits(
-    mapping(uint16 => uint256) storage det, // detail  (L3)  bitmap
-    mapping(uint8 => uint256) storage mid, // mid     (L2)  bitmap
-    uint8 l1, // high    byte
-    uint8 l2, // middle  byte
-    uint8 l3 // low     byte
-  ) internal returns (bool firstInL1) {
-    uint16 detKey = (uint16(l1) << 8) | l2; // Word key for det[] mapping
-    uint256 m3 = BitScan.mask(l3); // Isolate bit l3
-
-    // If this is the very first order at (l1,l2,l3) …
-    if (det[detKey] & m3 == 0) {
-      det[detKey] |= m3; // Flip the detail bit
-
-      uint256 m2 = BitScan.mask(l2); // Bit mask for mid bitmap
-      // If this tick is the first in its 256-tick block
-      if (mid[l1] & m2 == 0) {
-        mid[l1] |= m2; // Set the mid-level bit
-        return true; // Caller must set summary bit for l1
-      }
+      // The previous cycle must be settled
+      if (!cycles[activeCycle].isSettled) revert Errors.PreviousCycleNotSettled();
     }
-    return false;
-  }
 
-  /**
-   * @dev  Clear bits on mid and detail level, and return bool to indicate if caller must clear the summary bit for l1.
-   *       Returns true  -> caller must clear summary bit for l1.
-   *       Returns false -> summary still has other blocks.
-   */
-  function _clrBits(
-    mapping(uint16 => uint256) storage det,
-    mapping(uint8 => uint256) storage mid,
-    uint8 l1,
-    uint8 l2,
-    uint8 l3
-  ) internal returns (bool lastInL1) {
-    assembly {
-      mstore(0x00, or(shl(8, l1), l2))
-      mstore(0x20, det.slot)
-      let pDet := keccak256(0x00, 0x40)
+    uint64 price = _getOraclePrice();
+    if (price == 0) revert Errors.InvalidOraclePrice();
 
-      let word := sload(pDet)
-      let newW := and(word, not(shl(l3, 1)))
-      sstore(pDet, newW)
+    // Create new market
+    cycles[expiry] = Cycle({
+      isSettled: false,
+      strikePrice: price,
+      settlementPrice: 0 // Settlement price is set at cycle end time
+    });
 
-      if iszero(newW) {
-        // clear mid
-        mstore8(0x00, l1)
-        mstore(0x20, mid.slot)
-        let pMid := keccak256(0x00, 0x20)
-        let newM := and(sload(pMid), not(shl(l2, 1)))
-        sstore(pMid, newM)
-        if iszero(newM) { lastInL1 := 1 }
-      }
-    }
-  }
+    // Set expiry as current market
+    activeCycle = expiry;
 
-  // Returns the best tick and key for the given side and option type
-  function _best(bool isBid, bool isPut) private view returns (uint32 tick, uint32 key) {
-    uint256 summary = summaries[_summaryIx(isBid, isPut)];
-    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBid, isPut);
-
-    // For bids we want highest price (msb), for asks we want lowest price (lsb)
-    uint8 l1 = isBid ? summary.msb() : summary.lsb();
-
-    // Same for l2 and l3
-    uint8 l2 = isBid ? mid[l1].msb() : mid[l1].lsb();
-    uint16 k12 = (uint16(l1) << 8) | l2;
-    uint8 l3 = isBid ? det[k12].msb() : det[k12].lsb();
-
-    tick = BitScan.join(l1, l2, l3);
-    key = _key(tick, isPut, isBid);
-    return (tick, key);
-  }
-
-  // Add bit to summary bitmap
-  function _sumAddBit(bool isBid, bool isPut, uint8 l1) internal {
-    // Bitwise OR the mask with the summary bitmap, flipping that bit on
-    summaries[_summaryIx(isBid, isPut)] |= BitScan.mask(l1);
-  }
-
-  // Clear bit from summary bitmap
-  function _sumClrBit(bool isBid, bool isPut, uint8 l1) internal {
-    uint8 idx = (isPut ? 2 : 0) | (isBid ? 1 : 0);
-    summaries[idx] &= ~(1 << l1);
-  }
-
-  // Get summary index
-  function _summaryIx(bool isBid, bool isPut) internal pure returns (uint8) {
-    return (isBid ? 1 : 0) | ((isPut ? 1 : 0) << 1); // 0-3
+    emit CycleStarted(expiry, uint256(price));
   }
 
   // #######################################################################
   // #                                                                     #
-  // #                  Internal orderbook helpers                         #
+  // #                  Internal order placement helpers                   #
   // #                                                                     #
   // #######################################################################
+  function _depositCollateral(uint256 amount, address trader) private {
+    if (amount == 0) revert Errors.InvalidAmount();
 
-  function _insertLimit(bool isBuy, bool isPut, uint32 tick, uint128 size) private returns (uint16 nodeId) {
-    // pick the right bitmap ladders
-    (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det) = _maps(isBuy, isPut);
-
-    // derive level bytes and key
-    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
-    uint32 key = _key(tick, isPut, isBuy);
-
-    // if level empty, set bitmap bits
-    if (levels[key].vol == 0) {
-      bool firstInL1 = _addBits(det, mid, l1, l2, l3);
-      assert(mid[l1] & (1 << l2) != 0);
-
-      if (firstInL1) _sumAddBit(isBuy, isPut, l1);
+    IERC20(collateralToken).transferFrom(trader, address(this), amount);
+    unchecked {
+      // Nobody is depositing 18 trillion USD to overflow this
+      userAccounts[trader].balance += uint64(amount);
     }
 
-    // maker node
-    nodeId = ++nodePtr;
-    makerQ[nodeId] = Maker(_msgSender(), size, 0, key, levels[key].tail);
-
-    // FIFO queue link
-    if (levels[key].vol == 0) levels[key].head = nodeId;
-    else makerQ[levels[key].tail].next = nodeId;
-    levels[key].tail = nodeId;
-    levels[key].vol += size;
-
-    // position table
-    if (!inList[_msgSender()]) {
-      inList[_msgSender()] = true;
-      traders.push(_msgSender());
-    }
-    Pos storage P = positions[activeCycle | uint256(uint160(_msgSender()))]; // key by cycle+trader
-
-    if (isPut) isBuy ? P.pendingLongPuts += uint32(size) : P.pendingShortPuts += uint32(size);
-    else isBuy ? P.pendingLongCalls += uint32(size) : P.pendingShortCalls += uint32(size);
+    emit CollateralDeposited(trader, amount);
   }
 
-  function _settleFill(
-    uint32 orderId,
-    bool takerIsBuy,
-    bool isPut,
-    uint256 price, // 6 decimals
-    uint128 size,
-    address taker,
-    address maker,
-    bool isTakerQueue
-  ) internal returns (uint128) {
-    // Fees accounting
-    {
-      int256 notionalPremium = int256(price) * int256(uint256(size)); // always +ve
+  function _withdrawCollateral(uint256 amount, address trader) private {
+    if (amount == 0) revert Errors.InvalidAmount();
 
-      // signed direction: +1 when taker buys, -1 when taker sells
-      int256 dir = takerIsBuy ? int256(1) : int256(-1);
+    if (_hasOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
+    uint256 balance = userAccounts[trader].balance;
+    if (balance < amount) revert Errors.InsufficientBalance();
 
-      int256 makerFee = notionalPremium * makerFeeBps / int256(denominator);
-      int256 takerFee = notionalPremium * takerFeeBps / int256(denominator);
-
-      // flip premium flow with dir
-      int256 cashMaker = dir * notionalPremium + makerFee;
-      int256 cashTaker = -dir * notionalPremium + takerFee;
-
-      // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && balances[taker] < uint256((cashTaker * -1))) return 0;
-
-      _applyCashDeltaSocial(maker, cashMaker);
-      _applyCashDeltaSocial(taker, cashTaker);
-
-      int256 houseFee = -(makerFee + takerFee); // net to fee recipient
-      if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+    unchecked {
+      // We check amount above, and this saves some gas + code size
+      userAccounts[trader].balance -= uint64(amount);
     }
 
-    // Position accounting
-    {
-      Pos storage PM = positions[activeCycle | uint256(uint160(maker))];
-      Pos storage PT = positions[activeCycle | uint256(uint160(taker))];
+    IERC20(collateralToken).transfer(trader, amount);
 
-      if (isPut) {
-        if (takerIsBuy) {
-          PT.longPuts += uint32(size);
-          PM.shortPuts += uint32(size);
-          if (!isTakerQueue) PM.pendingShortPuts -= uint32(size);
-          else PT.pendingLongPuts -= uint32(size);
-        } else {
-          PT.shortPuts += uint32(size);
-          PM.longPuts += uint32(size);
-          if (!isTakerQueue) PM.pendingLongPuts -= uint32(size);
-          else PT.pendingShortPuts -= uint32(size);
-        }
-      } else {
-        if (takerIsBuy) {
-          PT.longCalls += uint32(size);
-          PM.shortCalls += uint32(size);
-          if (!isTakerQueue) PM.pendingShortCalls -= uint32(size);
-          else PT.pendingLongCalls -= uint32(size);
-        } else {
-          PT.shortCalls += uint32(size);
-          PM.longCalls += uint32(size);
-          if (!isTakerQueue) PM.pendingLongCalls -= uint32(size);
-          else PT.pendingShortCalls -= uint32(size);
-        }
+    emit CollateralWithdrawn(trader, amount);
+  }
+
+  function _placeOrder(
+    MarketSide side,
+    uint256 size,
+    uint256 limitPrice, // 0 = market
+    address trader
+  ) private returns (uint256 orderId) {
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    if (size == 0) revert Errors.InvalidAmount();
+
+    if (limitPrice == 0) {
+      // Market order
+      _marketOrder(side, uint128(size), trader);
+      return 0;
+    }
+
+    // Convert price to tick
+    uint256 tick = limitPrice / TICK_SZ; // 1 tick = 0.01 USDT0
+
+    // If opposite side has liquidity and price is crossing, then also treat as market order
+    MarketSide oppSide = _oppositeSide(side);
+    if (ob[activeCycle].summaries[uint256(oppSide)] != 0) {
+      (uint32 oppBest,) = _best(oppSide);
+
+      // Check crossing: even enum values (buys) use >=, odd enum values (sells) use <=
+      bool isCrossing = (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
+
+      if (isCrossing) {
+        _marketOrder(side, uint128(size), trader);
+        return 0;
       }
     }
 
-    // event OrderMatched(uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, bool isBuy, bool
-    // isPut, address indexed taker, address indexed maker);
-    emit OrderFilled(activeCycle, orderId, size, price, takerIsBuy, isPut, taker, maker, _getOraclePrice(0) / 10000000);
+    // Is a limit order
+    uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ);
+    if (qtyLeft == 0) return 0;
 
-    return size;
+    orderId = _insertLimit(side, uint32(tick), uint128(qtyLeft));
+
+    if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
+      revert Errors.InsufficientBalance();
+    }
   }
 
-  /**
-   * @dev Fills against the opposite side until either a) qty exhausted, or b) book empty
-   */
-  function _marketOrder(bool isBuy, bool isPut, uint128 want, address taker) private {
+  function _marketOrder(MarketSide side, uint128 want, address taker) private {
     uint128 left = want;
+    uint256 ac = activeCycle;
+    OrderbookState storage _ob = ob[ac];
+    mapping(uint32 => Level) storage levels = _ob.levels;
+    mapping(uint16 => Maker) storage makerQ = _ob.makerNodes;
 
     while (left > 0) {
       {
         // Any liquidity left?
-        uint256 sumOpp = summaries[_summaryIx(!isBuy, isPut)];
+        uint256 sumOpp = _ob.summaries[uint256(_oppositeSide(side))];
         if (sumOpp == 0) break; // No bits set in summary means empty book
       }
 
       // Best price level
-      (uint32 bestTick, uint32 bestKey) = _best(!isBuy, isPut);
+      (uint32 bestTick, uint32 bestKey) = _best(_oppositeSide(side));
       Level storage L = levels[bestKey];
       uint16 nodeId = L.head; // nodeId = orderId
 
@@ -672,18 +406,18 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
         uint128 take = left < M.size ? left : M.size;
 
-        uint128 taken = _settleFill(
-          nodeId,
-          isBuy, // taker side
-          isPut,
-          uint256(bestTick) * TICK_SZ, // price
-          take,
-          taker, // taker
-          M.trader, // maker
-          false // isTakerQueue
+        uint128 taken = uint128(
+          _settleFill(
+            nodeId,
+            side,
+            uint256(bestTick) * TICK_SZ, // price
+            take,
+            taker, // taker
+            M.trader, // maker
+            _isBuy(side),
+            false // isTakerQueue
+          )
         );
-
-        require(taken > 0, Errors.INSUFFICIENT_BALANCE);
 
         left -= taken;
         M.size -= taken;
@@ -704,47 +438,41 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
       }
 
       // If price level empty, clear bitmaps
-      if (L.vol == 0) _clearLevel(!isBuy, isPut, bestKey);
+      if (L.vol == 0) _clearLevel(_oppositeSide(side), bestKey);
     }
 
-    if (left > 0) _queueTaker(isBuy, isPut, left, taker);
-  }
-
-  function _queueTaker(bool isBuy, bool isPut, uint128 qty, address trader) private {
-    takerQ[isPut ? 1 : 0][isBuy ? 1 : 0].push(TakerQ({size: uint96(qty), trader: trader}));
-    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
-    if (isPut) isBuy ? P.pendingLongPuts += uint32(qty) : P.pendingShortPuts += uint32(qty);
-    else isBuy ? P.pendingLongCalls += uint32(qty) : P.pendingShortCalls += uint32(qty);
+    if (left > 0) _queueTaker(side, left, taker);
   }
 
   function _matchQueuedTakers(
-    bool makerIsBid,
-    bool isPut,
-    uint128 makerSize,
+    MarketSide side,
+    uint256 makerSize,
     uint256 price // maker's price, 6-dec
-  ) private returns (uint128 remainingMakerSize) {
-    TakerQ[] storage Q = takerQ[isPut ? 1 : 0][makerIsBid ? 0 : 1];
-    uint256 i = tqHead[isPut ? 1 : 0][makerIsBid ? 0 : 1];
+  ) private returns (uint256 remainingMakerSize) {
+    TakerQ[] storage Q = takerQ[uint256(_oppositeSide(side))];
+    uint256 i = tqHead[uint256(_oppositeSide(side))];
 
+    uint256 qLength = Q.length;
     remainingMakerSize = makerSize;
 
-    while (remainingMakerSize > 0 && i < Q.length) {
+    while (remainingMakerSize > 0 && i < qLength) {
       TakerQ storage T = Q[i];
       if (T.size == 0) {
         ++i;
         continue;
       } // skip emptied slot
 
-      uint128 take = T.size > remainingMakerSize ? remainingMakerSize : T.size;
+      TakerQ memory Tmem = Q[i]; // copy over for gas savings
+      uint256 take = Tmem.size > remainingMakerSize ? remainingMakerSize : Tmem.size;
 
-      uint128 taken = _settleFill(
+      uint256 taken = _settleFill(
         0, // Imaginary orderId to denote that this is a takerQueue match
-        !makerIsBid, // same as takerIsBuy
-        isPut,
+        side,
         price,
         take,
-        T.trader, // The (queued) taker
+        Tmem.trader, // The (queued) taker
         _msgSender(), // The maker
+        !_isBuy(side), // Taker is buy when maker's side is sell, which is when side is odd
         true // isTakerQueue
       );
 
@@ -753,28 +481,379 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
 
       if (T.size == 0) ++i; // fully consumed
     }
-    tqHead[isPut ? 1 : 0][makerIsBid ? 0 : 1] = i; // persist cursor
+    tqHead[uint256(_oppositeSide(side))] = i; // persist cursor
   }
 
-  // Safely apply pnl
-  function _applyCashDelta(address user, int256 delta) private {
-    if (delta > 0) {
-      balances[user] += uint256(delta);
-    } else if (delta < 0) {
-      uint256 absVal = uint256(-delta);
-      require(balances[user] >= absVal, Errors.INSUFFICIENT_BALANCE);
-      balances[user] -= absVal;
+  function _insertLimit(MarketSide side, uint32 tick, uint128 size) private returns (uint16 nodeId) {
+    // derive level bytes and key
+    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+    uint32 key = _key(tick, side);
+
+    uint256 ac = activeCycle;
+    OrderbookState storage _ob = ob[ac];
+    mapping(uint32 => Level) storage levels = _ob.levels;
+
+    // if level empty, set bitmap bits
+    if (levels[key].vol == 0) {
+      bool firstInL1 = _addBits(_ob.dets[side], _ob.mids[side], l1, l2, l3);
+      assert(_ob.mids[side][l1] & (1 << l2) != 0);
+
+      if (firstInL1) _ob.summaries[uint256(side)] |= BitScan.mask(l1);
+    }
+
+    // maker node
+    nodeId = ++_ob.nodePtr;
+    address trader = _msgSender();
+    _ob.makerNodes[nodeId] = Maker(trader, size, 0, key, levels[key].tail);
+
+    // FIFO queue link
+    if (levels[key].vol == 0) levels[key].head = nodeId;
+    else _ob.makerNodes[levels[key].tail].next = nodeId;
+    levels[key].tail = nodeId;
+    levels[key].vol += size;
+
+    // position table
+    if (!userAccounts[trader].activeInCycle) {
+      userAccounts[trader].activeInCycle = true;
+      traders.push(trader);
+    }
+    UserAccount storage ua = userAccounts[trader];
+
+    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts += uint16(size);
+    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts += uint16(size);
+    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint16(size);
+    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint16(size);
+    else revert();
+  }
+
+  function _settleFill(
+    uint32 orderId,
+    MarketSide side,
+    uint256 price, // 6 decimals
+    uint256 size,
+    address taker,
+    address maker,
+    bool isTakerBuy,
+    bool isTakerQueue
+  ) internal returns (uint256) {
+    // Fees accounting
+    {
+      int256 premium = int256(price) * int256(size); // always +ve
+
+      // signed direction: +1 when taker buys, -1 when taker sells
+      int256 dir = isTakerBuy ? int256(1) : int256(-1);
+
+      int256 makerFee = premium * makerFeeBps / int256(denominator);
+      int256 takerFee = premium * takerFeeBps / int256(denominator);
+
+      // flip premium flow with dir
+      int256 cashMaker = dir * premium + makerFee;
+      int256 cashTaker = -dir * premium + takerFee;
+
+      // Check if taker has enough cash to pay premium. If not, return 0
+      if (isTakerQueue && userAccounts[taker].balance < uint256((cashTaker * -1))) return 0;
+
+      _applyCashDelta(maker, cashMaker);
+      _applyCashDelta(taker, cashTaker);
+
+      // Net to fee recipient. This should always be positive (unless makerFeeBps + takerFeeBps are set incorrectly)
+      int256 houseFee = -(makerFee + takerFee);
+      if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+    }
+
+    // Position accounting
+    {
+      UserAccount storage uaMaker = userAccounts[maker];
+      UserAccount storage uaTaker = userAccounts[taker];
+
+      if (_isPut(side)) {
+        if (isTakerBuy) {
+          uaTaker.longPuts += uint16(size);
+          uaMaker.shortPuts += uint16(size);
+          if (!isTakerQueue) uaMaker.pendingShortPuts -= uint16(size);
+          else uaTaker.pendingLongPuts -= uint16(size);
+        } else {
+          uaTaker.shortPuts += uint16(size);
+          uaMaker.longPuts += uint16(size);
+          if (!isTakerQueue) uaMaker.pendingLongPuts -= uint16(size);
+          else uaTaker.pendingShortPuts -= uint16(size);
+        }
+      } else {
+        if (isTakerBuy) {
+          uaTaker.longCalls += uint16(size);
+          uaMaker.shortCalls += uint16(size);
+          if (!isTakerQueue) uaMaker.pendingShortCalls -= uint16(size);
+          else uaTaker.pendingLongCalls -= uint16(size);
+        } else {
+          uaTaker.shortCalls += uint16(size);
+          uaMaker.longCalls += uint16(size);
+          if (!isTakerQueue) uaMaker.pendingLongCalls -= uint16(size);
+          else uaTaker.pendingShortCalls -= uint16(size);
+        }
+      }
+    }
+
+    emit OrderFilled(activeCycle, orderId, size, price, side, taker, maker, _getOraclePrice());
+
+    return size;
+  }
+
+  function _queueTaker(MarketSide side, uint256 qty, address trader) private {
+    takerQ[uint256(side)].push(TakerQ({size: uint96(qty), trader: trader}));
+    UserAccount storage ua = userAccounts[trader];
+    if (_isPut(side)) {
+      if (_isBuy(side)) ua.pendingLongPuts += uint16(qty);
+      else ua.pendingShortPuts += uint16(qty);
+    } else {
+      if (_isBuy(side)) ua.pendingLongCalls += uint16(qty);
+      else ua.pendingShortCalls += uint16(qty);
     }
   }
 
+  function _forceCancel(uint16 orderId) internal {
+    uint256 ac = activeCycle;
+    Maker memory M = ob[ac].makerNodes[orderId];
+    uint32 key = M.key;
+    Level storage L = ob[ac].levels[key];
+
+    uint16 p = M.prev;
+    uint16 n = M.next;
+
+    if (p == 0) L.head = n;
+    else ob[ac].makerNodes[p].next = n;
+    if (n == 0) L.tail = p;
+    else ob[ac].makerNodes[n].prev = p;
+
+    L.vol -= M.size; // reduce resting volume
+    UserAccount storage ua = userAccounts[M.trader];
+    (uint32 tick, MarketSide side) = BitScan.splitKey(M.key);
+
+    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint16(M.size);
+    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint16(M.size);
+    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint16(M.size);
+    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint16(M.size);
+
+    delete ob[ac].makerNodes[orderId]; // free storage
+
+    if (L.vol == 0) _clearLevel(side, key);
+
+    emit OrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                  Internal Orderbook helpers                         #
+  // #                                                                     #
+  // #######################################################################
+
+  function _oppositeSide(MarketSide side) internal pure returns (MarketSide) {
+    return MarketSide(uint256(side) ^ 1); // XOR 1 to flip the side
+  }
+
+  function _getOraclePrice() internal view returns (uint64) {
+    // return 100000 * 1e6;
+    (bool success, bytes memory result) = ORACLE_PX_PRECOMPILE_ADDRESS.staticcall(abi.encode(0));
+    if (!success) revert Errors.OraclePriceCallFailed();
+    // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
+    uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
+    return price;
+  }
+
+  function _best(MarketSide side) private view returns (uint32 tick, uint32 key) {
+    uint256 summary = ob[activeCycle].summaries[uint256(side)];
+
+    function (uint256) pure returns (uint8) sb = _sb(side);
+
+    // For bids we want highest price (msb), for asks we want lowest price (lsb)
+    uint8 l1 = sb(summary);
+    uint8 l2 = sb(ob[activeCycle].mids[side][l1]);
+    uint16 k12 = (uint16(l1) << 8) | l2;
+    uint8 l3 = sb(ob[activeCycle].dets[side][k12]);
+
+    tick = BitScan.join(l1, l2, l3);
+    key = _key(tick, side);
+    return (tick, key);
+  }
+
+  function _key(uint32 tick, MarketSide side) internal pure returns (uint32) {
+    if (tick >= 1 << 24) revert Errors.TickTooLarge();
+    return tick | (_isPut(side) ? 1 << 31 : 0) | (_isBuy(side) ? 1 << 30 : 0);
+  }
+
+  function _sb(MarketSide side) internal pure returns (function (uint256) pure returns (uint8)) {
+    return _isBuy(side) ? BitScan.msb : BitScan.lsb;
+  }
+
+  function _isPut(MarketSide side) internal pure returns (bool) {
+    return side == MarketSide.PUT_BUY || side == MarketSide.PUT_SELL;
+  }
+
+  function _isBuy(MarketSide side) internal pure returns (bool) {
+    return side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY;
+  }
+
+  /**
+   * @notice Add bits to the orderbook on mid and detail level, and return bool to indicate if caller must set the
+   * summary bit for l1.
+   * @dev  Mark tick (l1,l2,l3) as non-empty.
+   *       Returns true  -> caller must set the summary bit for l1.
+   *       Returns false -> No change needed to summary bit.
+   *
+   * ticks are defined as [uint8, uint8, uint8] from the rightmost 24 bits of the tickKey:
+   *
+   * [1bit, 1bit, 6bits, 8bits, 8bits, 8bits]
+   * [isPut, isBid, unused, l1, l2, l3]
+   *
+   * where l1, l2, l3 are summary, mid, and detail bit index respectively.
+   *
+   * Index system is LSB-based. Meaning that index 0 is right most bit, and index 255 is left most bit.
+   */
+  function _addBits(
+    mapping(uint16 => uint256) storage dett, // detail  (L3)  bitmap
+    mapping(uint8 => uint256) storage midd, // mid     (L2)  bitmap
+    uint8 l1, // high    byte
+    uint8 l2, // middle  byte
+    uint8 l3 // low     byte
+  ) internal returns (bool firstInL1) {
+    uint16 detKey = (uint16(l1) << 8) | l2; // Word key for det[] mapping
+    uint256 m3 = BitScan.mask(l3); // Isolate bit l3
+
+    // If this is the very first order at (l1,l2,l3) …
+    if (dett[detKey] & m3 == 0) {
+      dett[detKey] |= m3; // Flip the detail bit
+
+      uint256 m2 = BitScan.mask(l2); // Bit mask for mid bitmap
+      // If this tick is the first in its 256-tick block
+      if (midd[l1] & m2 == 0) {
+        midd[l1] |= m2; // Set the mid-level bit
+        return true; // Caller must set summary bit for l1
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @dev  Clear bits on mid and detail level, and return bool to indicate if caller must clear the summary bit for l1.
+   *       Returns true  -> caller must clear summary bit for l1.
+   *       Returns false -> summary still has other blocks.
+   */
+  function _clrBits(MarketSide side, uint8 l1, uint8 l2, uint8 l3) internal returns (bool lastInL1) {
+    mapping(uint8 => uint256) storage mid = ob[activeCycle].mids[side];
+    mapping(uint16 => uint256) storage det = ob[activeCycle].dets[side];
+
+    uint16 detKey = (uint16(l1) << 8) | l2; // Locate detail word
+    det[detKey] &= ~BitScan.mask(l3); // Clear bit l3
+
+    // If no ticks left in this 256-tick word
+    if (det[detKey] == 0) {
+      mid[l1] &= ~BitScan.mask(l2); // Clear mid-level bit
+      // If no 256-tick words left in this 65 k-tick block
+      if (mid[l1] == 0) return true; // Caller must clear summary bit
+    }
+    return false;
+  }
+
+  function _clearLevel(MarketSide side, uint32 key) private {
+    (uint32 tick,) = BitScan.splitKey(key);
+    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+
+    // Clear bitmaps
+    bool lastInL1 = _clrBits(side, l1, l2, l3);
+    if (lastInL1) ob[activeCycle].summaries[uint256(side)] &= ~BitScan.mask(l1);
+
+    delete ob[activeCycle].levels[key];
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #             Internal position and settlement helpers                #
+  // #                                                                     #
+  // #######################################################################
+
+  function _hasOpenPositionsOrOrders(address trader) internal view returns (bool) {
+    UserAccount storage a = userAccounts[trader];
+
+    return (
+      a.longCalls | a.shortCalls | a.longPuts | a.shortPuts | a.pendingLongCalls | a.pendingShortCalls
+        | a.pendingLongPuts | a.pendingShortPuts
+    ) != 0;
+  }
+
+  function _isMarketLive() internal view returns (bool) {
+    uint256 ac = activeCycle;
+    return block.timestamp < ac && ac != 0;
+  }
+
+  function _requiredMarginForOrder(address trader, uint256 price, uint256 marginBps) internal view returns (uint256) {
+    UserAccount memory ua = userAccounts[trader];
+
+    uint256 shortCalls = (ua.shortCalls + ua.pendingShortCalls) > (ua.longCalls + ua.pendingLongCalls)
+      ? (ua.shortCalls + ua.pendingShortCalls) - (ua.longCalls + ua.pendingLongCalls)
+      : 0;
+    uint256 shortPuts = (ua.shortPuts + ua.pendingShortPuts) > (ua.longPuts + ua.pendingLongPuts)
+      ? (ua.shortPuts + ua.pendingShortPuts) - (ua.longPuts + ua.pendingLongPuts)
+      : 0;
+
+    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
+    return notional * marginBps / denominator;
+  }
+
+  function _applyCashDelta(address user, int256 delta) private {
+    if (delta > 0) {
+      userAccounts[user].balance += uint64(uint256(delta));
+    } else if (delta < 0) {
+      uint256 absVal = uint256(-delta);
+      if (userAccounts[user].balance < absVal) revert Errors.InsufficientBalance();
+      userAccounts[user].balance -= uint64(absVal);
+    }
+  }
+
+  function _settleTrader(uint256 cycleId, uint64 price, address trader) internal {
+    UserAccount memory uaMem = userAccounts[trader];
+    if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) {
+      _clearAllPositions(trader);
+      return;
+    }
+
+    int256 pnl;
+
+    /* intrinsic of calls */
+    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
+    if (diff > 0) {
+      // long calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    } else {
+      // short calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    }
+
+    /* intrinsic of puts (mirror) */
+    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
+    if (diff > 0) {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    } else {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    }
+
+    _applyCashDeltaSocial(trader, pnl);
+
+    _clearAllPositions(trader);
+    emit Settled(cycleId, trader, pnl);
+  }
+
   function _applyCashDeltaSocial(address u, int256 d) internal {
+    UserAccount memory ua = userAccounts[u];
     if (d < 0) {
       uint256 debit = uint256(-d);
-      uint256 bal = balances[u];
+      uint256 bal = ua.balance;
       if (bal >= debit) {
-        balances[u] = bal - debit;
+        ua.balance = uint64(bal - debit);
       } else {
-        balances[u] = 0;
+        ua.balance = 0;
         badDebt += debit - bal;
       }
       return;
@@ -784,7 +863,7 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint256 newPaid = paidOut + credit;
 
     if (badDebt == 0) {
-      balances[u] += credit;
+      ua.balance = uint64(ua.balance + credit);
       paidOut = newPaid;
       return;
     }
@@ -799,233 +878,50 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     uint256 distributable = newPaid - badDebt; // > 0
     uint256 give = credit * distributable / newPaid;
 
-    balances[u] += give;
+    ua.balance = uint64(ua.balance + give);
 
     // plug the hole and keep only the surplus as new paidOut
     paidOut = distributable;
     badDebt = 0;
   }
 
-  function _clearLevel(bool isBuy, bool isPut, uint32 key) private {
-    (uint32 tick,,) = _splitKey(key);
-    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
-
-    // The opposite book
-    (mapping(uint8 => uint256) storage midOpp, mapping(uint16 => uint256) storage detOpp) = _maps(isBuy, isPut);
-
-    // Clear bitmaps
-    bool lastInL1 = _clrBits(detOpp, midOpp, l1, l2, l3);
-    if (lastInL1) _sumClrBit(isBuy, isPut, l1);
-
-    delete levels[key];
-  }
-
-  function _forceCancel(uint16 orderId) internal {
-    Maker storage M = makerQ[orderId];
-    uint32 key = M.key;
-    Level storage L = levels[key];
-
-    uint16 p = M.prev;
-    uint16 n = M.next;
-
-    if (p == 0) L.head = n;
-    else makerQ[p].next = n;
-    if (n == 0) L.tail = p;
-    else makerQ[n].prev = p;
-
-    L.vol -= M.size; // reduce resting volume
-    Pos storage P = positions[activeCycle | uint256(uint160(M.trader))];
-    (uint32 tick, bool isPut, bool isBid) = _splitKey(M.key);
-
-    if (isPut) isBid ? P.pendingLongPuts -= uint32(M.size) : P.pendingShortPuts -= uint32(M.size);
-    else isBid ? P.pendingLongCalls -= uint32(M.size) : P.pendingShortCalls -= uint32(M.size);
-    delete makerQ[orderId]; // free storage
-
-    if (L.vol == 0) _clearLevel(isBid, isPut, key);
-
-    emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
-  }
-
-  // Return the mid and detailed bitmaps for the given side.
-  function _maps(bool isBid, bool isPut)
+  function _requiredMarginForLiquidation(address trader, uint256 price, uint256 marginBps)
     internal
     view
-    returns (mapping(uint8 => uint256) storage mid, mapping(uint16 => uint256) storage det)
+    returns (uint256)
   {
-    if (isBid) {
-      if (isPut) {
-        mid = midPB;
-        det = detPB;
-      } else {
-        mid = midCB;
-        det = detCB;
-      }
-    } else {
-      if (isPut) {
-        mid = midPA;
-        det = detPA;
-      } else {
-        mid = midCA;
-        det = detCA;
-      }
-    }
-  }
+    UserAccount memory ua = userAccounts[trader];
 
-  function _purgeBook() internal {
-    // Loop over all 4 book sides
-    for (uint8 put = 0; put < 2; ++put) {
-      for (uint8 bid = 0; bid < 2; ++bid) {
-        _purgeSide(bid == 1, put == 1);
-      }
-    }
-  }
+    uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
+    uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
-  // walk one side of the book, removing every price-level
-  function _purgeSide(bool isBid, bool isPut) private {
-    uint8 sIx = _summaryIx(isBid, isPut);
+    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
 
-    // while there is still at least one block with liquidity …
-    while (summaries[sIx] != 0) {
-      // start clearing from best price level
-      (, uint32 key) = _best(isBid, isPut);
-
-      // unlink all maker nodes at that tick
-      Level storage L = levels[key];
-      uint16 node = L.head;
-      while (node != 0) {
-        uint16 nxt = makerQ[node].next;
-        delete makerQ[node];
-        node = nxt;
-      }
-
-      // clear bitmap bits and Level struct
-      _clearLevel(isBid, isPut, key);
-    }
-  }
-
-  // #######################################################################
-  // #                                                                     #
-  // #             Internal position and settlement helpers                #
-  // #                                                                     #
-  // #######################################################################
-
-  function _getOraclePrice(uint32 index) internal view returns (uint64 price) {
-    // bool success;
-    // bytes memory result;
-    // (success, result) = ORACLE_PX_PRECOMPILE_ADDRESS.call(abi.encode(index));
-    // require(success, Errors.ORACLE_PRICE_CALL_FAILED);
-    // price = abi.decode(result, (uint64)) / 10;
-    price = 107000 * uint64(10 ** collateralDecimals);
-  }
-
-  function _isMarketLive() internal view returns (bool) {
-    return cycles[activeCycle].settlementPrice == 0;
-  }
-
-  function _totalNotional(uint256 contracts, uint64 spot) internal pure returns (uint256) {
-    // contracts * spot * 0.01 = total notional
-    return contracts * uint256(spot) / CONTRACT_SIZE;
-  }
-
-  function _netShortCalls(Pos memory p) internal pure returns (uint256) {
-    return (p.shortCalls + p.pendingShortCalls) > (p.longCalls + p.pendingLongCalls)
-      ? (p.shortCalls + p.pendingShortCalls) - (p.longCalls + p.pendingLongCalls)
-      : 0;
-  }
-
-  function _netShortPuts(Pos memory p) internal pure returns (uint256) {
-    return (p.shortPuts + p.pendingShortPuts) > (p.longPuts + p.pendingLongPuts)
-      ? (p.shortPuts + p.pendingShortPuts) - (p.longPuts + p.pendingLongPuts)
-      : 0;
-  }
-
-  function _requiredMargin(address trader, uint64 price, uint256 marginBps) internal view returns (uint256 rm) {
-    Pos storage P = positions[activeCycle | uint256(uint160(trader))];
-
-    uint256 shortCalls = _netShortCalls(P);
-    uint256 shortPuts = _netShortPuts(P);
-
-    uint256 notional = _totalNotional(shortCalls + shortPuts, price);
-
-    rm = notional * marginBps / denominator;
+    return notional * marginBps / denominator;
   }
 
   function _isLiquidatable(address trader, uint64 price) internal view returns (bool) {
-    uint256 mm6 = _requiredMargin(trader, price, MM_BPS);
-
-    return balances[trader] < mm6;
+    UserAccount storage ua = userAccounts[trader];
+    return ua.balance < _requiredMarginForLiquidation(trader, price, MM_BPS);
   }
 
-  function _settleTrader(uint256 cycleId, uint256 key, uint64 price, address trader) internal {
-    Pos storage P = positions[key];
-    if (P.longCalls | P.shortCalls | P.longPuts | P.shortPuts == 0) {
-      delete positions[key];
-      return;
+  function _clearAllPositions(address trader) internal {
+    UserAccount storage ua = userAccounts[trader];
+    ua.activeInCycle = false;
+    // Zero out all 8 position variables (upper 128 bits) while preserving lower 128 bits
+    assembly {
+      let slot := ua.slot
+      let currentValue := sload(slot)
+      let mask := 0x00000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+      sstore(slot, and(currentValue, mask))
     }
-
-    int256 pnl;
-
-    /* intrinsic of calls */
-    int256 diff = int256(uint256(price)) - int256(uint256(cycles[activeCycle].strikePrice));
-    if (diff > 0) {
-      // long calls win
-      pnl += diff * int256(uint256(P.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(P.shortCalls)) / int256(CONTRACT_SIZE);
-    } else {
-      // short calls win
-      pnl += diff * int256(uint256(P.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(P.shortCalls)) / int256(CONTRACT_SIZE);
-    }
-
-    /* intrinsic of puts (mirror) */
-    diff = int256(uint256(cycles[activeCycle].strikePrice)) - int256(uint256(price));
-    if (diff > 0) {
-      pnl += diff * int256(uint256(P.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(P.shortPuts)) / int256(CONTRACT_SIZE);
-    } else {
-      pnl += diff * int256(uint256(P.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(P.shortPuts)) / int256(CONTRACT_SIZE);
-    }
-
-    _applyCashDeltaSocial(trader, pnl);
-    inList[trader] = false;
-    emit Settled(cycleId, trader, pnl);
-
-    delete positions[key]; // gas refund
-  }
-
-  function _noOpenPositionsOrOrders(address trader) internal view returns (bool) {
-    uint256 key = activeCycle | uint256(uint160(trader));
-    return positions[key].longCalls | positions[key].shortCalls | positions[key].longPuts | positions[key].shortPuts
-      | positions[key].pendingLongCalls | positions[key].pendingShortCalls | positions[key].pendingLongPuts
-      | positions[key].pendingShortPuts == 0;
   }
 
   // #######################################################################
   // #                                                                     #
-  // #                  View functions                                     #
+  // #             Other helpers                                           #
   // #                                                                     #
   // #######################################################################
-
-  function viewTakerQueue(bool isPut, bool isBid) external view returns (TakerQ[] memory) {
-    return takerQ[isPut ? 1 : 0][isBid ? 1 : 0];
-  }
-
-  modifier onlyWhitelisted() {
-    require(whitelist[_msgSender()], Errors.NOT_WHITELISTED);
-    _;
-  }
-
-  modifier isValidSignature(bytes memory signature) {
-    require(
-      WHITELIST_SIGNER == ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature), Errors.INVALID_SIGNATURE
-    );
-    _;
-  }
-
-  function getOraclePrice(uint32 index) external view returns (uint64) {
-    return _getOraclePrice(index);
-  }
 
   function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
@@ -1048,29 +944,15 @@ contract Market is IMarket, ERC2771ContextUpgradeable, UUPSUpgradeable, OwnableU
     return ERC2771ContextUpgradeable._contextSuffixLength();
   }
 
-  // #######################################################################
-  // #                                                                     #
-  // #                  Admin functions                                    #
-  // #                                                                     #
-  // #######################################################################
-
-  function setTrustedForwarder(address _forwarder) external onlyOwner {
-    _trustedForwarder = _forwarder;
+  modifier onlyWhitelisted() {
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
+    _;
   }
 
-  function pause() external onlyOwner {
-    _pause();
+  modifier isValidSignature(bytes memory signature) {
+    if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
+      revert Errors.InvalidSignature();
+    }
+    _;
   }
-
-  function unpause() external onlyOwner {
-    _unpause();
-  }
-
-  /**
-   * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract.
-   * Called by
-   * {upgradeTo} and {upgradeToAndCall}.
-   * @param newImplementation Address of the new implementation contract
-   */
-  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

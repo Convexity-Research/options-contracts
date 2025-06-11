@@ -3,40 +3,60 @@ pragma solidity ^0.8.25;
 
 import "forge-std/Test.sol";
 import "forge-std/StdUtils.sol";
-import "../src/Market.sol";
-import "./mocks/MarketTest.sol";
-import "../src/lib/Bitscan.sol";
-import "./mocks/Token.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import "./mocks/MarketWithViews.sol";
+import {BitScan} from "../src/lib/Bitscan.sol";
+import {Token} from "./mocks/Token.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {
+  TransparentUpgradeableProxy,
+  ITransparentUpgradeableProxy
+} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 contract MarketSuite is Test {
   using BitScan for uint256;
 
-  uint32 constant ONE_TICK = 1; // == 0.01 USDT
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
   uint256 constant LOT = 100; // contracts
-  address public constant ORACLE_FEED = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
 
   Token usdt; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
-  MarketTest mkt;
 
-  address u1 = makeAddr("alice");
-  address u2 = makeAddr("bob");
+  MarketWithViews implementation;
+  ProxyAdmin proxyAdmin;
+  TransparentUpgradeableProxy proxy;
+  MarketWithViews mkt;
+
+  address public owner = makeAddr("owner");
+  address public u1 = makeAddr("user1");
+  address public u2 = makeAddr("user2");
   address feeSink = makeAddr("feeSink");
   address signer;
   uint256 signerKey;
 
+  uint256 btcPrice = 109000;
+
   function setUp() public {
     (signer, signerKey) = makeAddrAndKey("signer");
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
-    mkt = MarketTest(
-      address(
-        new ERC1967Proxy(
-          address(new MarketTest()), abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt))
-        )
-      )
-    );
-    mkt.startCycle(block.timestamp);
+
+    implementation = new MarketWithViews();
+
+    // ProxyAdmin with owner as `owner`
+    vm.prank(owner);
+    proxyAdmin = new ProxyAdmin(owner);
+
+    // Init data
+    bytes memory initData =
+      abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt), address(0));
+
+    // Proxy
+    proxy = new TransparentUpgradeableProxy(address(implementation), address(proxyAdmin), initData);
+
+    // Interface to interact with proxy
+    mkt = MarketWithViews(address(proxy));
+
+    _mockOracle(btcPrice);
+
+    mkt.startCycle(block.timestamp + 60);
   }
 
   // #######################################################################
@@ -52,48 +72,51 @@ contract MarketSuite is Test {
     vm.prank(u1);
     mkt.withdrawCollateral(withdrawAmount);
 
-    assertEq(mkt.balances(u1), depositAmount - withdrawAmount);
+    MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
+
+    assertEq(ua.balance, depositAmount - withdrawAmount);
     assertEq(usdt.balanceOf(address(mkt)), depositAmount - withdrawAmount);
   }
 
   function testInsertCallBidPriceAtLowestBitmap() public {
     _fund(u1, 10 * ONE_COIN);
+    MarketSide side = MarketSide.CALL_BUY;
 
     uint256 price = 2e6; // 2 USDT0
 
     vm.prank(u1);
-    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price, _createSignature(u1));
+    uint256 id = mkt.placeOrder(side, LOT, price);
 
     uint32 tick = _tick(price); // tick = 2e6 / 1e4 = 200
     uint32 key = _key(tick, false, true); // CALL-BID
 
     // Test level volume
-    (uint128 vol,,) = mkt.levels(key);
-    assertEq(vol, LOT, "level vol mismatch");
+    Level memory lvl = mkt.levels(key);
+    assertEq(lvl.vol, LOT, "level vol mismatch");
     assertEq(id, 1, "first maker id");
 
     // Test summary (L1) bitmap - l1 is 0, so bit 0 should be set. Which means value of 1
-    uint8 sid = 1; // CallBid bucket
-    assertEq(mkt.summaries(sid), 1, "summary bit not set correctly");
+    assertEq(mkt.summaries(uint256(side)), 1, "summary bit not set correctly");
 
     // Test mid (L2) bitmap - l1 is 0, l2 is 0, so bit 0 should be set in mid[0]
-    assertEq(mkt.midCB(0), 1, "mid bit not set correctly");
+    assertEq(mkt.mids(side, 0), 1, "mid bit not set correctly");
 
     // Test detail (L3) bitmap - l1 and l2 are 0, l3 is 200, since tick is 200
     uint16 detKey = 0; // (l1 << 8) | l2 where both are 0
-    assertEq(mkt.detCB(detKey), 1 << 200, "detail bit not set correctly");
+    assertEq(mkt.dets(side, detKey), 1 << 200, "detail bit not set correctly");
 
-    _printBook(true, false);
+    _printBook(side);
   }
 
   function testInsertCallBidPriceAtMiddleBitmap() public {
     _fund(u1, 1000 * ONE_COIN);
+    MarketSide side = MarketSide.CALL_BUY;
 
     uint256 price = 700_000_000; // 700 USDT0
     uint32 expectedTick = 70000; // 700_000_000 / 10000
 
     vm.prank(u1);
-    uint256 id = mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, price, _createSignature(u1));
+    uint256 id = mkt.placeOrder(side, LOT, price);
 
     uint32 tick = _tick(price);
     assertEq(tick, expectedTick, "tick calculation incorrect");
@@ -101,26 +124,26 @@ contract MarketSuite is Test {
     uint32 key = _key(tick, false, true); // CALL-BID
 
     // Test level volume
-    (uint128 vol,,) = mkt.levels(key);
-    assertEq(vol, LOT, "level vol mismatch");
+    Level memory lvl = mkt.levels(key);
+    assertEq(lvl.vol, LOT, "level vol mismatch");
     assertEq(id, 1, "first maker id");
 
     // Test summary (L1) bitmap - l1 is 0x01, so bit 1 should be set
-    uint8 sid = 1; // CallBid bucket
-    assertEq(mkt.summaries(sid), 1 << 1, "summary bit not set correctly");
+    assertEq(mkt.summaries(uint256(side)), 1 << 1, "summary bit not set correctly");
 
     // Test mid (L2) bitmap - l1 is 0x01, l2 is 0x11 (17), so bit 17 should be set in mid[1]
-    assertEq(mkt.midCB(1), 1 << 17, "mid bit not set correctly");
+    assertEq(mkt.mids(side, 1), 1 << 17, "mid bit not set correctly");
 
     // Test detail (L3) bitmap - l1 is 0x01, l2 is 0x11, l3 is 0x70 (112)
     uint16 detKey = (uint16(1) << 8) | 17; // (l1 << 8) | l2
-    assertEq(mkt.detCB(detKey), 1 << 112, "detail bit not set correctly");
+    assertEq(mkt.dets(side, detKey), 1 << 112, "detail bit not set correctly");
 
-    _printBook(true, false);
+    _printBook(side);
   }
 
   function testMultipleOrdersAtDifferentPriceLevels() public {
     _fund(u1, 1000 * ONE_COIN);
+    MarketSide side = MarketSide.CALL_BUY;
 
     uint256[] memory prices = new uint256[](3);
     uint8[] memory l1s = new uint8[](3);
@@ -149,7 +172,7 @@ contract MarketSuite is Test {
     // Place all orders
     for (uint256 i = 0; i < prices.length; i++) {
       vm.prank(u1);
-      mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, prices[i], _createSignature(u1));
+      mkt.placeOrder(side, LOT, prices[i]);
     }
 
     // Check each order's bits individually
@@ -162,23 +185,23 @@ contract MarketSuite is Test {
       // console.log("l2 (mid byte):", l2, "in binary:", vm.toString(bytes32(uint256(l2))));
       // console.log("l3 (low byte):", l3, "in binary:", vm.toString(bytes32(uint256(l3))));
 
-      assertTrue((mkt.summaries(1) & (1 << l1s[i])) != 0, "summary bit not set");
+      assertTrue((mkt.summaries(uint256(side)) & (1 << l1s[i])) != 0, "summary bit not set");
 
       // Mid bitmap check - should have its bit set in the correct word
-      assertTrue((mkt.midCB(l1s[i]) & (1 << l2s[i])) != 0, "mid bit not set");
+      assertTrue((mkt.mids(side, l1s[i]) & (1 << l2s[i])) != 0, "mid bit not set");
 
       // Detail bitmap check - should have its bit set in the correct word
       uint16 detKey = (uint16(l1s[i]) << 8) | l2s[i];
-      assertTrue((mkt.detCB(detKey) & (1 << l3s[i])) != 0, "detail bit not set");
+      assertTrue((mkt.dets(side, detKey) & (1 << l3s[i])) != 0, "detail bit not set");
 
       // Level check - should have correct volume
       uint32 key = _key(tick, false, true);
-      (uint128 vol,,) = mkt.levels(key);
-      assertEq(vol, LOT, "level vol mismatch");
+      Level memory lvl = mkt.levels(key);
+      assertEq(lvl.vol, LOT, "level vol mismatch");
     }
 
     // Visual check
-    _printBook(true, false);
+    _printBook(side);
   }
 
   // #######################################################################
@@ -191,61 +214,61 @@ contract MarketSuite is Test {
     // Maker (u1) posts bid
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.CALL, Side.BUY, LOT, ONE_COIN, _createSignature(u1));
+    mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN);
 
-    uint256 balSinkBefore = mkt.balances(feeSink);
+    uint256 balSinkBefore = mkt.getUserAccount(feeSink).balance;
 
     // Taker (u2) hits bid
     _fund(u2, 1000 * ONE_COIN); // writer needs no upfront USDT premium
     vm.prank(u2);
-    mkt.placeOrder(OptionType.CALL, Side.SELL, LOT, ONE_COIN, _createSignature(u2)); // Price crossed since same price
+    mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN); // Price crossed since same price
       // as maker
 
     // Queues empty, level deleted
     uint32 key = _key(_tick(ONE_COIN), false, true);
-    (uint128 vol,,) = mkt.levels(key);
-    assertEq(vol, 0, "level not cleared");
+    Level memory lvl = mkt.levels(key);
+    assertEq(lvl.vol, 0, "level not cleared");
 
     // Fee accounting
     int256 gross = int256(ONE_COIN) * int256(LOT);
-    int256 makerFee = gross * mkt.makerFeeBps() / 10_000;
-    int256 takerFee = gross * mkt.takerFeeBps() / 10_000;
+    int256 makerFee = gross * 10 / 10_000;
+    int256 takerFee = gross * -40 / 10_000;
     uint256 sinkPlus = uint256(-(makerFee + takerFee));
 
-    assertEq(mkt.balances(feeSink), balSinkBefore + sinkPlus);
+    assertEq(mkt.getUserAccount(feeSink).balance, balSinkBefore + sinkPlus);
   }
 
   // Market order sweeps 3 price levels and leaves tail in queue
   function testMarketOrderMultiLevelAndQueue() public {
     uint32[3] memory ticks = [_tick(ONE_COIN), _tick(ONE_COIN * 2), _tick(ONE_COIN * 700)];
-    uint256 collatPerContract = 107000000000 / 100 / 1000; // Divide by 100 for 0.01BTC size contract price,
+    uint256 collatPerContract = btcPrice * 10**6 / 100 / 1000; // Divide by 100 for 0.01BTC size contract price,
       // divide by 1000 for 0.1% margin
     _fund(u1, collatPerContract * LOT * 3);
 
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
       vm.prank(u1);
-      mkt.placeOrder(OptionType.PUT, Side.SELL, LOT, ticks[i] * 1e4, _createSignature(u1)); // ask
+      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4); // ask
     }
 
     // Taker buys 250 contracts market –> eats 2.5 levels
     _fund(u2, 1000000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(OptionType.PUT, Side.BUY, 250, 0, _createSignature(u2)); // market
+    mkt.placeOrder(MarketSide.PUT_BUY, 250, 0); // market
 
     // level[0] & level[1] empty, level[2] partial 50 left
     uint32 key0 = _key(ticks[0], true, false);
-    (uint128 vol0,,) = mkt.levels(key0);
-    assertEq(vol0, 0);
+    Level memory lvl0 = mkt.levels(key0);
+    assertEq(lvl0.vol, 0);
     uint32 key1 = _key(ticks[1], true, false);
-    (uint128 vol1,,) = mkt.levels(key1);
-    assertEq(vol1, 0);
+    Level memory lvl1 = mkt.levels(key1);
+    assertEq(lvl1.vol, 0);
     uint32 key2 = _key(ticks[2], true, false);
-    (uint128 vol2,,) = mkt.levels(key2);
-    assertEq(vol2, 50);
+    Level memory lvl2 = mkt.levels(key2);
+    assertEq(lvl2.vol, 50);
 
     // Queue should not hold any leftover (fully filled)
-    (TakerQ[] memory q) = mkt.viewTakerQueue(true, true); // PUT-Bid bucket
+    (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY); // PUT-Bid bucket
     assertEq(q.length, 0, "unexpected tail in takerQ");
   }
 
@@ -260,25 +283,25 @@ contract MarketSuite is Test {
     // Taker market order, book empty, 120 contracts queued
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.PUT, Side.BUY, 120, 0, _createSignature(u1)); // book is blank
+    mkt.placeOrder(MarketSide.PUT_BUY, 120, 0); // book is blank
 
-    (TakerQ[] memory qBefore) = mkt.viewTakerQueue(true, true);
+    (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
     assertEq(qBefore.length, 1); // 1 queued
     assertEq(qBefore[0].size, 120);
 
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(OptionType.PUT, Side.SELL, 200, ONE_COIN, _createSignature(u2));
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
 
     // The first 120 matched immediately, only 80 rest on book
     uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
-    (uint128 vol,,) = mkt.levels(key);
-    assertEq(vol, 80, "book remainder wrong");
+    Level memory lvl = mkt.levels(key);
+    assertEq(lvl.vol, 80, "book remainder wrong");
 
     // Queue length won't be zero since we don't pop, but pointer should be equal to length
-    (TakerQ[] memory qAfter) = mkt.viewTakerQueue(true, false);
-    assertEq(mkt.tqHead(1, 0), qAfter.length, "queue head not at the end");
+    (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    assertEq(mkt.tqHead(uint256(MarketSide.PUT_BUY)), qAfter.length, "queue head not at the end");
   }
 
   // #######################################################################
@@ -287,17 +310,19 @@ contract MarketSuite is Test {
   // #                                                                     #
   // #######################################################################
 
-  function testFuzzBitmap(uint128 amount, uint8 priceTick) public {
+  function testFuzzBitmap(uint128 amount, uint8 priceTick, uint8 sideIndex) public {
     vm.assume(amount > 0 && amount < 1e6);
+    vm.assume(sideIndex < 4);
+    MarketSide side = MarketSide(sideIndex);
     uint256 price = uint256(priceTick) * 1e4 + 1e4; // >=1 tick
 
     _fund(u1, 1e24);
     vm.prank(u1);
-    mkt.placeOrder(OptionType.CALL, Side.BUY, amount, price, _createSignature(u1));
+    mkt.placeOrder(side, amount, price);
 
     uint32 tick = _tick(price);
     (uint8 l1,,) = BitScan.split(tick);
-    assertTrue((mkt.summaries(1) & BitScan.mask(l1)) != 0); // bit set
+    assertTrue((mkt.summaries(uint256(side)) & BitScan.mask(l1)) != 0); // bit set
   }
 
   function testBitscan(uint256 bit) public pure {
@@ -317,8 +342,9 @@ contract MarketSuite is Test {
     deal(address(usdt), who, amount);
     vm.prank(who);
     usdt.approve(address(mkt), type(uint256).max);
+    bytes memory signature = _createSignature(who);
     vm.prank(who);
-    mkt.depositCollateral(amount);
+    mkt.depositCollateral(amount, signature);
   }
 
   function _tick(uint256 p) internal pure returns (uint32) {
@@ -335,12 +361,16 @@ contract MarketSuite is Test {
     return abi.encodePacked(r, s, v);
   }
 
-  function _printBook(bool isBid, bool isPut) internal view {
-    OBLevel[] memory book = mkt.dumpBook(isBid, isPut);
+  function _printBook(MarketSide side) internal view {
+    OBLevel[] memory book = mkt.dumpBook(side);
 
     console.log("\n");
     console.log("============================================");
-    console.log("              %s %s                ", isPut ? "PUT" : "CALL", isBid ? "BIDS" : "ASKS");
+    console.log(
+      "              %s %s                ",
+      side == MarketSide.PUT_BUY || side == MarketSide.PUT_SELL ? "PUT" : "CALL",
+      side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY ? "BIDS" : "ASKS"
+    );
     console.log("============================================");
 
     if (book.length == 0) {
@@ -357,5 +387,13 @@ contract MarketSuite is Test {
       console.log("%d\t\t%d\t\t%d", book[i].tick, price6, book[i].vol);
     }
     console.log("============================================\n");
+  }
+
+  function _mockOracle(uint256 price) internal {
+    vm.mockCall(
+      address(0x0000000000000000000000000000000000000807),
+      abi.encodeWithSelector(0x00000000),
+      abi.encode(price * 10) // Oracle and Mark price feeds return with 1 decimal when reading L1 from HyperEVM
+    );
   }
 }

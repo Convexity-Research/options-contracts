@@ -91,7 +91,8 @@ contract Market is
     // mappings to fetch relevant orderbook data
     mapping(uint32 => Level) levels; // tickKey ⇒ Level
     mapping(uint32 => Maker) makerNodes; // nodeId  ⇒ Maker
-    uint32 nodePtr; // auto-increment id for maker orders
+    uint32 limitOrderPtr; // auto-increment id for limit orders
+    uint32 takerOrderPtr; // auto-increment id for taker orders
   }
 
   //------- Events -------
@@ -107,7 +108,8 @@ contract Market is
   );
   event OrderFilled(
     uint256 indexed cycleId,
-    uint256 orderId,
+    uint256 makerOrderId,
+    uint256 takerOrderId,
     uint256 size,
     uint256 limitPrice,
     MarketSide side,
@@ -118,9 +120,12 @@ contract Market is
   event OrderCancelled(
     uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, address indexed maker
   );
-  event TakerQueueOrderPlaced(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker);
-  event TakerQueueOrderFilled(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker, bool isFullyFilled);
-  event TakerQueueOrderCancelled(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker);
+  event TakerOrderPlaced(
+    uint256 indexed cycleId, uint32 takerOrderId, uint256 size, MarketSide side, address indexed taker
+  );
+  event TakerOrderRemaining(
+    uint256 indexed cycleId, uint32 takerOrderId, uint256 size, MarketSide side, address indexed taker
+  );
 
   /// @custom:oz-upgrades-unsafe-allow constructor
   constructor() ERC2771ContextUpgradeable(address(0)) {
@@ -250,8 +255,12 @@ contract Market is
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
     uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
-    if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader);
-    if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader);
+    if (shortCalls > 0) {
+      _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
+    }
+    if (shortPuts > 0) {
+      _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
+    }
 
     ua.liquidationQueued = true;
 
@@ -374,8 +383,9 @@ contract Market is
     if (size == 0) revert Errors.InvalidAmount();
 
     if (limitPrice == 0) {
-      // Market order
-      _marketOrder(side, uint128(size), trader);
+      uint32 takerId = _nextTakerId(ob[activeCycle]);
+      emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
+      _marketOrder(side, uint128(size), trader, takerId);
       return 0;
     }
 
@@ -391,23 +401,26 @@ contract Market is
       bool isCrossing = (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
 
       if (isCrossing) {
-        _marketOrder(side, uint128(size), trader);
+        uint32 takerId = _nextTakerId(ob[activeCycle]);
+        emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
+        _marketOrder(side, uint128(size), trader, takerId);
         return 0;
       }
     }
 
     // Is a limit order
-    uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ);
+    orderId = _nextMakerId(ob[activeCycle]);
+    uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
     if (qtyLeft == 0) return 0;
 
-    orderId = _insertLimit(side, uint32(tick), uint128(qtyLeft), trader);
+    _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
 
     if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
       revert Errors.InsufficientBalance();
     }
   }
 
-  function _marketOrder(MarketSide side, uint128 want, address taker) private {
+  function _marketOrder(MarketSide side, uint128 want, address taker, uint32 takerOrderId) private {
     uint128 left = want;
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
@@ -435,6 +448,7 @@ contract Market is
         uint128 taken = uint128(
           _settleFill(
             nodeId,
+            takerOrderId,
             side,
             uint256(bestTick) * TICK_SZ, // price
             take,
@@ -471,13 +485,14 @@ contract Market is
       if (L.vol == 0) _clearLevel(_oppositeSide(side), bestKey);
     }
 
-    if (left > 0) _queueTaker(side, left, taker);
+    if (left > 0) _queueTaker(side, left, taker, takerOrderId);
   }
 
   function _matchQueuedTakers(
     MarketSide side,
     uint256 makerSize,
-    uint256 price // maker's price, 6-dec
+    uint256 price, // maker's price, 6-dec
+    uint32 makerOrderId
   ) private returns (uint256 remainingMakerSize) {
     MarketSide oppSide = _oppositeSide(side);
     TakerQ[] storage Q = takerQ[uint256(oppSide)];
@@ -497,8 +512,9 @@ contract Market is
       uint256 take = Tmem.size > remainingMakerSize ? remainingMakerSize : Tmem.size;
 
       uint256 taken = _settleFill(
-        0, // Imaginary orderId to denote that this is a takerQueue match
-        side,
+        makerOrderId,
+        Tmem.takerOrderId,
+        oppSide,
         price,
         take,
         Tmem.trader, // The (queued) taker
@@ -507,20 +523,15 @@ contract Market is
         true // isTakerQueue
       );
 
-      T.size -= uint96(taken);
+      T.size -= uint64(taken);
       remainingMakerSize -= taken;
 
-      if (T.size == 0) { // fully consumed
-        ++i;
-        emit TakerQueueOrderFilled(activeCycle, uint256(Tmem.size), oppSide, Tmem.trader, true);
-      } else {
-        emit TakerQueueOrderFilled(activeCycle, uint256(Tmem.size), oppSide, Tmem.trader, false);
-      }
+      if (T.size == 0) ++i; // fully consumed
     }
     tqHead[uint256(_oppositeSide(side))] = i; // persist cursor
   }
 
-  function _insertLimit(MarketSide side, uint32 tick, uint128 size, address trader) private returns (uint32 nodeId) {
+  function _insertLimit(MarketSide side, uint32 tick, uint128 size, address trader, uint32 makerOrderId) private {
     if (userOrders[trader].length >= MAX_OPEN_LIMIT_ORDERS) revert Errors.MaximumOrdersCapReached();
 
     // derive level bytes and key
@@ -539,20 +550,15 @@ contract Market is
       if (firstInL1) _ob.summaries[uint256(side)] |= BitScan.mask(l1);
     }
 
-    // maker node
-    unchecked {
-      nodeId = ++_ob.nodePtr; // Shouldn't overflow in a single minute
-    }
-
-    _ob.makerNodes[nodeId] = Maker(trader, size, 0, key, levels[key].tail);
+    _ob.makerNodes[makerOrderId] = Maker(trader, size, 0, key, levels[key].tail);
 
     // Track order for user
-    userOrders[trader].push(nodeId);
+    userOrders[trader].push(makerOrderId);
 
     // FIFO queue link
-    if (levels[key].vol == 0) levels[key].head = nodeId;
-    else _ob.makerNodes[levels[key].tail].next = nodeId;
-    levels[key].tail = nodeId;
+    if (levels[key].vol == 0) levels[key].head = makerOrderId;
+    else _ob.makerNodes[levels[key].tail].next = makerOrderId;
+    levels[key].tail = makerOrderId;
     levels[key].vol += size;
 
     // position table
@@ -568,11 +574,12 @@ contract Market is
     else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint32(size);
     else revert();
 
-    emit OrderPlaced(ac, nodeId, size, tick * TICK_SZ, side, trader);
+    emit OrderPlaced(ac, makerOrderId, size, tick * TICK_SZ, side, trader);
   }
 
   function _settleFill(
-    uint32 orderId,
+    uint32 makerOrderId,
+    uint32 takerOrderId,
     MarketSide side,
     uint256 price, // 6 decimals
     uint256 size,
@@ -647,13 +654,13 @@ contract Market is
       if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
     }
 
-    emit OrderFilled(activeCycle, orderId, size, price, side, taker, maker, _getOraclePrice());
+    emit OrderFilled(activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, _getOraclePrice());
 
     return size;
   }
 
-  function _queueTaker(MarketSide side, uint256 qty, address trader) private {
-    takerQ[uint256(side)].push(TakerQ({size: uint96(qty), trader: trader}));
+  function _queueTaker(MarketSide side, uint256 qty, address trader, uint32 takerId) private {
+    takerQ[uint256(side)].push(TakerQ({size: uint64(qty), trader: trader, takerOrderId: takerId}));
     UserAccount storage ua = userAccounts[trader];
     if (_isPut(side)) {
       if (_isBuy(side)) ua.pendingLongPuts += uint32(qty);
@@ -663,7 +670,7 @@ contract Market is
       else ua.pendingShortCalls += uint32(qty);
     }
 
-    emit TakerQueueOrderPlaced(activeCycle, uint128(qty), side, trader);
+    emit TakerOrderRemaining(activeCycle, takerId, qty, side, trader);
   }
 
   function _forceCancel(uint32 orderId) internal {
@@ -717,8 +724,6 @@ contract Market is
 
           // Set size to 0 but don't remove to preserve queue ordering
           queue[j].size = 0;
-
-          emit TakerQueueOrderCancelled(activeCycle, size, side, trader);
         }
 
         ++j;
@@ -738,6 +743,18 @@ contract Market is
         break;
       }
     }
+  }
+
+  function _nextMakerId(OrderbookState storage _ob) private returns (uint32 id) {
+    if (_ob.limitOrderPtr == 0) id = 1;
+    else id = _ob.limitOrderPtr + 2;
+    _ob.limitOrderPtr = id;
+  }
+
+  function _nextTakerId(OrderbookState storage _ob) private returns (uint32 id) {
+    if (_ob.takerOrderPtr == 0) id = 2;
+    else id = _ob.takerOrderPtr + 2;
+    _ob.takerOrderPtr = id;
   }
 
   // #######################################################################

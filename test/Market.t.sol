@@ -252,12 +252,12 @@ contract MarketSuite is Test {
       mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4); // ask
     }
 
-    // Taker buys 250 contracts market –> eats 2.5 levels
+    // Taker buys 350 contracts market –> eats 3 levels
     _fund(u2, 1000000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.PUT_BUY, 250, 0); // market
+    mkt.placeOrder(MarketSide.PUT_BUY, 350, 0); // market
 
-    // level[0] & level[1] empty, level[2] partial 50 left
+    // level[0] & level[1] empty, level[2] empty
     uint32 key0 = _key(ticks[0], true, false);
     Level memory lvl0 = mkt.levels(key0);
     assertEq(lvl0.vol, 0);
@@ -266,11 +266,12 @@ contract MarketSuite is Test {
     assertEq(lvl1.vol, 0);
     uint32 key2 = _key(ticks[2], true, false);
     Level memory lvl2 = mkt.levels(key2);
-    assertEq(lvl2.vol, 50);
+    assertEq(lvl2.vol, 0);
 
     // Queue should not hold any leftover (fully filled)
     (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY); // PUT-Bid bucket
-    assertEq(q.length, 0, "unexpected tail in takerQ");
+    assertEq(q.length, 1, "incorrect queue length");
+    assertEq(q[0].size, 50, "incorrect queue size");
   }
 
   // #######################################################################

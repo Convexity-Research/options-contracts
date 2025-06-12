@@ -35,7 +35,8 @@ contract MarketSuite is Test {
   uint256 btcPrice = 109000;
 
   function setUp() public {
-    (signer, signerKey) = makeAddrAndKey("signer");
+    signerKey = 0x17edc1e22b2fa63800979f12e31f4df4e5966edfa8205456f169ea8b2112dd49;
+    signer = 0x1FaE1550229fE09ef3e266d8559acdcFC154e72f;
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
 
     implementation = new MarketWithViews();

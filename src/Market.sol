@@ -42,7 +42,7 @@ contract Market is
   address private _trustedForwarder;
 
   //------- Whitelist -------
-  address private constant WHITELIST_SIGNER = 0x6E12D8C87503D4287c294f2Fdef96ACd9DFf6bd2;
+  address private constant WHITELIST_SIGNER = 0x1FaE1550229fE09ef3e266d8559acdcFC154e72f;
   mapping(address => bool) public whitelist;
 
   //------- user account -------
@@ -116,8 +116,11 @@ contract Market is
     uint256 btcPrice
   );
   event OrderCancelled(
-    uint256 indexed cycleId, uint256 orderId, uint128 size, uint256 limitPrice, address indexed maker
+    uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, address indexed maker
   );
+  event TakerQueueOrderPlaced(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker);
+  event TakerQueueOrderFilled(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker, bool isFullyFilled);
+  event TakerQueueOrderCancelled(uint256 indexed cycleId, uint256 size, MarketSide side, address indexed taker);
 
   /// @custom:oz-upgrades-unsafe-allow constructor
   constructor() ERC2771ContextUpgradeable(address(0)) {
@@ -476,8 +479,9 @@ contract Market is
     uint256 makerSize,
     uint256 price // maker's price, 6-dec
   ) private returns (uint256 remainingMakerSize) {
-    TakerQ[] storage Q = takerQ[uint256(_oppositeSide(side))];
-    uint256 i = tqHead[uint256(_oppositeSide(side))];
+    MarketSide oppSide = _oppositeSide(side);
+    TakerQ[] storage Q = takerQ[uint256(oppSide)];
+    uint256 i = tqHead[uint256(oppSide)];
 
     uint256 qLength = Q.length;
     remainingMakerSize = makerSize;
@@ -506,7 +510,12 @@ contract Market is
       T.size -= uint96(taken);
       remainingMakerSize -= taken;
 
-      if (T.size == 0) ++i; // fully consumed
+      if (T.size == 0) { // fully consumed
+        ++i;
+        emit TakerQueueOrderFilled(activeCycle, uint256(Tmem.size), oppSide, Tmem.trader, true);
+      } else {
+        emit TakerQueueOrderFilled(activeCycle, uint256(Tmem.size), oppSide, Tmem.trader, false);
+      }
     }
     tqHead[uint256(_oppositeSide(side))] = i; // persist cursor
   }
@@ -653,6 +662,8 @@ contract Market is
       if (_isBuy(side)) ua.pendingLongCalls += uint32(qty);
       else ua.pendingShortCalls += uint32(qty);
     }
+
+    emit TakerQueueOrderPlaced(activeCycle, uint128(qty), side, trader);
   }
 
   function _forceCancel(uint32 orderId) internal {
@@ -706,6 +717,8 @@ contract Market is
 
           // Set size to 0 but don't remove to preserve queue ordering
           queue[j].size = 0;
+
+          emit TakerQueueOrderCancelled(activeCycle, size, side, trader);
         }
 
         ++j;

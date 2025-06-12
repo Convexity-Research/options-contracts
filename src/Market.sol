@@ -11,10 +11,9 @@ import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Cont
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
-import {console2} from "forge-std/console2.sol";
-
-contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeable, ERC2771ContextUpgradeable {
+contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable, ERC2771ContextUpgradeable {
   using BitScan for uint256;
 
   //------- Meta -------
@@ -1031,4 +1030,6 @@ contract Market is IMarket, Initializable, OwnableUpgradeable, PausableUpgradeab
     }
     _;
   }
+
+  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

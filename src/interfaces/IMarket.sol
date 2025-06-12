@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-enum Side {
-  BUY,
-  SELL
-}
-
-enum OptionType {
-  CALL,
-  PUT
-}
-
 enum MarketSide {
   CALL_BUY,
   CALL_SELL,
@@ -24,30 +14,19 @@ struct Cycle {
   uint64 settlementPrice;
 }
 
-struct Pos {
-  uint32 longCalls;
-  uint32 shortCalls;
-  uint32 longPuts;
-  uint32 shortPuts;
-  uint32 pendingLongCalls;
-  uint32 pendingShortCalls;
-  uint32 pendingLongPuts;
-  uint32 pendingShortPuts;
-}
-
 struct Level {
   // one storage slot
   uint128 vol;
-  uint16 head; // first maker node
-  uint16 tail; // last  maker node
+  uint32 head; // first maker node
+  uint32 tail; // last  maker node
 }
 
 struct Maker {
   address trader;
   uint128 size;
-  uint16 next;
+  uint32 next;
   uint32 key;
-  uint16 prev; // back-pointer for cancel
+  uint32 prev; // back-pointer for cancel
 }
 
 struct TakerQ {

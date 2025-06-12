@@ -74,6 +74,17 @@ library BitScan {
     }
   }
 
+  function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32 result) {
+    assembly {
+      // Shift into their 24-bit positions:
+      let p1 := shl(16, l1) // l1 << 16
+      let p2 := shl(8, l2) // l2 << 8
+
+      // Combine: (l1<<16) | (l2<<8) | l3
+      result := or(or(p1, p2), l3)
+    }
+  }
+
   function split(uint32 t) internal pure returns (uint8 l1, uint8 l2, uint8 l3) {
     assembly {
       // byte(i, x) returns the i-th byte of x (0 = most-significant,
@@ -93,16 +104,5 @@ library BitScan {
     // Convert bools to MarketSide enum
     // CALL_BUY=0, CALL_SELL=1, PUT_BUY=2, PUT_SELL=3
     side = MarketSide((isPut ? 2 : 0) | (isBid ? 0 : 1));
-  }
-
-  function join(uint8 l1, uint8 l2, uint8 l3) internal pure returns (uint32 result) {
-    assembly {
-      // Shift into their 24-bit positions:
-      let p1 := shl(16, l1) // l1 << 16
-      let p2 := shl(8, l2) // l2 << 8
-
-      // Combine: (l1<<16) | (l2<<8) | l3
-      result := or(or(p1, p2), l3)
-    }
   }
 }

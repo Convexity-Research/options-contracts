@@ -12,9 +12,17 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, PausableUpgradeable, ERC2771ContextUpgradeable {
-  using BitScan for uint256;
+contract Market is
+  IMarket,
+  Initializable,
+  UUPSUpgradeable,
+  OwnableUpgradeable,
+  PausableUpgradeable,
+  ERC2771ContextUpgradeable
+{
+  using SafeERC20 for IERC20;
 
   //------- Meta -------
   string public name;
@@ -23,6 +31,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
   uint256 constant collateralDecimals = 6;
   address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
+  uint256 constant MAX_OPEN_LIMIT_ORDERS = 8; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 constant makerFeeBps = 10; // +0.10 %, basis points
@@ -41,16 +50,17 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
   struct UserAccount {
     bool activeInCycle;
-    uint56 _gap; // 56 remaining bits for future use. Makes settling logic simpler to gap this here.
+    bool liquidationQueued;
     uint64 balance;
-    uint16 longCalls;
-    uint16 shortCalls;
-    uint16 longPuts;
-    uint16 shortPuts;
-    uint16 pendingLongCalls;
-    uint16 pendingShortCalls;
-    uint16 pendingLongPuts;
-    uint16 pendingShortPuts;
+    uint176 _gap; // 176 remaining bits for future use. Packs position data into next slot
+    uint32 longCalls;
+    uint32 shortCalls;
+    uint32 longPuts;
+    uint32 shortPuts;
+    uint32 pendingLongCalls;
+    uint32 pendingShortCalls;
+    uint32 pendingLongPuts;
+    uint32 pendingShortPuts;
   }
 
   //------- Cycle state -------
@@ -59,7 +69,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
   //------- Trading/Settlement -------
   address[] public traders;
-  mapping(address => uint16[]) public userOrders; // Track all order IDs per user
+  mapping(address => uint32[]) public userOrders; // Track all order IDs per user
   uint256 public cursor; // settlement iterator
 
   TakerQ[][4] internal takerQ; // 4 buckets
@@ -80,8 +90,8 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     mapping(MarketSide => mapping(uint16 => uint256)) dets;
     // mappings to fetch relevant orderbook data
     mapping(uint32 => Level) levels; // tickKey ⇒ Level
-    mapping(uint16 => Maker) makerNodes; // nodeId  ⇒ Maker
-    uint16 nodePtr; // auto-increment id for maker orders
+    mapping(uint32 => Maker) makerNodes; // nodeId  ⇒ Maker
+    uint32 nodePtr; // auto-increment id for maker orders
   }
 
   //------- Events -------
@@ -173,16 +183,16 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
   function cancelOrder(uint256 orderId) external {
     if (!_isMarketLive()) revert Errors.MarketNotLive();
-    Maker storage M = ob[activeCycle].makerNodes[uint16(orderId)];
+    Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
     if (M.trader != _msgSender()) revert Errors.NotOwner();
 
     uint32 tickKey = M.key;
     Level storage L = ob[activeCycle].levels[tickKey];
 
-    mapping(uint16 => Maker) storage makerNodes = ob[activeCycle].makerNodes;
+    mapping(uint32 => Maker) storage makerNodes = ob[activeCycle].makerNodes;
 
-    uint16 p = M.prev;
-    uint16 n = M.next;
+    uint32 p = M.prev;
+    uint32 n = M.next;
 
     // unlink from neighbours
     if (p == 0) L.head = n; // cancelled head
@@ -201,17 +211,17 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
     UserAccount storage P = userAccounts[M.trader];
 
-    if (side == MarketSide.PUT_BUY) P.pendingLongPuts -= uint16(M.size);
-    else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint16(M.size);
-    else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint16(M.size);
-    else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint16(M.size);
+    if (side == MarketSide.PUT_BUY) P.pendingLongPuts -= uint32(M.size);
+    else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint32(M.size);
+    else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint32(M.size);
+    else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint32(M.size);
     else revert();
 
     // Remove from user's order tracking
-    _removeOrderFromTracking(M.trader, uint16(orderId));
+    _removeOrderFromTracking(M.trader, uint32(orderId));
 
     emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
-    delete makerNodes[uint16(orderId)];
+    delete makerNodes[uint32(orderId)];
   }
 
   function liquidate(address trader) external {
@@ -220,10 +230,10 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     // Cancel all maker orders
-    uint16[] memory orderIds = userOrders[trader];
+    uint32[] memory orderIds = userOrders[trader];
     for (uint256 k; k < orderIds.length; ++k) {
-      uint16 id = orderIds[k];
-      // Check if order still exists before cancelling
+      uint32 id = orderIds[k];
+      // Double check order still exists before cancelling
       if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
     }
 
@@ -237,8 +247,10 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
     uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
-    if (shortCalls > 0) _marketOrder(MarketSide.CALL_SELL, uint128(shortCalls), trader);
-    if (shortPuts > 0) _marketOrder(MarketSide.PUT_SELL, uint128(shortPuts), trader);
+    if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader);
+    if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader);
+
+    ua.liquidationQueued = true;
 
     emit Liquidated(activeCycle, trader);
   }
@@ -322,7 +334,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
   function _depositCollateral(uint256 amount, address trader) private {
     if (amount == 0) revert Errors.InvalidAmount();
 
-    IERC20(collateralToken).transferFrom(trader, address(this), amount);
+    IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
     unchecked {
       // Nobody is depositing 18 trillion USD to overflow this
       userAccounts[trader].balance += uint64(amount);
@@ -343,7 +355,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
       userAccounts[trader].balance -= uint64(amount);
     }
 
-    IERC20(collateralToken).transfer(trader, amount);
+    IERC20(collateralToken).safeTransfer(trader, amount);
 
     emit CollateralWithdrawn(trader, amount);
   }
@@ -355,6 +367,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     address trader
   ) private returns (uint256 orderId) {
     if (!_isMarketLive()) revert Errors.MarketNotLive();
+    if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
     if (size == 0) revert Errors.InvalidAmount();
 
     if (limitPrice == 0) {
@@ -384,7 +397,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ);
     if (qtyLeft == 0) return 0;
 
-    orderId = _insertLimit(side, uint32(tick), uint128(qtyLeft));
+    orderId = _insertLimit(side, uint32(tick), uint128(qtyLeft), trader);
 
     if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
       revert Errors.InsufficientBalance();
@@ -396,7 +409,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
     mapping(uint32 => Level) storage levels = _ob.levels;
-    mapping(uint16 => Maker) storage makerQ = _ob.makerNodes;
+    mapping(uint32 => Maker) storage makerQ = _ob.makerNodes;
 
     while (left > 0) {
       {
@@ -408,7 +421,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
       // Best price level
       (uint32 bestTick, uint32 bestKey) = _best(_oppositeSide(side));
       Level storage L = levels[bestKey];
-      uint16 nodeId = L.head; // nodeId = orderId
+      uint32 nodeId = L.head; // nodeId = orderId
 
       // Walk FIFO makers at this tick
       while (left > 0 && nodeId != 0) {
@@ -435,7 +448,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
         if (M.size == 0) {
           // Remove node from queue
-          uint16 nxt = M.next;
+          uint32 nxt = M.next;
           if (nxt == 0) L.tail = 0;
           else makerQ[nxt].prev = 0;
 
@@ -498,7 +511,9 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     tqHead[uint256(_oppositeSide(side))] = i; // persist cursor
   }
 
-  function _insertLimit(MarketSide side, uint32 tick, uint128 size) private returns (uint16 nodeId) {
+  function _insertLimit(MarketSide side, uint32 tick, uint128 size, address trader) private returns (uint32 nodeId) {
+    if (userOrders[trader].length >= MAX_OPEN_LIMIT_ORDERS) revert Errors.MaximumOrdersCapReached();
+
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
     uint32 key = _key(tick, side);
@@ -520,7 +535,6 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
       nodeId = ++_ob.nodePtr; // Shouldn't overflow in a single minute
     }
 
-    address trader = _msgSender();
     _ob.makerNodes[nodeId] = Maker(trader, size, 0, key, levels[key].tail);
 
     // Track order for user
@@ -539,10 +553,10 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     }
     UserAccount storage ua = userAccounts[trader];
 
-    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts += uint16(size);
-    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts += uint16(size);
-    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint16(size);
-    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint16(size);
+    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts += uint32(size);
+    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts += uint32(size);
+    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint32(size);
+    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint32(size);
     else revert();
 
     emit OrderPlaced(ac, nodeId, size, tick * TICK_SZ, side, trader);
@@ -558,6 +572,9 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     bool isTakerBuy,
     bool isTakerQueue
   ) internal returns (uint256) {
+    UserAccount storage uaMaker = userAccounts[maker];
+    UserAccount storage uaTaker = userAccounts[taker];
+
     // Fees accounting
     {
       int256 premium = int256(price) * int256(size); // always +ve
@@ -573,7 +590,7 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
       int256 cashTaker = -dir * premium + takerFee;
 
       // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && cashTaker < 0) if (userAccounts[taker].balance < uint256(-cashTaker)) return 0;
+      if (isTakerQueue && cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
 
       _applyCashDelta(maker, cashMaker);
       _applyCashDelta(taker, cashTaker);
@@ -585,34 +602,40 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
     // Position accounting
     {
-      UserAccount storage uaMaker = userAccounts[maker];
-      UserAccount storage uaTaker = userAccounts[taker];
-
       if (_isPut(side)) {
         if (isTakerBuy) {
-          uaTaker.longPuts += uint16(size);
-          uaMaker.shortPuts += uint16(size);
-          if (!isTakerQueue) uaMaker.pendingShortPuts -= uint16(size);
-          else uaTaker.pendingLongPuts -= uint16(size);
+          uaTaker.longPuts += uint32(size);
+          uaMaker.shortPuts += uint32(size);
+          if (!isTakerQueue) uaMaker.pendingShortPuts -= uint32(size);
+          else uaTaker.pendingLongPuts -= uint32(size);
         } else {
-          uaTaker.shortPuts += uint16(size);
-          uaMaker.longPuts += uint16(size);
-          if (!isTakerQueue) uaMaker.pendingLongPuts -= uint16(size);
-          else uaTaker.pendingShortPuts -= uint16(size);
+          uaTaker.shortPuts += uint32(size);
+          uaMaker.longPuts += uint32(size);
+          if (!isTakerQueue) uaMaker.pendingLongPuts -= uint32(size);
+          else uaTaker.pendingShortPuts -= uint32(size);
         }
       } else {
         if (isTakerBuy) {
-          uaTaker.longCalls += uint16(size);
-          uaMaker.shortCalls += uint16(size);
-          if (!isTakerQueue) uaMaker.pendingShortCalls -= uint16(size);
-          else uaTaker.pendingLongCalls -= uint16(size);
+          uaTaker.longCalls += uint32(size);
+          uaMaker.shortCalls += uint32(size);
+          if (!isTakerQueue) uaMaker.pendingShortCalls -= uint32(size);
+          else uaTaker.pendingLongCalls -= uint32(size);
         } else {
-          uaTaker.shortCalls += uint16(size);
-          uaMaker.longCalls += uint16(size);
-          if (!isTakerQueue) uaMaker.pendingLongCalls -= uint16(size);
-          else uaTaker.pendingShortCalls -= uint16(size);
+          uaTaker.shortCalls += uint32(size);
+          uaMaker.longCalls += uint32(size);
+          if (!isTakerQueue) uaMaker.pendingLongCalls -= uint32(size);
+          else uaTaker.pendingShortCalls -= uint32(size);
         }
       }
+    }
+
+    if (uaTaker.liquidationQueued) {
+      uint256 shortCalls = uaTaker.shortCalls;
+      uint256 shortPuts = uaTaker.shortPuts;
+      uint256 longCalls = uaTaker.longCalls;
+      uint256 longPuts = uaTaker.longPuts;
+
+      if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
     }
 
     emit OrderFilled(activeCycle, orderId, size, price, side, taker, maker, _getOraclePrice());
@@ -624,22 +647,22 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     takerQ[uint256(side)].push(TakerQ({size: uint96(qty), trader: trader}));
     UserAccount storage ua = userAccounts[trader];
     if (_isPut(side)) {
-      if (_isBuy(side)) ua.pendingLongPuts += uint16(qty);
-      else ua.pendingShortPuts += uint16(qty);
+      if (_isBuy(side)) ua.pendingLongPuts += uint32(qty);
+      else ua.pendingShortPuts += uint32(qty);
     } else {
-      if (_isBuy(side)) ua.pendingLongCalls += uint16(qty);
-      else ua.pendingShortCalls += uint16(qty);
+      if (_isBuy(side)) ua.pendingLongCalls += uint32(qty);
+      else ua.pendingShortCalls += uint32(qty);
     }
   }
 
-  function _forceCancel(uint16 orderId) internal {
+  function _forceCancel(uint32 orderId) internal {
     uint256 ac = activeCycle;
     Maker memory M = ob[ac].makerNodes[orderId];
     uint32 key = M.key;
     Level storage L = ob[ac].levels[key];
 
-    uint16 p = M.prev;
-    uint16 n = M.next;
+    uint32 p = M.prev;
+    uint32 n = M.next;
 
     if (p == 0) L.head = n;
     else ob[ac].makerNodes[p].next = n;
@@ -650,19 +673,16 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     UserAccount storage ua = userAccounts[M.trader];
     (uint32 tick, MarketSide side) = BitScan.splitKey(M.key);
 
-    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint16(M.size);
-    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint16(M.size);
-    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint16(M.size);
-    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint16(M.size);
+    if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint32(M.size);
+    else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint32(M.size);
+    else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint32(M.size);
+    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint32(M.size);
 
     delete ob[ac].makerNodes[orderId]; // free storage
 
     if (L.vol == 0) _clearLevel(side, key);
 
     emit OrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
-
-    // Remove from user's order tracking
-    _removeOrderFromTracking(M.trader, orderId);
   }
 
   function _clearTakerQueueEntries(address trader) internal {
@@ -679,10 +699,10 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
           // Update pending positions based on market side
           MarketSide side = MarketSide(i);
-          if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint16(size);
-          else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint16(size);
-          else if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint16(size);
-          else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint16(size);
+          if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint32(size);
+          else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint32(size);
+          else if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint32(size);
+          else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint32(size);
 
           // Set size to 0 but don't remove to preserve queue ordering
           queue[j].size = 0;
@@ -693,8 +713,8 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
     }
   }
 
-  function _removeOrderFromTracking(address trader, uint16 orderId) internal {
-    uint16[] storage orders = userOrders[trader];
+  function _removeOrderFromTracking(address trader, uint32 orderId) internal {
+    uint32[] storage orders = userOrders[trader];
     uint256 length = orders.length;
 
     // Find and remove the order ID (swap with last element and pop for gas efficiency)
@@ -969,18 +989,18 @@ contract Market is IMarket, Initializable, UUPSUpgradeable, OwnableUpgradeable, 
 
   function isLiquidatable(address trader, uint64 price) public view returns (bool) {
     UserAccount storage ua = userAccounts[trader];
+    if (ua.liquidationQueued) return false;
     return ua.balance < _requiredMarginForLiquidation(trader, price, MM_BPS);
   }
 
   function _clearAllPositions(address trader) internal {
     UserAccount storage ua = userAccounts[trader];
+    ua.liquidationQueued = false;
     ua.activeInCycle = false;
     // Zero out all 8 position variables (upper 128 bits) while preserving lower 128 bits
     assembly {
       let slot := ua.slot
-      let currentValue := sload(slot)
-      let mask := 0x00000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-      sstore(slot, and(currentValue, mask))
+      sstore(add(slot, 1), 0)
     }
   }
 

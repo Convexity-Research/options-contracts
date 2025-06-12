@@ -37,4 +37,6 @@ library Errors {
   error CycleAlreadySettled();
   error MarketNotLive();
   error TickTooLarge();
+  error MaximumOrdersCapReached();
+  error AccountInLiquidation();
 }

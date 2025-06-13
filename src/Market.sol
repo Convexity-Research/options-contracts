@@ -29,13 +29,13 @@ contract Market is
   address public feeRecipient;
   address public collateralToken;
   uint256 constant collateralDecimals = 6;
-  address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
+  address constant ORACLE_PX_PRECOMPILE = 0x0000000000000000000000000000000000000807;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 constant MAX_OPEN_LIMIT_ORDERS = 8; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 constant makerFeeBps = 10; // +0.10 %, basis points
-  int256 constant takerFeeBps = -40; // –0.40 %, basis points
+  int256 constant takerFeeBps = -50; // –0.50 %, basis points
   uint256 constant denominator = 10_000;
 
   //------- Gasless TX -------
@@ -52,7 +52,8 @@ contract Market is
     bool activeInCycle;
     bool liquidationQueued;
     uint64 balance;
-    uint176 _gap; // 176 remaining bits for future use. Packs position data into next slot
+    uint64 scratchPnL;
+    uint112 _gap; // 112 remaining bits for future use. Packs position data into next slot
     uint32 longCalls;
     uint32 shortCalls;
     uint32 longPuts;
@@ -75,8 +76,10 @@ contract Market is
   TakerQ[][4] internal takerQ; // 4 buckets
   uint256[4] public tqHead; // cursor per bucket
 
+  // Two-phase settlement for fair social loss distribution
+  uint256 posSum; // total positive PnL (winners)
   uint256 badDebt; // grows whenever we meet an under-collateralised loser
-  uint256 paidOut; // raw sum of *gross* positive deltas we have met so far
+  bool settlementPhase; // false = phase 1, true = phase 2
 
   //------- Orderbook -------
   mapping(uint256 => OrderbookState) internal ob;
@@ -255,19 +258,15 @@ contract Market is
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
     uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
-    if (shortCalls > 0) {
-      _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
-    }
-    if (shortPuts > 0) {
-      _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
-    }
+    if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
+    if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
 
     ua.liquidationQueued = true;
 
     emit Liquidated(activeCycle, trader);
   }
 
-  function settleChunk(uint256 max) external returns (bool done) {
+  function settleChunk(uint256 max) external {
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
     uint64 settlementPrice = C.settlementPrice;
@@ -281,14 +280,49 @@ contract Market is
 
     if (C.isSettled) revert Errors.CycleAlreadySettled();
 
+    if (!settlementPhase) {
+      // Phase 1: Calculate PnL, debit losers immediately, store winners' PnL
+      _doPhase1(cycleId, settlementPrice, max);
+    } else {
+      // Phase 2: Credit winners pro-rata based on loss ratio
+      _doPhase2(cycleId, max);
+    }
+  }
+
+  function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal {
     uint256 n = traders.length;
     uint256 i = cursor;
     uint256 upper = i + max;
     if (upper > n) upper = n;
 
     while (i < upper) {
-      address t = traders[i];
-      _settleTrader(cycleId, settlementPrice, t);
+      address trader = traders[i];
+      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
+
+      UserAccount storage ua = userAccounts[trader];
+      if (pnl < 0) {
+        // Loser - debit immediately
+        uint256 debit = uint256(-pnl);
+        uint256 balance = ua.balance;
+        uint256 amountPaid = balance < debit ? balance : debit;
+
+        ua.balance -= uint64(amountPaid);
+        uint256 unpaid = debit - amountPaid;
+        badDebt += unpaid;
+
+        emit Settled(cycleId, trader, pnl);
+      } else if (pnl > 0) {
+        // Winner - store PnL for phase 2
+        ua.scratchPnL = uint64(uint256(pnl));
+        posSum += uint256(pnl);
+      }
+      // If pnl == 0, do nothing but still emit event
+      else {
+        emit Settled(cycleId, trader, 0);
+      }
+
+      _clearAllPositions(trader);
+
       unchecked {
         ++i;
       }
@@ -296,21 +330,87 @@ contract Market is
     cursor = i;
 
     if (i == n) {
-      // Finished settling all traders
+      // Phase 1 complete - calculate loss ratio and prepare for phase 2
+      settlementPhase = true;
+      cursor = 0; // Reset cursor for phase 2
+    }
+  }
+
+  function _doPhase2(uint256 cycleId, uint256 max) internal {
+    Cycle storage C = cycles[cycleId];
+    uint256 n = traders.length;
+    uint256 i = cursor;
+    uint256 upper = i + max;
+    if (upper > n) upper = n;
+
+    // Calculate loss ratio once (using 1e18 precision)
+    uint256 lossRatio = posSum == 0 ? 1e18 : (badDebt * 1e18 < posSum ? badDebt * 1e18 / posSum : 1e18);
+
+    while (i < upper) {
+      address trader = traders[i];
+      uint256 rawPnl = userAccounts[trader].scratchPnL;
+
+      if (rawPnl > 0) {
+        // Credit winner pro-rata
+        uint256 credit = rawPnl * (1e18 - lossRatio) / 1e18;
+        userAccounts[trader].balance += uint64(credit);
+
+        // Emit event with the actual credited amount (after social loss)
+        emit Settled(cycleId, trader, int256(credit));
+
+        userAccounts[trader].scratchPnL = 0; // Gas refund
+      }
+
+      unchecked {
+        ++i;
+      }
+    }
+    cursor = i;
+
+    if (i == n) {
+      // Phase 2 complete - clean up everything
       delete traders;
       delete takerQ;
       delete tqHead;
 
       cursor = 0;
+      posSum = 0;
+      badDebt = 0;
+      settlementPhase = false;
       C.isSettled = true;
       activeCycle = 0;
 
-      badDebt = 0;
-      paidOut = 0;
-
       emit CycleSettled(cycleId);
-      done = true;
     }
+  }
+
+  function _calculateTraderPnl(uint256 cycleId, uint64 price, address trader) internal view returns (int256 pnl) {
+    UserAccount memory uaMem = userAccounts[trader];
+    if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) return 0;
+
+    /* intrinsic of calls */
+    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
+    if (diff > 0) {
+      // long calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    } else {
+      // short calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    }
+
+    /* intrinsic of puts (mirror) */
+    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
+    if (diff > 0) {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    } else {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    }
+
+    return pnl;
   }
 
   function startCycle(uint256 expiry) external {
@@ -514,7 +614,7 @@ contract Market is
       uint256 taken = _settleFill(
         makerOrderId,
         Tmem.takerOrderId,
-        oppSide,
+        oppSide, // OPPSIDE PASSED HERE JUST SO EVENTS ARE ALWAYS FROM TAKER POV. This is a footgun but will do for now
         price,
         take,
         Tmem.trader, // The (queued) taker
@@ -713,7 +813,7 @@ contract Market is
       uint256 end = queue.length;
       while (j < end) {
         if (queue[j].trader == trader && queue[j].size > 0) {
-          uint96 size = queue[j].size;
+          uint64 size = queue[j].size;
 
           // Update pending positions based on market side
           MarketSide side = MarketSide(i);
@@ -768,8 +868,7 @@ contract Market is
   }
 
   function _getOraclePrice() internal view returns (uint64) {
-    // return 100000 * 1e6;
-    (bool success, bytes memory result) = ORACLE_PX_PRECOMPILE_ADDRESS.staticcall(abi.encode(0));
+    (bool success, bytes memory result) = ORACLE_PX_PRECOMPILE.staticcall(abi.encode(0));
     if (!success) revert Errors.OraclePriceCallFailed();
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
@@ -925,81 +1024,15 @@ contract Market is
     }
   }
 
-  function _settleTrader(uint256 cycleId, uint64 price, address trader) internal {
-    UserAccount memory uaMem = userAccounts[trader];
-    if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) {
-      _clearAllPositions(trader);
-      return;
+  function _clearAllPositions(address trader) internal {
+    UserAccount storage ua = userAccounts[trader];
+    ua.liquidationQueued = false;
+    ua.activeInCycle = false;
+    // Zero out second slot in UserAccount struct, which contains all the individual positions data
+    assembly {
+      let slot := ua.slot
+      sstore(add(slot, 1), 0)
     }
-
-    int256 pnl;
-
-    /* intrinsic of calls */
-    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
-    if (diff > 0) {
-      // long calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
-    } else {
-      // short calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
-    }
-
-    /* intrinsic of puts (mirror) */
-    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
-    if (diff > 0) {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
-    } else {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
-    }
-
-    _applyCashDeltaSocial(trader, pnl);
-
-    _clearAllPositions(trader);
-    emit Settled(cycleId, trader, pnl);
-  }
-
-  function _applyCashDeltaSocial(address u, int256 d) internal {
-    UserAccount storage ua = userAccounts[u];
-    if (d < 0) {
-      uint256 debit = uint256(-d);
-      uint256 bal = ua.balance;
-      if (bal >= debit) {
-        ua.balance = uint64(bal - debit);
-      } else {
-        ua.balance = 0;
-        badDebt += debit - bal;
-      }
-      return;
-    }
-
-    uint256 credit = uint256(d);
-    uint256 newPaid = paidOut + credit;
-
-    if (badDebt == 0) {
-      ua.balance = uint64(ua.balance + credit);
-      paidOut = newPaid;
-      return;
-    }
-
-    if (newPaid <= badDebt) {
-      // still underwater – winner gets nothing yet
-      paidOut = newPaid;
-      return;
-    }
-
-    // partially underwater: distribute only the surplus
-    uint256 distributable = newPaid - badDebt; // > 0
-    uint256 give = credit * distributable / newPaid;
-
-    ua.balance = uint64(ua.balance + give);
-
-    // plug the hole and keep only the surplus as new paidOut
-    paidOut = distributable;
-    badDebt = 0;
   }
 
   function _requiredMarginForLiquidation(address trader, uint256 price, uint256 marginBps)
@@ -1021,17 +1054,6 @@ contract Market is
     UserAccount storage ua = userAccounts[trader];
     if (ua.liquidationQueued) return false;
     return ua.balance < _requiredMarginForLiquidation(trader, price, MM_BPS);
-  }
-
-  function _clearAllPositions(address trader) internal {
-    UserAccount storage ua = userAccounts[trader];
-    ua.liquidationQueued = false;
-    ua.activeInCycle = false;
-    // Zero out all 8 position variables (upper 128 bits) while preserving lower 128 bits
-    assembly {
-      let slot := ua.slot
-      sstore(add(slot, 1), 0)
-    }
   }
 
   // #######################################################################

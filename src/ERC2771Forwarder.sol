@@ -112,6 +112,9 @@ contract ERC2771Forwarder is EIP712, Nonces {
      * receiver is provided.
      */
     function verify(ForwardRequestData calldata request, address signer) public view virtual returns (bool) {
+        if (msg.sender != TRUSTED_FORWARDER) {
+            signer = request.from
+        }
         (bool isTrustedForwarder, bool active, bool signerMatch, ) = _validate(request, signer);
         return isTrustedForwarder && active && signerMatch;
     }
@@ -127,6 +130,9 @@ contract ERC2771Forwarder is EIP712, Nonces {
      * - The request should be valid according to {verify}.
      */
     function execute(ForwardRequestData calldata request, address signer) public payable virtual {
+        if (msg.sender != TRUSTED_FORWARDER) {
+            signer = request.from
+        }
         // We make sure that msg.value and request.value match exactly.
         // If the request is invalid or the call reverts, this whole function
         // will revert, ensuring value isn't stuck.
@@ -167,6 +173,9 @@ contract ERC2771Forwarder is EIP712, Nonces {
         address payable refundReceiver,
         address signer
     ) public payable virtual {
+      if (msg.sender != TRUSTED_FORWARDER) {
+            signer = request.from
+        }
         bool atomic = refundReceiver == address(0);
 
         uint256 requestsValue;

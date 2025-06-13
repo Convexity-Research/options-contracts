@@ -14,6 +14,8 @@ import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/met
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import "forge-std/console2.sol";
+
 contract Market is
   IMarket,
   Initializable,
@@ -34,8 +36,9 @@ contract Market is
   uint256 constant MAX_OPEN_LIMIT_ORDERS = 8; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 constant makerFeeBps = 10; // +0.10 %, basis points
-  int256 constant takerFeeBps = -50; // –0.50 %, basis points
+  int256 constant makerFeeBps = -10; // -0.10 %, basis points. Negative means its a fee rebate, so pay out to makers
+  int256 constant takerFeeBps = 50; // +0.50 %, basis points
+  uint256 constant liquidationFeeBps = 1000; // 10.00 %, basis points
   uint256 constant denominator = 10_000;
 
   //------- Gasless TX -------
@@ -258,6 +261,23 @@ contract Market is
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
     uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
+    // Calculate liquidation fee based on notional value of NET position being liquidated
+    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
+    uint256 liquidationFee = notional * liquidationFeeBps / denominator;
+
+    // Deduct liquidation fee from trader's balance first
+    if (ua.balance > liquidationFee) {
+      ua.balance -= uint64(liquidationFee);
+      _applyCashDelta(feeRecipient, int256(liquidationFee));
+    } else {
+      // If not enough balance, take all remaining balance as fee
+      uint256 remainingBalance = ua.balance;
+      ua.balance = 0;
+      _applyCashDelta(feeRecipient, int256(remainingBalance));
+    }
+
+    // Now execute market orders to close positions
+    // Users may have insufficient balance to cover buying the puts/calls, but this is handled in _marketOrder
     if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
     if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
 
@@ -521,6 +541,7 @@ contract Market is
   }
 
   function _marketOrder(MarketSide side, uint128 want, address taker, uint32 takerOrderId) private {
+    console2.log("marketOrder");
     uint128 left = want;
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
@@ -539,11 +560,17 @@ contract Market is
       Level storage L = levels[bestKey];
       uint32 nodeId = L.head; // nodeId = orderId
 
+      console2.log("outer");
+
       // Walk FIFO makers at this tick
       while (left > 0 && nodeId != 0) {
         Maker storage M = makerQ[nodeId];
 
         uint128 take = left < M.size ? left : M.size;
+
+        console2.log("M.size", M.size);
+        console2.log("left", left);
+        console2.log("take", take);
 
         uint128 taken = uint128(
           _settleFill(
@@ -558,6 +585,8 @@ contract Market is
             false // isTakerQueue
           )
         );
+
+        console2.log("taken", taken);
 
         left -= taken;
         M.size -= taken;
@@ -691,28 +720,37 @@ contract Market is
     UserAccount storage uaMaker = userAccounts[maker];
     UserAccount storage uaTaker = userAccounts[taker];
 
+    console2.log("settleFill");
+
     // Fees accounting
     {
       int256 premium = int256(price) * int256(size); // always +ve
 
-      // signed direction: +1 when taker buys, -1 when taker sells
-      int256 dir = isTakerBuy ? int256(1) : int256(-1);
+      // Use BTC oracle price for notional calculation, not option price
+      uint256 btcPrice = _getOraclePrice();
+      int256 notional = int256(size) * int256(btcPrice) / int256(CONTRACT_SIZE);
+      console2.log("notional", notional);
 
-      int256 makerFee = premium * makerFeeBps / int256(denominator);
-      int256 takerFee = premium * takerFeeBps / int256(denominator);
+      // Dir signed direction from pov of taker: -1 when taker buys, since they're paying premium
+      int256 dir = isTakerBuy ? int256(-1) : int256(1);
+
+      // Calculate fees based on notional value
+      int256 makerFee = notional * makerFeeBps / int256(denominator);
+      int256 takerFee = notional * takerFeeBps / int256(denominator);
 
       // flip premium flow with dir
-      int256 cashMaker = dir * premium + makerFee;
-      int256 cashTaker = -dir * premium + takerFee;
+      int256 cashMaker = -dir * premium - makerFee;
+      int256 cashTaker = dir * premium - takerFee;
 
-      // Check if taker has enough cash to pay premium. If not, return 0
-      if (isTakerQueue && cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
+      // Check if buyer (whoever has negative cash flow) has enough balance. If not, return 0
+      if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
+      if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
 
       _applyCashDelta(maker, cashMaker);
       _applyCashDelta(taker, cashTaker);
 
       // Net to fee recipient. This should always be positive (unless makerFeeBps + takerFeeBps are set incorrectly)
-      int256 houseFee = -(makerFee + takerFee);
+      int256 houseFee = takerFee + makerFee;
       if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
     }
 
@@ -745,13 +783,16 @@ contract Market is
       }
     }
 
-    if (uaTaker.liquidationQueued) {
-      uint256 shortCalls = uaTaker.shortCalls;
-      uint256 shortPuts = uaTaker.shortPuts;
-      uint256 longCalls = uaTaker.longCalls;
-      uint256 longPuts = uaTaker.longPuts;
+    // Liquidation check
+    {
+      if (uaTaker.liquidationQueued) {
+        uint256 shortCalls = uaTaker.shortCalls;
+        uint256 shortPuts = uaTaker.shortPuts;
+        uint256 longCalls = uaTaker.longCalls;
+        uint256 longPuts = uaTaker.longPuts;
 
-      if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
+        if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
+      }
     }
 
     emit OrderFilled(activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, _getOraclePrice());

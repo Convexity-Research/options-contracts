@@ -15,6 +15,9 @@ import {
 contract MarketSuite is Test {
   using BitScan for uint256;
 
+  int256 constant MAKER_FEE_BPS = -10;
+  int256 constant TAKER_FEE_BPS = 50;
+
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
   uint256 constant LOT = 100; // contracts
 
@@ -213,14 +216,14 @@ contract MarketSuite is Test {
 
   function testCrossAtSameTick() public {
     // Maker (u1) posts bid
-    _fund(u1, 1000 * ONE_COIN);
+    _fund(u1, 10000 * ONE_COIN);
     vm.prank(u1);
     mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN);
 
     uint256 balSinkBefore = mkt.getUserAccount(feeSink).balance;
 
     // Taker (u2) hits bid
-    _fund(u2, 1000 * ONE_COIN); // writer needs no upfront USDT premium
+    _fund(u2, 10000 * ONE_COIN); // writer needs no upfront USDT premium
     vm.prank(u2);
     mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN); // Price crossed since same price
       // as maker
@@ -230,11 +233,11 @@ contract MarketSuite is Test {
     Level memory lvl = mkt.levels(key);
     assertEq(lvl.vol, 0, "level not cleared");
 
-    // Fee accounting
-    int256 gross = int256(ONE_COIN) * int256(LOT);
-    int256 makerFee = gross * 10 / 10_000;
-    int256 takerFee = gross * -40 / 10_000;
-    uint256 sinkPlus = uint256(-(makerFee + takerFee));
+    // Fee accounting - fees are now based on notional value (BTC price), not premium
+    int256 notional = int256(LOT) * int256(_getOraclePrice()) / 100; // CONTRACT_SIZE = 100
+    int256 makerFee = notional * MAKER_FEE_BPS / 10_000; // -0.10% rebate
+    int256 takerFee = notional * TAKER_FEE_BPS / 10_000; // +0.50% charge
+    uint256 sinkPlus = uint256(takerFee + makerFee); // House gets taker fee + maker fee
 
     assertEq(mkt.getUserAccount(feeSink).balance, balSinkBefore + sinkPlus);
   }
@@ -389,6 +392,10 @@ contract MarketSuite is Test {
       console.log("%d\t\t%d\t\t%d", book[i].tick, price6, book[i].vol);
     }
     console.log("============================================\n");
+  }
+
+  function _getOraclePrice() internal view returns (int256) {
+    return int256(btcPrice * 1000000);
   }
 
   function _mockOracle(uint256 price) internal {

@@ -13,7 +13,7 @@ contract DeployUUPSProxy is Script {
 
   // address usdt0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb;
   address usdt0 = 0x12039B52D9F52e8F00784fe6FB49C0A7bEDb702F;
-  address forwarder = 0x3fB78f769C33a9689aC28c77074BE74CB3ec2870;
+  address forwarder = 0x44122Dd43cF39Fb47853dBd2232D63B4C9eb5B7E;
   address whitelistSigner = 0xf059b24cE0C34D44fb271dDC795a7C0E71576fd2;
 
   function run() external {

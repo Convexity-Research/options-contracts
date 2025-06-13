@@ -641,6 +641,8 @@ contract Market is
       TakerQ memory Tmem = Q[i]; // copy over for gas savings
       uint256 take = Tmem.size > remainingMakerSize ? remainingMakerSize : Tmem.size;
 
+      console2.log("takeTHATS!!", take);
+
       uint256 taken = _settleFill(
         makerOrderId,
         Tmem.takerOrderId,
@@ -652,6 +654,8 @@ contract Market is
         !_isBuy(side), // Taker is buy when maker's side is sell, which is when side is odd
         true // isTakerQueue
       );
+
+      console2.log("taken", taken);
 
       T.size -= uint64(taken);
       remainingMakerSize -= taken;
@@ -723,10 +727,13 @@ contract Market is
 
     console2.log("settleFill");
 
+    // Check if this is a liquidation order (taker is being liquidated)
+    bool isLiquidationOrder = uaTaker.liquidationQueued;
+
     // Fees accounting
     {
       int256 premium = int256(price) * int256(size); // always +ve
-
+      
       // Use BTC oracle price for notional calculation, not option price
       uint256 btcPrice = _getOraclePrice();
       int256 notional = int256(size) * int256(btcPrice) / int256(CONTRACT_SIZE);
@@ -743,12 +750,24 @@ contract Market is
       int256 cashMaker = -dir * premium - makerFee;
       int256 cashTaker = dir * premium - takerFee;
 
-      // Check if buyer (whoever has negative cash flow) has enough balance. If not, return 0
-      if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
-      if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+      // For non-liquidation orders, check if buyer has enough balance
+      if (!isLiquidationOrder) {
+        if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
+        if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+      }
 
-      _applyCashDelta(maker, cashMaker);
-      _applyCashDelta(taker, cashTaker);
+      // Apply cash deltas - for liquidations, handle insufficient balance as bad debt
+      if (isLiquidationOrder && cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
+        // Liquidation order: taker doesn't have enough balance, add to bad debt
+        uint256 shortfall = uint256(-cashTaker) - uaTaker.balance;
+        badDebt += shortfall;
+        uaTaker.balance = 0; // Zero out taker balance
+        _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
+      } else {
+        // Normal case: both parties have sufficient balance
+        _applyCashDelta(maker, cashMaker);
+        _applyCashDelta(taker, cashTaker);
+      }
 
       // Net to fee recipient. This should always be positive (unless makerFeeBps + takerFeeBps are set incorrectly)
       int256 houseFee = takerFee + makerFee;

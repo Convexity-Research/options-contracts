@@ -112,9 +112,6 @@ contract ERC2771Forwarder is EIP712, Nonces {
      * receiver is provided.
      */
     function verify(ForwardRequestData calldata request, address signer) public view virtual returns (bool) {
-        if (msg.sender != TRUSTED_FORWARDER) {
-            signer = request.from;
-        }
         (bool isTrustedForwarder, bool active, bool signerMatch, ) = _validate(request, signer);
         return isTrustedForwarder && active && signerMatch;
     }

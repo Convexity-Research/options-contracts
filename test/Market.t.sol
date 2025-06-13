@@ -311,6 +311,37 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
+  // #                    Reproduce paths                                  #
+  // #                                                                     #
+  // #######################################################################
+
+  function testReproduce() public {
+    // Taker market order, book empty, 1 contracts queued
+    _fund(u1, 25 * ONE_COIN);
+    vm.prank(u1);
+    mkt.placeOrder(MarketSide.PUT_BUY, 10000000000, 0); // book is blank
+
+    (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    // assertEq(qBefore.length, 1); // 1 queued
+    // assertEq(qBefore[0].size, 1);
+
+    // Maker comes with limit Sell 200 @ $1
+    _fund(u2, 1000 * ONE_COIN);
+    vm.prank(u2);
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
+
+    // The first 1 matched immediately, only 80 rest on book
+    uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
+    Level memory lvl = mkt.levels(key);
+    // assertEq(lvl.vol, 199, "book remainder wrong");
+
+    // Queue length won't be zero since we don't pop, but pointer should be equal to length
+    (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    assertEq(mkt.tqHead(uint256(MarketSide.PUT_BUY)), qAfter.length, "queue head not at the end");
+  }
+  
+  // #######################################################################
+  // #                                                                     #
   // #                    Bitscan and bitmap invariants                    #
   // #                                                                     #
   // #######################################################################

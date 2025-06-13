@@ -1,7 +1,7 @@
 [profile.default]
   libs = ["lib"]
   optimizer = true
-  optimizer_runs = 1000
+  optimizer_runs = 100
   out = "out"
   solc_version = "0.8.30"
   src = "src"
@@ -20,3 +20,10 @@
 
 [rpc_endpoints]
   hyperevm = "${HYPEREVM_MAINNET_RPC}"
+  arbitrum = "${ARBITRUM_MAINNET_RPC}"
+  base = "${BASE_MAINNET_RPC}"
+
+[etherscan]
+  mainnet = { key = "${NGW1KG1RDR82WYRMQSET2N5IQ6DE5XTU2C}"}
+  arbitrum = { key = "${ARBITRUM_ETHERSCAN_API_KEY}" }
+  base = { key = "${BASE_ETHERSCAN_API_KEY}" }

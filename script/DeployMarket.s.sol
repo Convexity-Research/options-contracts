@@ -6,17 +6,18 @@ import {console} from "forge-std/console.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Market} from "../src/Market.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract DeployUUPSProxy is Script {
   address public constant ADMIN = 0xE7Bc1Ed115b368B946d97e45eE79f47a14eBF179;
 
   // address usdt0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb;
-  address usdt0 = 0xAA480C5F5EB436D0645189Ca20E5AdE13aecAf27;
-  address forwarder = 0x99f052B76c837853f5F649edCAb028fF1521d1BA;
+  address usdt0 = 0x12039B52D9F52e8F00784fe6FB49C0A7bEDb702F;
+  address forwarder = 0x3fB78f769C33a9689aC28c77074BE74CB3ec2870;
   address whitelistSigner = 0xf059b24cE0C34D44fb271dDC795a7C0E71576fd2;
 
   function run() external {
-    vm.createSelectFork("hyperevm");
+    vm.createSelectFork("base");
     vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
     address deployer = ADMIN;
 
@@ -44,6 +45,9 @@ contract DeployUUPSProxy is Script {
     // UUPSUpgradeable(address(proxy)).upgradeToAndCall(address(implementation2), "");
     // console.log("Proxy upgraded");
     // console.log("Market version:", MarketV2(address(proxy)).version());
+
+    IERC20(usdt0).approve(address(market), 100 * 1e6);
+    market.depositCollateral(100 * 1e6);
 
     vm.stopBroadcast();
 

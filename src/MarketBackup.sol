@@ -162,24 +162,24 @@ contract Market is
     _depositCollateral(amount, trader);
   }
 
-  function depositCollateral(uint256 amount) external {
+  function depositCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external {
+  function withdrawCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size) external {
+  function long(uint256 size) external onlyWhitelisted {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
     _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
-  function short(uint256 size) external {
+  function short(uint256 size) external onlyWhitelisted {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
@@ -196,9 +196,9 @@ contract Market is
   }
 
   function cancelOrder(uint256 orderId) external {
-    require(_isMarketLive(), "Market not live");
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
-    require(M.trader == _msgSender(), "Not owner");
+    if (M.trader != _msgSender()) revert Errors.NotOwner();
 
     uint32 tickKey = M.key;
     Level storage L = ob[activeCycle].levels[tickKey];
@@ -229,7 +229,7 @@ contract Market is
     else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint32(M.size);
     else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint32(M.size);
     else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint32(M.size);
-    else revert("Invalid side");
+    else revert();
 
     // Remove from user's order tracking
     _removeOrderFromTracking(M.trader, uint32(orderId));
@@ -239,9 +239,9 @@ contract Market is
   }
 
   function liquidate(address trader) external {
-    require(_isMarketLive(), "Market not live");
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
     uint64 price = _getOraclePrice();
-    require(isLiquidatable(trader, price), "Not liquidatable");
+    if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     // Cancel all maker orders
     uint32[] memory orderIds = userOrders[trader];
@@ -292,13 +292,13 @@ contract Market is
     uint64 settlementPrice = C.settlementPrice;
 
     if (settlementPrice == 0) {
-      require(block.timestamp >= activeCycle, "Not expired");
+      if (block.timestamp < activeCycle) revert Errors.NotExpired();
       settlementPrice = _getOraclePrice();
       C.settlementPrice = settlementPrice;
       emit PriceFixed(activeCycle, settlementPrice);
     }
 
-    require(!C.isSettled, "Cycle already settled");
+    if (C.isSettled) revert Errors.CycleAlreadySettled();
 
     if (!settlementPhase) {
       // Phase 1: Calculate PnL, debit losers immediately, store winners' PnL
@@ -436,14 +436,14 @@ contract Market is
   function startCycle(uint256 expiry) external {
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
-      require(activeCycle < block.timestamp, "Cycle already started");
+      if (activeCycle >= block.timestamp) revert Errors.CycleAlreadyStarted();
 
       // The previous cycle must be settled
-      require(cycles[activeCycle].isSettled, "Previous cycle not settled");
+      if (!cycles[activeCycle].isSettled) revert Errors.PreviousCycleNotSettled();
     }
 
     uint64 price = _getOraclePrice();
-    require(price != 0, "Invalid oracle price");
+    if (price == 0) revert Errors.InvalidOraclePrice();
 
     // Create new market
     cycles[expiry] = Cycle({
@@ -464,8 +464,7 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function _depositCollateral(uint256 amount, address trader) private {
-    
-    require(amount > 0, "Invalid amount");
+    if (amount == 0) revert Errors.InvalidAmount();
 
     IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
     unchecked {
@@ -477,11 +476,11 @@ contract Market is
   }
 
   function _withdrawCollateral(uint256 amount, address trader) private {
-    require(amount > 0, "Invalid amount");
-    require(!_hasOpenPositionsOrOrders(trader), "In trader list");
+    if (amount == 0) revert Errors.InvalidAmount();
 
+    if (_hasOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
     uint256 balance = userAccounts[trader].balance;
-    require(balance >= amount, "Insufficient balance");
+    if (balance < amount) revert Errors.InsufficientBalance();
 
     unchecked {
       // We check amount above, and this saves some gas + code size
@@ -499,9 +498,9 @@ contract Market is
     uint256 limitPrice, // 0 = market
     address trader
   ) private returns (uint256 orderId) {
-    require(_isMarketLive(), "Market not live");
-    require(!userAccounts[trader].liquidationQueued, "Account in liquidation");
-    require(size > 0, "Invalid amount");
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
+    if (size == 0) revert Errors.InvalidAmount();
 
     if (limitPrice == 0) {
       uint32 takerId = _nextTakerId(ob[activeCycle]);
@@ -537,7 +536,7 @@ contract Market is
     _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
 
     if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
-      require(false, "Insufficient balance");
+      revert Errors.InsufficientBalance();
     }
   }
 
@@ -662,7 +661,7 @@ contract Market is
   }
 
   function _insertLimit(MarketSide side, uint32 tick, uint128 size, address trader, uint32 makerOrderId) private {
-    require(userOrders[trader].length < MAX_OPEN_LIMIT_ORDERS, "Maximum orders cap reached");
+    if (userOrders[trader].length >= MAX_OPEN_LIMIT_ORDERS) revert Errors.MaximumOrdersCapReached();
 
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
@@ -702,7 +701,7 @@ contract Market is
     else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts += uint32(size);
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint32(size);
     else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint32(size);
-    else revert("Invalid side");
+    else revert();
 
     emit OrderPlaced(ac, makerOrderId, size, tick * TICK_SZ, side, trader);
   }
@@ -911,7 +910,7 @@ contract Market is
 
   function _getOraclePrice() internal view returns (uint64) {
     (bool success, bytes memory result) = ORACLE_PX_PRECOMPILE.staticcall(abi.encode(0));
-    require(success, "Oracle price call failed");
+    if (!success) revert Errors.OraclePriceCallFailed();
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
     return price;
@@ -934,7 +933,7 @@ contract Market is
   }
 
   function _key(uint32 tick, MarketSide side) internal pure returns (uint32) {
-    require(tick < 1 << 24, "Tick too large");
+    if (tick >= 1 << 24) revert Errors.TickTooLarge();
     return tick | (_isPut(side) ? 1 << 31 : 0) | (_isBuy(side) ? 1 << 30 : 0);
   }
 
@@ -1061,7 +1060,7 @@ contract Market is
       userAccounts[user].balance += uint64(uint256(delta));
     } else if (delta < 0) {
       uint256 absVal = uint256(-delta);
-      require(userAccounts[user].balance >= absVal, "Insufficient balance");
+      if (userAccounts[user].balance < absVal) revert Errors.InsufficientBalance();
       userAccounts[user].balance -= uint64(absVal);
     }
   }
@@ -1134,13 +1133,13 @@ contract Market is
   }
 
   modifier onlyWhitelisted() {
-    require(whitelist[_msgSender()], "Not whitelisted");
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
     _;
   }
 
   modifier isValidSignature(bytes memory signature) {
     if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      require(false, "Invalid signature");
+      revert Errors.InvalidSignature();
     }
     _;
   }

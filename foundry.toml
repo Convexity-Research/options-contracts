@@ -19,5 +19,6 @@
   wrap_comments = true
 
 [rpc_endpoints]
+  hyperevm = "${HYPEREVM_MAINNET_RPC}"
   arbitrum = "${ARBITRUM_MAINNET_RPC}"
   base = "${BASE_MAINNET_RPC}"

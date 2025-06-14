@@ -28,6 +28,9 @@ contract DeployUUPSProxy is Script {
     UUPSUpgradeable(address(marketProxy)).upgradeToAndCall(address(newImplementation), "");
     console.log("Proxy upgraded");
 
+    Market(marketProxy).transferOwnership(0xdf5dc9d934a87E52aAdCE0c4F6258b0DCDbBF4c2);
+
     vm.stopBroadcast();
   }
 }
+// 0x5fA815049DCaf3e7e79C27F0FaE3ecCcEEa07F46

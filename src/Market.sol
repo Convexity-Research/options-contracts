@@ -36,9 +36,9 @@ contract Market is
   uint256 constant MAX_OPEN_LIMIT_ORDERS = 8; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 constant makerFeeBps = -10; // -0.10 %, basis points. Negative means its a fee rebate, so pay out to makers
-  int256 constant takerFeeBps = 50; // +0.50 %, basis points
-  uint256 constant liquidationFeeBps = 1000; // 10.00 %, basis points
+  int256 constant makerFeeBps = -20; // -0.20 %, basis points. Negative means its a fee rebate, so pay out to makers
+  int256 constant takerFeeBps = 100; // +1.00 %, basis points
+  uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
   uint256 constant denominator = 10_000;
 
   //------- Gasless TX -------
@@ -55,8 +55,9 @@ contract Market is
     bool activeInCycle;
     bool liquidationQueued;
     uint64 balance;
+    uint64 liquidationFeeOwed;
     uint64 scratchPnL;
-    uint112 _gap; // 112 remaining bits for future use. Packs position data into next slot
+    uint48 _gap; // 48 remaining bits for future use. Packs position data into next slot
     uint32 longCalls;
     uint32 shortCalls;
     uint32 longPuts;
@@ -121,6 +122,8 @@ contract Market is
     MarketSide side,
     address indexed taker,
     address indexed maker,
+    int256 cashTaker,
+    int256 cashMaker,
     uint256 btcPrice
   );
   event OrderCancelled(
@@ -162,24 +165,24 @@ contract Market is
     _depositCollateral(amount, trader);
   }
 
-  function depositCollateral(uint256 amount) external {
+  function depositCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external {
+  function withdrawCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size) external {
+  function long(uint256 size) external onlyWhitelisted {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
     _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
-  function short(uint256 size) external {
+  function short(uint256 size) external onlyWhitelisted {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
@@ -192,13 +195,17 @@ contract Market is
     returns (uint256 orderId)
   {
     address trader = _msgSender();
-    return _placeOrder(side, size, limitPrice, trader);
+    _placeOrder(side, size, limitPrice, trader);
+    return 0;
   }
 
   function cancelOrder(uint256 orderId) external {
     require(_isMarketLive(), "Market not live");
+    address trader = _msgSender();
+    require(!isLiquidatable(trader, _getOraclePrice()), "Cannot cancel order while liquidatable");
+
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
-    require(M.trader == _msgSender(), "Not owner");
+    require(M.trader == trader, "Not owner");
 
     uint32 tickKey = M.key;
     Level storage L = ob[activeCycle].levels[tickKey];
@@ -262,26 +269,15 @@ contract Market is
     uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
 
     // Calculate liquidation fee based on notional value of NET position being liquidated
-    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
-    uint256 liquidationFee = notional * liquidationFeeBps / denominator;
+    uint256 liquidationFee = (shortCalls + shortPuts) * price * liquidationFeeBps / denominator / CONTRACT_SIZE;
 
-    // Deduct liquidation fee from trader's balance first
-    if (ua.balance > liquidationFee) {
-      ua.balance -= uint64(liquidationFee);
-      _applyCashDelta(feeRecipient, int256(liquidationFee));
-    } else {
-      // If not enough balance, take all remaining balance as fee
-      uint256 remainingBalance = ua.balance;
-      ua.balance = 0;
-      _applyCashDelta(feeRecipient, int256(remainingBalance));
-    }
+    ua.liquidationFeeOwed = uint64(liquidationFee);
+    ua.liquidationQueued = true;
 
     // Now execute market orders to close positions
     // Users may have insufficient balance to cover buying the puts/calls, but this is handled in _marketOrder
     if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
     if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
-
-    ua.liquidationQueued = true;
 
     emit Liquidated(activeCycle, trader);
   }
@@ -317,6 +313,10 @@ contract Market is
 
     while (i < upper) {
       address trader = traders[i];
+
+      // Charge liquidation fee, if any
+      _chargeLiquidationFee(trader);
+
       int256 pnl = _calculateTraderPnl(cycleId, price, trader);
 
       UserAccount storage ua = userAccounts[trader];
@@ -356,6 +356,18 @@ contract Market is
     }
   }
 
+  // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
+  function _chargeLiquidationFee(address trader) internal {
+    UserAccount storage ua = userAccounts[trader];
+    if (ua.liquidationFeeOwed > 0) {
+      uint256 fee = ua.liquidationFeeOwed;
+      uint256 pay = ua.balance < fee ? ua.balance : fee;
+      ua.balance -= uint64(pay);
+      ua.liquidationFeeOwed -= uint64(pay);
+      _applyCashDelta(feeRecipient, int256(pay));
+    }
+  }
+
   function _doPhase2(uint256 cycleId, uint256 max) internal {
     Cycle storage C = cycles[cycleId];
     uint256 n = traders.length;
@@ -363,8 +375,8 @@ contract Market is
     uint256 upper = i + max;
     if (upper > n) upper = n;
 
-    // Calculate loss ratio once (using 1e18 precision)
-    uint256 lossRatio = posSum == 0 ? 1e18 : (badDebt * 1e18 < posSum ? badDebt * 1e18 / posSum : 1e18);
+    // Calculate loss ratio once (using 1e12 precision)
+    uint256 lossRatio = posSum == 0 ? 1e12 : (badDebt * 1e12 < posSum ? badDebt * 1e12 / posSum : 1e12);
 
     while (i < upper) {
       address trader = traders[i];
@@ -372,7 +384,7 @@ contract Market is
 
       if (rawPnl > 0) {
         // Credit winner pro-rata
-        uint256 credit = rawPnl * (1e18 - lossRatio) / 1e18;
+        uint256 credit = rawPnl * (1e12 - lossRatio) / 1e12;
         userAccounts[trader].balance += uint64(credit);
 
         // Emit event with the actual credited amount (after social loss)
@@ -464,7 +476,6 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function _depositCollateral(uint256 amount, address trader) private {
-    
     require(amount > 0, "Invalid amount");
 
     IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
@@ -498,43 +509,25 @@ contract Market is
     uint256 size,
     uint256 limitPrice, // 0 = market
     address trader
-  ) private returns (uint256 orderId) {
+  ) private {
     require(_isMarketLive(), "Market not live");
     require(!userAccounts[trader].liquidationQueued, "Account in liquidation");
     require(size > 0, "Invalid amount");
 
-    if (limitPrice == 0) {
-      uint32 takerId = _nextTakerId(ob[activeCycle]);
-      emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
-      _marketOrder(side, uint128(size), trader, takerId);
-      return 0;
-    }
-
     // Convert price to tick
     uint256 tick = limitPrice / TICK_SZ; // 1 tick = 0.01 USDT0
 
-    // If opposite side has liquidity and price is crossing, then also treat as market order
-    MarketSide oppSide = _oppositeSide(side);
-    if (ob[activeCycle].summaries[uint256(oppSide)] != 0) {
-      (uint32 oppBest,) = _best(oppSide);
-
-      // Check crossing: even enum values (buys) use >=, odd enum values (sells) use <=
-      bool isCrossing = (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
-
-      if (isCrossing) {
-        uint32 takerId = _nextTakerId(ob[activeCycle]);
-        emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
-        _marketOrder(side, uint128(size), trader, takerId);
-        return 0;
-      }
+    if (limitPrice == 0 || _isCrossing(side, tick)) {
+      // Market order
+      uint32 takerId = _nextTakerId(ob[activeCycle]);
+      emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
+      _marketOrder(side, uint128(size), trader, takerId);
+    } else {
+      // Limit order
+      uint256 orderId = _nextMakerId(ob[activeCycle]);
+      uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
+      if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
     }
-
-    // Is a limit order
-    orderId = _nextMakerId(ob[activeCycle]);
-    uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
-    if (qtyLeft == 0) return 0;
-
-    _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
 
     if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
       require(false, "Insufficient balance");
@@ -542,7 +535,6 @@ contract Market is
   }
 
   function _marketOrder(MarketSide side, uint128 want, address taker, uint32 takerOrderId) private {
-    console2.log("marketOrder");
     uint128 left = want;
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
@@ -561,17 +553,11 @@ contract Market is
       Level storage L = levels[bestKey];
       uint32 nodeId = L.head; // nodeId = orderId
 
-      console2.log("outer");
-
       // Walk FIFO makers at this tick
       while (left > 0 && nodeId != 0) {
         Maker storage M = makerQ[nodeId];
 
         uint128 take = left < M.size ? left : M.size;
-
-        console2.log("M.size", M.size);
-        console2.log("left", left);
-        console2.log("take", take);
 
         uint128 taken = uint128(
           _settleFill(
@@ -586,8 +572,6 @@ contract Market is
             false // isTakerQueue
           )
         );
-
-        console2.log("taken", taken);
 
         left -= taken;
         M.size -= taken;
@@ -641,8 +625,6 @@ contract Market is
       TakerQ memory Tmem = Q[i]; // copy over for gas savings
       uint256 take = Tmem.size > remainingMakerSize ? remainingMakerSize : Tmem.size;
 
-      console2.log("takeTHATS!!", take);
-
       uint256 taken = _settleFill(
         makerOrderId,
         Tmem.takerOrderId,
@@ -655,12 +637,10 @@ contract Market is
         true // isTakerQueue
       );
 
-      console2.log("taken", taken);
-
       T.size -= uint64(taken);
       remainingMakerSize -= taken;
 
-      if (T.size == 0) ++i; // fully consumed
+      if (T.size == 0 || taken == 0) ++i; // fully consumed
     }
     tqHead[uint256(_oppositeSide(side))] = i; // persist cursor
   }
@@ -725,35 +705,39 @@ contract Market is
     UserAccount storage uaMaker = userAccounts[maker];
     UserAccount storage uaTaker = userAccounts[taker];
 
-    console2.log("settleFill");
-
     // Check if this is a liquidation order (taker is being liquidated)
     bool isLiquidationOrder = uaTaker.liquidationQueued;
 
     // Fees accounting
+    int256 cashTaker;
+    int256 cashMaker;
     {
       int256 premium = int256(price) * int256(size); // always +ve
-      
-      // Use BTC oracle price for notional calculation, not option price
-      uint256 btcPrice = _getOraclePrice();
-      int256 notional = int256(size) * int256(btcPrice) / int256(CONTRACT_SIZE);
-      console2.log("notional", notional);
 
       // Dir signed direction from pov of taker: -1 when taker buys, since they're paying premium
       int256 dir = isTakerBuy ? int256(-1) : int256(1);
 
-      // Calculate fees based on notional value
-      int256 makerFee = notional * makerFeeBps / int256(denominator);
-      int256 takerFee = notional * takerFeeBps / int256(denominator);
+      // Calculate fees based on premium
+      int256 makerFee = premium * makerFeeBps / int256(denominator);
+      int256 takerFee = premium * takerFeeBps / int256(denominator);
 
       // flip premium flow with dir
-      int256 cashMaker = -dir * premium - makerFee;
-      int256 cashTaker = dir * premium - takerFee;
+      cashMaker = -dir * premium - makerFee;
+      cashTaker = dir * premium - takerFee;
 
-      // For non-liquidation orders, check if buyer has enough balance
+      // We need a safeguard against the situation where the 'resting' party - and if they're a buyer paying premium -
+      // has insufficient balance to pay the premium (for whatever reason). The 'resting party' is a limit order in the
+      // orderbook, or a market order if it ends up in the takerQueue. Either of these scenarios could lead to denial of
+      // service, so we remove the resting orders completelyorders
       if (!isLiquidationOrder) {
-        if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) return 0;
-        if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+        if (isTakerQueue && isTakerBuy) {
+          if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
+            return 0;
+          } else if (!isTakerQueue && !isTakerBuy) {
+            ob[activeCycle].makerNodes[makerOrderId].size = 0;
+            if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+          }
+        }
       }
 
       // Apply cash deltas - for liquidations, handle insufficient balance as bad debt
@@ -805,7 +789,7 @@ contract Market is
 
     // Liquidation check
     {
-      if (uaTaker.liquidationQueued) {
+      if (isLiquidationOrder) {
         uint256 shortCalls = uaTaker.shortCalls;
         uint256 shortPuts = uaTaker.shortPuts;
         uint256 longCalls = uaTaker.longCalls;
@@ -815,7 +799,9 @@ contract Market is
       }
     }
 
-    emit OrderFilled(activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, _getOraclePrice());
+    emit OrderFilled(
+      activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
+    );
 
     return size;
   }
@@ -904,6 +890,19 @@ contract Market is
         break;
       }
     }
+  }
+
+  function _isCrossing(MarketSide side, uint256 tick) internal view returns (bool) {
+    MarketSide oppSide = _oppositeSide(side);
+
+    if (ob[activeCycle].summaries[uint256(oppSide)] != 0) {
+      (uint32 oppBest,) = _best(oppSide);
+
+      // Check crossing: even enum values (buys) use >=, odd enum values (sells) use <=
+      return (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
+    }
+
+    return false;
   }
 
   function _nextMakerId(OrderbookState storage _ob) private returns (uint32 id) {

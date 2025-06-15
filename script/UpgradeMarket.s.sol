@@ -14,7 +14,7 @@ contract DeployUUPSProxy is Script {
 
   function run() external {
     vm.createSelectFork("hyperevm");
-    vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
+    vm.startBroadcast(vm.envUint("MARKET_OWNER"));
     address deployer = ADMIN;
 
     console.log("Deploying with account:", deployer);
@@ -27,8 +27,6 @@ contract DeployUUPSProxy is Script {
     // 2. Upgrade
     UUPSUpgradeable(address(marketProxy)).upgradeToAndCall(address(newImplementation), "");
     console.log("Proxy upgraded");
-
-    Market(marketProxy).transferOwnership(0xdf5dc9d934a87E52aAdCE0c4F6258b0DCDbBF4c2);
 
     vm.stopBroadcast();
   }

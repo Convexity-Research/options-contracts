@@ -165,35 +165,31 @@ contract Market is
     _depositCollateral(amount, trader);
   }
 
-  function depositCollateral(uint256 amount) external onlyWhitelisted {
+  function depositCollateral(uint256 amount) external {
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external onlyWhitelisted {
+  function withdrawCollateral(uint256 amount) external {
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size) external onlyWhitelisted {
+  function long(uint256 size) external {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
     _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
-  function short(uint256 size) external onlyWhitelisted {
+  function short(uint256 size) external {
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
     _placeOrder(MarketSide.CALL_SELL, size, 0, trader);
   }
 
-  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice)
-    external
-    onlyWhitelisted
-    returns (uint256 orderId)
-  {
+  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice) external returns (uint256 orderId) {
     address trader = _msgSender();
     _placeOrder(side, size, limitPrice, trader);
     return 0;
@@ -525,12 +521,18 @@ contract Market is
     } else {
       // Limit order
       uint256 orderId = _nextMakerId(ob[activeCycle]);
+      emit OrderPlaced(activeCycle, orderId, size, tick * TICK_SZ, side, trader);
       uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
       if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
     }
 
     if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
       require(false, "Insufficient balance");
+    }
+
+    if (!userAccounts[trader].activeInCycle) {
+      userAccounts[trader].activeInCycle = true;
+      traders.push(trader);
     }
   }
 
@@ -675,11 +677,6 @@ contract Market is
     levels[key].tail = makerOrderId;
     levels[key].vol += size;
 
-    // position table
-    if (!userAccounts[trader].activeInCycle) {
-      userAccounts[trader].activeInCycle = true;
-      traders.push(trader);
-    }
     UserAccount storage ua = userAccounts[trader];
 
     if (side == MarketSide.PUT_BUY) ua.pendingLongPuts += uint32(size);
@@ -687,8 +684,6 @@ contract Market is
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint32(size);
     else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint32(size);
     else revert("Invalid side");
-
-    emit OrderPlaced(ac, makerOrderId, size, tick * TICK_SZ, side, trader);
   }
 
   function _settleFill(
@@ -1149,11 +1144,6 @@ contract Market is
     returns (uint256)
   {
     return ERC2771ContextUpgradeable._contextSuffixLength();
-  }
-
-  modifier onlyWhitelisted() {
-    require(whitelist[_msgSender()], "Not whitelisted");
-    _;
   }
 
   modifier isValidSignature(bytes memory signature) {

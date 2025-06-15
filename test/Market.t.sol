@@ -276,6 +276,12 @@ contract MarketSuite is Test {
     assertEq(q[0].size, 50, "incorrect queue size");
   }
 
+  function testLong() public {
+    _fund(u1, 25 * ONE_COIN);
+    vm.prank(u1);
+    mkt.long(2);
+  }
+
   // #######################################################################
   // #                                                                     #
   // #                      Limit -> Queued-taker flow                     #
@@ -365,6 +371,26 @@ contract MarketSuite is Test {
     assert(BitScan.msb(1) == 0); // bit-0 set
     // Check that msb returns the correct index
     assert(BitScan.msb(1 << bit) == bit);
+  }
+
+  function testCancelOrderNonExistentOrder() public {
+    _fund(u1, 1000 * ONE_COIN);
+    vm.prank(u1);
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
+    
+    vm.startPrank(u1);
+    vm.expectRevert();
+    mkt.cancelOrder(123);
+  }
+
+  function testTakerQueueThenLimitOrder() public {
+    _fund(u1, 1000 * ONE_COIN);
+    vm.prank(u1);
+    mkt.placeOrder(MarketSide.PUT_BUY, 2, 0); // book is blank
+
+    _fund(u2, 1000 * ONE_COIN);
+    vm.prank(u2);
+    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN);
   }
 
   // #######################################################################

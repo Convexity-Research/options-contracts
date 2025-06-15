@@ -37,6 +37,8 @@ contract MarketSuite is Test {
 
   uint256 btcPrice = 109000;
 
+  uint256 cycleId;
+
   function setUp() public {
     signerKey = 0x17edc1e22b2fa63800979f12e31f4df4e5966edfa8205456f169ea8b2112dd49;
     signer = 0x1FaE1550229fE09ef3e266d8559acdcFC154e72f;
@@ -60,7 +62,8 @@ contract MarketSuite is Test {
 
     _mockOracle(btcPrice);
 
-    mkt.startCycle(block.timestamp + 60);
+    cycleId = block.timestamp + 60;
+    mkt.startCycle(cycleId);
   }
 
   // #######################################################################
@@ -89,7 +92,7 @@ contract MarketSuite is Test {
     uint256 price = 2e6; // 2 USDT0
 
     vm.prank(u1);
-    mkt.placeOrder(side, LOT, price);
+    mkt.placeOrder(side, LOT, price, cycleId);
 
     uint32 tick = _tick(price); // tick = 2e6 / 1e4 = 200
     uint32 key = _key(tick, false, true); // CALL-BID
@@ -119,7 +122,7 @@ contract MarketSuite is Test {
     uint32 expectedTick = 70000; // 700_000_000 / 10000
 
     vm.prank(u1);
-    mkt.placeOrder(side, LOT, price);
+    mkt.placeOrder(side, LOT, price, cycleId);
 
     uint32 tick = _tick(price);
     assertEq(tick, expectedTick, "tick calculation incorrect");
@@ -174,7 +177,7 @@ contract MarketSuite is Test {
     // Place all orders
     for (uint256 i = 0; i < prices.length; i++) {
       vm.prank(u1);
-      mkt.placeOrder(side, LOT, prices[i]);
+      mkt.placeOrder(side, LOT, prices[i], cycleId);
     }
 
     // Check each order's bits individually
@@ -216,14 +219,14 @@ contract MarketSuite is Test {
     // Maker (u1) posts bid
     _fund(u1, 10000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN);
+    mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN, cycleId);
 
     uint256 balSinkBefore = mkt.getUserAccount(feeSink).balance;
 
     // Taker (u2) hits bid
     _fund(u2, 10000 * ONE_COIN); // writer needs no upfront USDT premium
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN); // Price crossed since same price
+    mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN, cycleId); // Price crossed since same price
       // as maker
 
     // Queues empty, level deleted
@@ -251,13 +254,13 @@ contract MarketSuite is Test {
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
       vm.prank(u1);
-      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4); // ask
+      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4, cycleId); // ask
     }
 
     // Taker buys 350 contracts market –> eats 3 levels
     _fund(u2, 1000000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.PUT_BUY, 350, 0); // market
+    mkt.placeOrder(MarketSide.PUT_BUY, 350, 0, cycleId); // market
 
     // level[0] & level[1] empty, level[2] empty
     uint32 key0 = _key(ticks[0], true, false);
@@ -279,7 +282,7 @@ contract MarketSuite is Test {
   function testLong() public {
     _fund(u1, 25 * ONE_COIN);
     vm.prank(u1);
-    mkt.long(2);
+    mkt.long(2, cycleId);
   }
 
   // #######################################################################
@@ -293,7 +296,7 @@ contract MarketSuite is Test {
     // Taker market order, book empty, 120 contracts queued
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(MarketSide.PUT_BUY, 120, 0); // book is blank
+    mkt.placeOrder(MarketSide.PUT_BUY, 120, 0, cycleId); // book is blank
 
     (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
     assertEq(qBefore.length, 1); // 1 queued
@@ -302,7 +305,7 @@ contract MarketSuite is Test {
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
 
     // The first 120 matched immediately, only 80 rest on book
     uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
@@ -324,7 +327,7 @@ contract MarketSuite is Test {
     // Taker market order, book empty, 1 contracts queued
     _fund(u1, 25 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(MarketSide.PUT_BUY, 10000000000, 0); // book is blank
+    mkt.placeOrder(MarketSide.PUT_BUY, 10000000000, 0, cycleId); // book is blank
 
     (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
     // assertEq(qBefore.length, 1); // 1 queued
@@ -333,7 +336,7 @@ contract MarketSuite is Test {
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
 
     // The first 1 matched immediately, only 80 rest on book
     // uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
@@ -359,7 +362,7 @@ contract MarketSuite is Test {
 
     _fund(u1, 1e24);
     vm.prank(u1);
-    mkt.placeOrder(side, amount, price);
+    mkt.placeOrder(side, amount, price, cycleId);
 
     uint32 tick = _tick(price);
     (uint8 l1,,) = BitScan.split(tick);
@@ -376,8 +379,8 @@ contract MarketSuite is Test {
   function testCancelOrderNonExistentOrder() public {
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN);
-    
+    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
+
     vm.startPrank(u1);
     vm.expectRevert();
     mkt.cancelOrder(123);
@@ -386,11 +389,11 @@ contract MarketSuite is Test {
   function testTakerQueueThenLimitOrder() public {
     _fund(u1, 1000 * ONE_COIN);
     vm.prank(u1);
-    mkt.placeOrder(MarketSide.PUT_BUY, 2, 0); // book is blank
+    mkt.placeOrder(MarketSide.PUT_BUY, 2, 0, cycleId); // book is blank
 
     _fund(u2, 1000 * ONE_COIN);
     vm.prank(u2);
-    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN);
+    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
   }
 
   // #######################################################################

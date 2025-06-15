@@ -110,10 +110,10 @@ contract Market is
   event Liquidated(uint256 indexed cycleId, address indexed trader);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
-  event OrderPlaced(
-    uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, MarketSide side, address indexed maker
+  event LimitOrderPlaced(
+    uint256 indexed cycleId, uint256 makerOrderId, uint256 size, uint256 limitPrice, MarketSide side, address indexed maker
   );
-  event OrderFilled(
+  event LimitOrderFilled(
     uint256 indexed cycleId,
     uint256 makerOrderId,
     uint256 takerOrderId,
@@ -126,8 +126,8 @@ contract Market is
     int256 cashMaker,
     uint256 btcPrice
   );
-  event OrderCancelled(
-    uint256 indexed cycleId, uint256 orderId, uint256 size, uint256 limitPrice, address indexed maker
+  event LimitOrderCancelled(
+    uint256 indexed cycleId, uint256 makerOrderId, uint256 size, uint256 limitPrice, address indexed maker
   );
   event TakerOrderPlaced(
     uint256 indexed cycleId, uint32 takerOrderId, uint256 size, MarketSide side, address indexed taker
@@ -175,21 +175,27 @@ contract Market is
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size) external {
+  function long(uint256 size, uint256 cycleId) external {
+    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
     _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
-  function short(uint256 size) external {
+  function short(uint256 size, uint256 cycleId) external {
+    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
     _placeOrder(MarketSide.CALL_SELL, size, 0, trader);
   }
 
-  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice) external returns (uint256 orderId) {
+  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
+    external
+    returns (uint256 orderId)
+  {
+    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
     address trader = _msgSender();
     _placeOrder(side, size, limitPrice, trader);
     return 0;
@@ -237,7 +243,7 @@ contract Market is
     // Remove from user's order tracking
     _removeOrderFromTracking(M.trader, uint32(orderId));
 
-    emit OrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
+    emit LimitOrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
     delete makerNodes[uint32(orderId)];
   }
 
@@ -521,7 +527,7 @@ contract Market is
     } else {
       // Limit order
       uint256 orderId = _nextMakerId(ob[activeCycle]);
-      emit OrderPlaced(activeCycle, orderId, size, tick * TICK_SZ, side, trader);
+      emit LimitOrderPlaced(activeCycle, orderId, size, tick * TICK_SZ, side, trader);
       uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
       if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
     }
@@ -543,15 +549,17 @@ contract Market is
     mapping(uint32 => Level) storage levels = _ob.levels;
     mapping(uint32 => Maker) storage makerQ = _ob.makerNodes;
 
+    MarketSide oppSide = _oppositeSide(side);
+
     while (left > 0) {
       {
         // Any liquidity left?
-        uint256 sumOpp = _ob.summaries[uint256(_oppositeSide(side))];
+        uint256 sumOpp = _ob.summaries[uint256(oppSide)];
         if (sumOpp == 0) break; // No bits set in summary means empty book
       }
 
       // Best price level
-      (uint32 bestTick, uint32 bestKey) = _best(_oppositeSide(side));
+      (uint32 bestTick, uint32 bestKey) = _best(oppSide);
       Level storage L = levels[bestKey];
       uint32 nodeId = L.head; // nodeId = orderId
 
@@ -565,7 +573,7 @@ contract Market is
           _settleFill(
             nodeId,
             takerOrderId,
-            side,
+            oppSide,
             uint256(bestTick) * TICK_SZ, // price
             take,
             taker, // taker
@@ -630,7 +638,7 @@ contract Market is
       uint256 taken = _settleFill(
         makerOrderId,
         Tmem.takerOrderId,
-        oppSide, // OPPSIDE PASSED HERE JUST SO EVENTS ARE ALWAYS FROM TAKER POV. This is a footgun but will do for now
+        side,
         price,
         take,
         Tmem.trader, // The (queued) taker
@@ -794,7 +802,7 @@ contract Market is
       }
     }
 
-    emit OrderFilled(
+    emit LimitOrderFilled(
       activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
     );
 
@@ -842,7 +850,7 @@ contract Market is
 
     if (L.vol == 0) _clearLevel(side, key);
 
-    emit OrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
+    emit LimitOrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
   }
 
   function _clearTakerQueueEntries(address trader) internal {

@@ -19,7 +19,7 @@ contract SignSomething is Script {
   function run() external {
     vm.createSelectFork("hyperevm");
     vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-    
+
     uint256 signerKey = 1;
 
     IERC20(usdt0).approve(market, type(uint256).max);
@@ -35,7 +35,7 @@ contract SignSomething is Script {
 
     Market(market).depositCollateral(50000000 * 1e6);
     // Market(market).startCycle(1749898567);
-    Market(market).long(1);
+    Market(market).long(1, 1749898567);
   }
 
   function _mockOracle(uint256 price) internal {

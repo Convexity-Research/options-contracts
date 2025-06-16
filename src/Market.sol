@@ -14,8 +14,6 @@ import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/met
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import "forge-std/console2.sol";
-
 contract Market is
   IMarket,
   Initializable,
@@ -33,11 +31,11 @@ contract Market is
   uint256 constant collateralDecimals = 6;
   address constant ORACLE_PX_PRECOMPILE = 0x0000000000000000000000000000000000000807;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
-  uint256 constant MAX_OPEN_LIMIT_ORDERS = 8; // Max number of open limit orders per user
+  uint256 constant MAX_OPEN_LIMIT_ORDERS = 256; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 constant makerFeeBps = -20; // -0.20 %, basis points. Negative means its a fee rebate, so pay out to makers
-  int256 constant takerFeeBps = 100; // +1.00 %, basis points
+  int256 constant makerFeeBps = -200; // -2.00 %, basis points. Negative means its a fee rebate, so pay out to makers
+  int256 constant takerFeeBps = 700; // +7.00 %, basis points
   uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
   uint256 constant denominator = 10_000;
 
@@ -111,7 +109,12 @@ contract Market is
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
   event LimitOrderPlaced(
-    uint256 indexed cycleId, uint256 makerOrderId, uint256 size, uint256 limitPrice, MarketSide side, address indexed maker
+    uint256 indexed cycleId,
+    uint256 makerOrderId,
+    uint256 size,
+    uint256 limitPrice,
+    MarketSide side,
+    address indexed maker
   );
   event LimitOrderFilled(
     uint256 indexed cycleId,
@@ -532,7 +535,7 @@ contract Market is
       if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
     }
 
-    if (userAccounts[trader].balance < _requiredMarginForOrder(trader, _getOraclePrice(), MM_BPS)) {
+    if (userAccounts[trader].balance < _requiredMargin(trader, _getOraclePrice(), false)) {
       require(false, "Insufficient balance");
     }
 
@@ -1063,20 +1066,6 @@ contract Market is
     return block.timestamp < ac && ac != 0;
   }
 
-  function _requiredMarginForOrder(address trader, uint256 price, uint256 marginBps) internal view returns (uint256) {
-    UserAccount memory ua = userAccounts[trader];
-
-    uint256 shortCalls = (ua.shortCalls + ua.pendingShortCalls) > (ua.longCalls + ua.pendingLongCalls)
-      ? (ua.shortCalls + ua.pendingShortCalls) - (ua.longCalls + ua.pendingLongCalls)
-      : 0;
-    uint256 shortPuts = (ua.shortPuts + ua.pendingShortPuts) > (ua.longPuts + ua.pendingLongPuts)
-      ? (ua.shortPuts + ua.pendingShortPuts) - (ua.longPuts + ua.pendingLongPuts)
-      : 0;
-
-    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
-    return notional * marginBps / denominator;
-  }
-
   function _applyCashDelta(address user, int256 delta) private {
     if (delta > 0) {
       userAccounts[user].balance += uint64(uint256(delta));
@@ -1098,25 +1087,48 @@ contract Market is
     }
   }
 
-  function _requiredMarginForLiquidation(address trader, uint256 price, uint256 marginBps)
-    internal
-    view
-    returns (uint256)
-  {
+  function _requiredMargin(
+    address trader,
+    uint256 currentPrice, // oracle price, 6-decimals USDC
+    bool isLiquidation
+  ) internal view returns (uint256) {
     UserAccount memory ua = userAccounts[trader];
 
-    uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
-    uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
+    uint256 netShortCalls;
+    uint256 netShortPuts;
+    // Net short exposure (calls & puts)
+    if (isLiquidation) {
+      netShortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
+      netShortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
+    } else {
+      netShortCalls = ua.shortCalls + ua.pendingShortCalls > ua.longCalls + ua.pendingLongCalls
+        ? ua.shortCalls + ua.pendingShortCalls - ua.longCalls - ua.pendingLongCalls
+        : 0;
+      netShortPuts = ua.shortPuts + ua.pendingShortPuts > ua.longPuts + ua.pendingLongPuts
+        ? ua.shortPuts + ua.pendingShortPuts - ua.longPuts - ua.pendingLongPuts
+        : 0;
+    }
 
-    uint256 notional = (shortCalls + shortPuts) * price / CONTRACT_SIZE;
+    if (netShortCalls == 0 && netShortPuts == 0) return 0;
 
-    return notional * marginBps / denominator;
+    // Liabilities
+    uint256 strike = cycles[activeCycle].strikePrice; // 6-decimals
+    uint256 callLiability = currentPrice > strike ? (currentPrice - strike) * netShortCalls / CONTRACT_SIZE : 0;
+    uint256 putLiability = strike > currentPrice ? (strike - currentPrice) * netShortPuts / CONTRACT_SIZE : 0;
+
+    uint256 currentLoss = callLiability + putLiability; // USDC, 6-dec
+
+    // 0.10 % buffer on strike notional
+    uint256 notional = (netShortCalls + netShortPuts) * strike / CONTRACT_SIZE;
+    uint256 buffer = notional * MM_BPS / denominator; // 0.10 % of notional
+
+    return currentLoss + buffer;
   }
 
   function isLiquidatable(address trader, uint64 price) public view returns (bool) {
     UserAccount storage ua = userAccounts[trader];
     if (ua.liquidationQueued) return false;
-    return ua.balance < _requiredMarginForLiquidation(trader, price, MM_BPS);
+    return ua.balance < _requiredMargin(trader, price, true);
   }
 
   // #######################################################################

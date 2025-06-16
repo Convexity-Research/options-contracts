@@ -15,8 +15,9 @@ import {
 contract MarketSuite is Test {
   using BitScan for uint256;
 
-  int256 constant MAKER_FEE_BPS = -20;
-  int256 constant TAKER_FEE_BPS = 100;
+  int256 constant MAKER_FEE_BPS = -200;
+  int256 constant TAKER_FEE_BPS = 700;
+  uint256 constant TICK_SIZE = 1e4;
 
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
   uint256 constant LOT = 100; // contracts
@@ -35,7 +36,7 @@ contract MarketSuite is Test {
   address signer;
   uint256 signerKey;
 
-  uint256 btcPrice = 109000;
+  uint256 btcPrice = 100000;
 
   uint256 cycleId;
 
@@ -47,7 +48,7 @@ contract MarketSuite is Test {
     implementation = new MarketWithViews();
 
     // ProxyAdmin with owner as `owner`
-    vm.prank(owner);
+    vm.startPrank(owner);
     proxyAdmin = new ProxyAdmin(owner);
 
     // Init data
@@ -76,7 +77,7 @@ contract MarketSuite is Test {
     uint256 depositAmount = 10 * ONE_COIN;
     uint256 withdrawAmount = 5 * ONE_COIN;
     _fund(u1, depositAmount);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.withdrawCollateral(withdrawAmount);
 
     MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
@@ -91,7 +92,7 @@ contract MarketSuite is Test {
 
     uint256 price = 2e6; // 2 USDT0
 
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
 
     uint32 tick = _tick(price); // tick = 2e6 / 1e4 = 200
@@ -121,7 +122,7 @@ contract MarketSuite is Test {
     uint256 price = 700_000_000; // 700 USDT0
     uint32 expectedTick = 70000; // 700_000_000 / 10000
 
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
 
     uint32 tick = _tick(price);
@@ -176,7 +177,7 @@ contract MarketSuite is Test {
 
     // Place all orders
     for (uint256 i = 0; i < prices.length; i++) {
-      vm.prank(u1);
+      vm.startPrank(u1);
       mkt.placeOrder(side, LOT, prices[i], cycleId);
     }
 
@@ -218,14 +219,14 @@ contract MarketSuite is Test {
   function testCrossAtSameTick() public {
     // Maker (u1) posts bid
     _fund(u1, 10000 * ONE_COIN);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN, cycleId);
 
     uint256 balSinkBefore = mkt.getUserAccount(feeSink).balance;
 
     // Taker (u2) hits bid
     _fund(u2, 10000 * ONE_COIN); // writer needs no upfront USDT premium
-    vm.prank(u2);
+    vm.startPrank(u2);
     mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN, cycleId); // Price crossed since same price
       // as maker
 
@@ -253,13 +254,13 @@ contract MarketSuite is Test {
 
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
-      vm.prank(u1);
+      vm.startPrank(u1);
       mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4, cycleId); // ask
     }
 
     // Taker buys 350 contracts market –> eats 3 levels
     _fund(u2, 1000000 * ONE_COIN);
-    vm.prank(u2);
+    vm.startPrank(u2);
     mkt.placeOrder(MarketSide.PUT_BUY, 350, 0, cycleId); // market
 
     // level[0] & level[1] empty, level[2] empty
@@ -279,10 +280,42 @@ contract MarketSuite is Test {
     assertEq(q[0].size, 50, "incorrect queue size");
   }
 
-  function testLong() public {
-    _fund(u1, 25 * ONE_COIN);
-    vm.prank(u1);
-    mkt.long(2, cycleId);
+  function testLiquidation() public {
+    // Maker
+    _fund(u1, 1000 * ONE_COIN);
+    vm.startPrank(u1);
+    // Buy and sell price the same to make premium accounting net to zero
+    mkt.placeOrder(MarketSide.PUT_BUY, 1, 1, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 1, cycleId);
+
+    // Taker going long, to be liquidated
+    uint256 userCollateral = 1 * ONE_COIN;
+    _fund(u2, userCollateral);
+    vm.startPrank(u2);
+    vm.recordLogs();
+    mkt.long(1, cycleId);
+
+    // Check if liquidatable.
+    uint64 currentPrice = uint64(btcPrice * 1e6);
+    assertEq(mkt.isLiquidatable(u2, currentPrice), false); // current price is 100000, where user opened position
+    currentPrice -= uint64(TICK_SIZE);
+    assertEq(mkt.isLiquidatable(u2, currentPrice), true); // Becomes liquidatable as just 1 tick below strike
+
+    // Liquidate
+    _mockOracle(btcPrice - 1); // Oracle only reports price in whole dollar moves. There are no cents in the oracle price.
+    vm.startPrank(owner);
+    mkt.liquidate(u2);
+
+    // In this case, liquidated user's market order goes to the takerQueue, so fill it
+
+    vm.startPrank(u1);
+    uint256 optionPrice = TICK_SIZE;
+    mkt.placeOrder(MarketSide.PUT_SELL, 1, optionPrice, cycleId);
+
+    // Check if liquidated
+    uint256 takerFee = uint256(int256(TICK_SIZE) * TAKER_FEE_BPS / 10_000);
+    assertEq(mkt.getUserAccount(u2).balance, userCollateral - optionPrice - takerFee);
+    assertEq(mkt.getUserAccount(u2).liquidationQueued, false);
   }
 
   // #######################################################################
@@ -295,7 +328,7 @@ contract MarketSuite is Test {
   function testQueuedTakerThenMaker() public {
     // Taker market order, book empty, 120 contracts queued
     _fund(u1, 1000 * ONE_COIN);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(MarketSide.PUT_BUY, 120, 0, cycleId); // book is blank
 
     (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
@@ -304,7 +337,7 @@ contract MarketSuite is Test {
 
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
-    vm.prank(u2);
+    vm.startPrank(u2);
     mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
 
     // The first 120 matched immediately, only 80 rest on book
@@ -326,7 +359,7 @@ contract MarketSuite is Test {
   function testReproduce() public {
     // Taker market order, book empty, 1 contracts queued
     _fund(u1, 25 * ONE_COIN);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(MarketSide.PUT_BUY, 10000000000, 0, cycleId); // book is blank
 
     (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
@@ -335,7 +368,7 @@ contract MarketSuite is Test {
 
     // Maker comes with limit Sell 200 @ $1
     _fund(u2, 1000 * ONE_COIN);
-    vm.prank(u2);
+    vm.startPrank(u2);
     mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
 
     // The first 1 matched immediately, only 80 rest on book
@@ -361,7 +394,7 @@ contract MarketSuite is Test {
     uint256 price = uint256(priceTick) * 1e4 + 1e4; // >=1 tick
 
     _fund(u1, 1e24);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(side, amount, price, cycleId);
 
     uint32 tick = _tick(price);
@@ -378,7 +411,7 @@ contract MarketSuite is Test {
 
   function testCancelOrderNonExistentOrder() public {
     _fund(u1, 1000 * ONE_COIN);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
 
     vm.startPrank(u1);
@@ -388,11 +421,11 @@ contract MarketSuite is Test {
 
   function testTakerQueueThenLimitOrder() public {
     _fund(u1, 1000 * ONE_COIN);
-    vm.prank(u1);
+    vm.startPrank(u1);
     mkt.placeOrder(MarketSide.PUT_BUY, 2, 0, cycleId); // book is blank
 
     _fund(u2, 1000 * ONE_COIN);
-    vm.prank(u2);
+    vm.startPrank(u2);
     mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
   }
 
@@ -404,10 +437,10 @@ contract MarketSuite is Test {
 
   function _fund(address who, uint256 amount) internal {
     deal(address(usdt), who, amount);
-    vm.prank(who);
+    vm.startPrank(who);
     usdt.approve(address(mkt), type(uint256).max);
     bytes memory signature = _createSignature(who);
-    vm.prank(who);
+    vm.startPrank(who);
     mkt.depositCollateral(amount, signature);
   }
 

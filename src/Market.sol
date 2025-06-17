@@ -1130,6 +1130,10 @@ contract Market is
     return currentLoss + buffer;
   }
 
+  function isLiquidatable(address trader) public view returns (bool) {
+    return isLiquidatable(trader, _getOraclePrice());
+  }
+
   function isLiquidatable(address trader, uint64 price) public view returns (bool) {
     UserAccount storage ua = userAccounts[trader];
     if (ua.liquidationQueued) return false;

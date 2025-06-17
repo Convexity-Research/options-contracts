@@ -1142,43 +1142,6 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  function liquidationPrices(address trader) external view returns (uint64 upperPx, uint64 lowerPx) {
-    UserAccount memory ua = userAccounts[trader];
-
-    uint256 netShortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
-    uint256 netShortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
-
-    if (netShortCalls == 0 && netShortPuts == 0) return (0, 0);
-
-    uint256 strike = cycles[activeCycle].strikePrice; // 6-dp
-    uint256 balance = ua.balance;
-
-    uint256 notional = (netShortCalls + netShortPuts) * strike / CONTRACT_SIZE;
-    uint256 buffer = notional * MM_BPS / denominator; // 0.10 %
-
-    if (netShortCalls > 0) {
-      if (balance <= buffer) {
-        upperPx = uint64(strike); // already unsafe
-      } else {
-        uint256 delta = (balance - buffer) * CONTRACT_SIZE / netShortCalls;
-        // add one extra increment so that price == upperPx is unsafe
-        upperPx = uint64(strike + delta + CONTRACT_SIZE);
-      }
-    }
-
-    if (netShortPuts > 0) {
-      if (balance <= buffer) {
-        lowerPx = uint64(strike);
-      } else {
-        uint256 delta = (balance - buffer) * CONTRACT_SIZE / netShortPuts;
-        // subtract extra increment; guard against under-flow
-        lowerPx = uint64(
-          strike > delta + CONTRACT_SIZE ? strike - delta - CONTRACT_SIZE : 0 // never below zero
-        );
-      }
-    }
-  }
-
   function getNumTraders() public view returns (uint256) {
     return traders.length;
   }

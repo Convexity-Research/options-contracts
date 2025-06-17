@@ -18,6 +18,7 @@ contract MarketSuite is Test {
   int256 constant MAKER_FEE_BPS = -200;
   int256 constant TAKER_FEE_BPS = 700;
   uint256 constant TICK_SIZE = 1e4;
+  uint256 constant CONTRACT_SIZE = 100;
 
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
   uint256 constant LOT = 100; // contracts
@@ -302,7 +303,8 @@ contract MarketSuite is Test {
     assertEq(mkt.isLiquidatable(u2, currentPrice), true); // Becomes liquidatable as just 1 tick below strike
 
     // Liquidate
-    _mockOracle(btcPrice - 1); // Oracle only reports price in whole dollar moves. There are no cents in the oracle price.
+    _mockOracle(btcPrice - 1); // Oracle only reports price in whole dollar moves. There are no cents in the oracle
+      // price.
     vm.startPrank(owner);
     mkt.liquidate(u2);
 
@@ -352,33 +354,185 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
-  // #                    Reproduce paths                                  #
+  // #                            Liquidation                              #
   // #                                                                     #
   // #######################################################################
 
-  function testReproduce() public {
-    // Taker market order, book empty, 1 contracts queued
-    _fund(u1, 25 * ONE_COIN);
-    vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.PUT_BUY, 10000000000, 0, cycleId); // book is blank
+  function testLiquidateRevertIfSafe() public {
+    _fund(u1, 10 * ONE_COIN);
+    vm.expectRevert("Not liquidatable");
+    mkt.liquidate(u1);
+  }
 
-    (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
-    // assertEq(qBefore.length, 1); // 1 queued
-    // assertEq(qBefore[0].size, 1);
+  /// maker-order and queued-taker entries are wiped when trader is liquidated
+  function testLiquidationClearsBookAndQueues() public {
+    // 1) Collateral: 150 USDT (enough to open, nowhere near enough after pump)
+    _fund(u1, 150 * ONE_COIN);
+    _fund(u2, 5000 * ONE_COIN); // counter-party + later liquidity
 
-    // Maker comes with limit Sell 200 @ $1
-    _fund(u2, 1000 * ONE_COIN);
+    // 2) u2 posts a BID for 100 CALL contracts @ 1 USDT
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.PUT_SELL, 200, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, LOT, ONE_COIN, cycleId); // bid sits
 
-    // The first 1 matched immediately, only 80 rest on book
-    // uint32 key = _key(_tick(ONE_COIN), true, false); // PUT-Ask
-    // Level memory lvl = mkt.levels(key);
-    // assertEq(lvl.vol, 199, "book remainder wrong");
+    // 3) u1 hits that bid (short CALL)
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, LOT, ONE_COIN, cycleId); // taker sell
 
-    // // Queue length won't be zero since we don't pop, but pointer should be equal to length
-    // (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
-    // assertEq(mkt.tqHead(uint256(MarketSide.PUT_BUY)), qAfter.length, "queue head not at the end");
+    // u1 now has 100 short-CALLs, balance = 150 + 100 (premium) = 250 USDT
+    assertEq(mkt.getUserAccount(u1).shortCalls, LOT);
+
+    // 4) Leave a resting maker ask (10 contracts @ 2 USDT) on the book, don't fill
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, 10, ONE_COIN * 2, cycleId); // will not cross
+
+    // 5) Leave a *queued* taker order (PUT-BUY, 30 contracts, market)
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.PUT_BUY, 30, 0, cycleId); // book empty → queued
+    (TakerQ[] memory qBefore) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    assertEq(qBefore.length, 1);
+    assertEq(qBefore[0].trader, u1);
+
+    // BTC pumps by +20 k
+    _mockOracle(btcPrice + 20_000);
+    assertTrue(mkt.isLiquidatable(u1, uint64((btcPrice + 20_000) * 1e6)), "trader should now be liquidatable");
+
+    // Liquidate
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+
+    // Resting maker order cleared
+    uint32 restingKey = _key(_tick(ONE_COIN * 2), false, false); // CALL-ASK key
+    assertEq(mkt.levels(restingKey).vol, 0, "maker vol not cleared");
+
+    // Queued taker entry zeroed
+    (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    uint256 head = mkt.tqHead(uint256(MarketSide.PUT_BUY));
+    bool queueClean = qAfter.length == 0 || head >= qAfter.length || qAfter[head].size == 0;
+    assertTrue(queueClean, "taker queue not cleaned");
+
+    // 3. liquidation flag set (until closing trades finish)
+    assertTrue(mkt.getUserAccount(u1).liquidationQueued, "flag not set");
+
+    // 4. short position has started to be offset (<= original LOT)
+    qAfter = mkt.viewTakerQueue(MarketSide.CALL_BUY);
+    assertEq(qAfter.length, 1, "liq market order not queued");
+  }
+
+  function testLiquidationPriceHelperCall() public {
+    _fund(u1, 2 * ONE_COIN);
+    _fund(u2, 2 * ONE_COIN);
+
+    _openCallPair(u2, u1);
+
+    (uint64 upperPx, uint64 lowerPx) = mkt.liquidationPrices(u1);
+
+    assertGt(upperPx, 0, "upperPx should be > 0 for short CALL");
+    assertEq(lowerPx, 0, "lowerPx should be 0 (no short PUTs)");
+
+    uint64 almostPx = upperPx > 0 ? upperPx - 1 : upperPx;
+    bool unsafeBelow = mkt.isLiquidatable(u1, almostPx);
+    assertFalse(unsafeBelow, "should NOT liquidate just below threshold");
+
+    bool unsafeAbove = mkt.isLiquidatable(u1, upperPx);
+    assertTrue(unsafeAbove, "should liquidate once price crosses threshold");
+  }
+
+  function testLiquidationPriceHelperPut() public {
+    _fund(u1, 2 * ONE_COIN); // writer – will be liquidated
+    _fund(u2, 2 * ONE_COIN); // long side
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.PUT_BUY, 1, ONE_COIN, cycleId); // bid
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
+
+    (uint64 upperPx, uint64 lowerPx) = mkt.liquidationPrices(u1);
+
+    assertEq(upperPx, 0, "upperPx should be 0 (no short CALLs)");
+    assertGt(lowerPx, 0, "lowerPx should be > 0 for short PUT");
+
+    uint64 justAbove = lowerPx + 1; // just above = safe
+    assertFalse(mkt.isLiquidatable(u1, justAbove), "should NOT liquidate just above lowerPx");
+
+    assertTrue(mkt.isLiquidatable(u1, lowerPx), "should liquidate once price crosses below threshold");
+
+    console.log("upperPx", upperPx);
+    console.log("lowerPx", lowerPx);
+    console.log("justAbove", justAbove);
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                            Settlement                               #
+  // #                                                                     #
+  // #######################################################################
+
+  function testSettlement_NoSocialLoss() public {
+    uint256 collateral = 200 * ONE_COIN;
+    _fund(u1, collateral); // long – must be able to receive, not pay
+    _fund(u2, collateral); // short – ample collateral → no bad-debt
+
+    _openCallPair(u1, u2);
+
+    // fast-forward to expiry
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 10_000); // +10 k → long wins 100 USDT
+
+    // phase-1 + phase-2 in two txs
+    mkt.settleChunk(20);
+    mkt.settleChunk(20);
+
+    // cycle closed
+    assertEq(mkt.activeCycle(), 0);
+    (bool settled,,) = mkt.cycles(cycleId);
+    assertTrue(settled, "cycle not flagged as settled");
+
+    // u1 received full 100 USDT (±1 tick for fees) – check delta not exact start
+    uint256 gain = mkt.getUserAccount(u1).balance - (collateral - ONE_COIN - 70_000); // deposit - premium - fee
+    assertEq(gain, 100 * ONE_COIN, "winner not paid in full");
+
+    // u2 balance dropped by 100 USDT
+    uint256 loss = (200 * ONE_COIN + 1_020_000) - mkt.getUserAccount(u2).balance; // deposit + premium rebate
+    assertEq(loss, 100 * ONE_COIN, "loser did not pay full");
+  }
+
+  function testSettlementPartialSocialLoss() public {
+    uint256 longDeposit = 50 * ONE_COIN; // 50 USDT
+    uint256 shortDeposit = 60 * ONE_COIN; // 60 USDT
+    _fund(u1, longDeposit);
+    _fund(u2, shortDeposit);
+
+    _openCallPair(u1, u2);
+
+    uint256 premium = ONE_COIN; // 1.000000
+    int256 makerFee = int256(premium) * MAKER_FEE_BPS / 10_000;
+    int256 takerFee = int256(premium) * TAKER_FEE_BPS / 10_000;
+
+    int256 cashMaker = -int256(premium) - makerFee; // −0.98 USDT
+    int256 cashTaker = int256(premium) - takerFee; // +0.93 USDT
+
+    uint256 balU1_afterTrade = uint256(int256(longDeposit) + cashMaker);
+    uint256 balU2_afterTrade = uint256(int256(shortDeposit) + cashTaker);
+
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 10_000); // +10 000 USD spot move
+
+    uint256 intrinsic = (10_000 * ONE_COIN) / CONTRACT_SIZE; // 100 USDT
+
+    mkt.settleChunk(10);
+
+    // u2 must be drained to zero, u1’s scratchPnL should equal +100
+    assertEq(mkt.getUserAccount(u2).balance, 0);
+    uint256 scratchPnL = mkt.getUserAccount(u1).scratchPnL;
+    assertEq(scratchPnL, intrinsic);
+
+    mkt.settleChunk(10);
+
+    // Full balance taken from u2
+    uint256 expectedFinal = balU1_afterTrade + balU2_afterTrade;
+
+    assertEq(mkt.getUserAccount(u1).balance, expectedFinal, "social-loss calculation wrong");
+    assertLt(balU2_afterTrade, scratchPnL, "u1 should recieve less than their actual pnl");
   }
 
   // #######################################################################
@@ -456,6 +610,19 @@ contract MarketSuite is Test {
     bytes32 messageHash = keccak256(abi.encodePacked(user));
     (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, messageHash);
     return abi.encodePacked(r, s, v);
+  }
+
+  // helper: open a 1-contract CALL long/short pair at 1 USDT premium
+  function _openCallPair(address longAddr, address shortAddr) internal {
+    // shortAddr posts ask
+    vm.startPrank(shortAddr);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    // longAddr hits it market
+    vm.startPrank(longAddr);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, 0, cycleId); // market
+    vm.stopPrank();
   }
 
   function _printBook(MarketSide side) internal view {

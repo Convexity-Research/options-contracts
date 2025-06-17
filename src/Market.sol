@@ -29,7 +29,7 @@ contract Market is
   address public feeRecipient;
   address public collateralToken;
   uint256 constant collateralDecimals = 6;
-  address constant ORACLE_PX_PRECOMPILE = 0x0000000000000000000000000000000000000807;
+  address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 constant MAX_OPEN_LIMIT_ORDERS = 256; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
@@ -939,7 +939,7 @@ contract Market is
   }
 
   function _getOraclePrice() internal view returns (uint64) {
-    (bool success, bytes memory result) = ORACLE_PX_PRECOMPILE.staticcall(abi.encode(0));
+    (bool success, bytes memory result) = MARK_PX_PRECOMPILE.staticcall(abi.encode(0));
     require(success, "Oracle price call failed");
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));

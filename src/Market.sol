@@ -31,7 +31,6 @@ contract Market is
   uint256 constant collateralDecimals = 6;
   address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
   uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
-  uint256 constant MAX_OPEN_LIMIT_ORDERS = 256; // Max number of open limit orders per user
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 constant makerFeeBps = -200; // -2.00 %, basis points. Negative means its a fee rebate, so pay out to makers
@@ -666,8 +665,6 @@ contract Market is
   }
 
   function _insertLimit(MarketSide side, uint32 tick, uint128 size, address trader, uint32 makerOrderId) private {
-    require(userOrders[trader].length < MAX_OPEN_LIMIT_ORDERS, "Maximum orders cap reached");
-
     // derive level bytes and key
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
     uint32 key = _key(tick, side);

@@ -64,8 +64,7 @@ contract MarketSuite is Test {
 
     _mockOracle(btcPrice);
 
-    cycleId = block.timestamp + 60;
-    mkt.startCycle(cycleId);
+    mkt.startCycle();
   }
 
   // #######################################################################

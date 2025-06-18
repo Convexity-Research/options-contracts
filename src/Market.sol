@@ -38,6 +38,7 @@ contract Market is
   int256 constant takerFeeBps = 700; // +7.00 %, basis points
   uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
   uint256 constant denominator = 10_000;
+  uint256 constant DEFAULT_EXPIRY = 1 minutes;
 
   //------- Gasless TX -------
   address private _trustedForwarder;
@@ -455,7 +456,8 @@ contract Market is
     return pnl;
   }
 
-  function startCycle(uint256 expiry) external {
+  function startCycle() external {
+    uint256 expiry = block.timestamp + DEFAULT_EXPIRY;
     if (activeCycle != 0) {
       // If there is an active cycle, it must be in the past
       require(activeCycle < block.timestamp, "Cycle already started");

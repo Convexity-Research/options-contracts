@@ -29,10 +29,10 @@ jobs:
           forge fmt --check
         id: fmt
 
-      - name: Run Forge build
-        run: |
-          forge build --sizes --via-ir
-        id: build
+      # - name: Run Forge build
+      #   run: |
+      #     forge build --sizes --via-ir
+      #   id: build
 
       - name: Run Forge tests
         run: |

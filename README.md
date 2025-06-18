@@ -67,13 +67,12 @@ To ensure fair social loss distribution:
 Unfilled market orders are queued in buckets corresponding to each market side, allowing them to be filled by incoming limit orders.
 
 ### 8. Oracle Integration
-Uses a precompiled contract at address `0x0000000000000000000000000000000000000806` for price feeds, ensuring reliable and gas-efficient price updates.
+Uses a precompile at address `0x0000000000000000000000000000000000000806` for price feeds, ensuring reliable and gas-efficient price updates. This is the `Mark price` used by the Hyperliquid perps dex.
 
 ## Constants & Configuration
 
 ```solidity
 uint256 constant TICK_SZ = 1e4;              // 0.01 USDT tick size
-uint256 constant MAX_OPEN_LIMIT_ORDERS = 256; // Max orders per user
 uint256 constant MM_BPS = 10;                 // 0.10% Maintenance Margin
 uint256 constant CONTRACT_SIZE = 100;         // Position size divisor
 int256 constant makerFeeBps = -200;          // -2.00% (rebate to makers)
@@ -222,7 +221,6 @@ When total losses exceed available collateral:
 - **Liquidation Trigger**: Balance < required margin
 
 ### Position Limits
-- **Max Open Orders**: 256 limit orders per user
 - **No Position Limits**: Users can take unlimited size positions if they have sufficient collateral
 
 ## Events

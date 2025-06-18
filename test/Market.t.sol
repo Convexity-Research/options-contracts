@@ -689,7 +689,7 @@ contract MarketSuite is Test {
 
   function _mockOracle(uint256 price) internal {
     vm.mockCall(
-      address(0x0000000000000000000000000000000000000807),
+      address(0x0000000000000000000000000000000000000806),
       abi.encodeWithSelector(0x00000000),
       abi.encode(price * 10) // Oracle and Mark price feeds return with 1 decimal when reading L1 from HyperEVM
     );

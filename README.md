@@ -1,24 +1,244 @@
-# Options Contracts
+# opt.fun Contract Documentation
 
-## Deployment
+## Overview
 
-Need to tell hyperCore that we want to deploy in a slow block:
+opt.fun is a decentralized options trading platform on HyperEVM that enables traders to buy and sell 1-minute expiry at-the-money (ATM) options. The platform provides a streamlined trading experience for short-term options strategies with automated settlement and collateral management.
 
+### Key Features
+- **High leverage**: Up to 1000x leverage on deposited collateral
+- **1-minute expiry cycles**: Each trading cycle lasts exactly 60 seconds from initiation to settlement
+- **At-the-money strikes**: All options are automatically struck at the current oracle price when the cycle begins
+- **Binary settlement**: Options expire either in-the-money (ITM) or out-of-the-money (OTM)
+- **Gasless trading**: Sponsored by the opt.fun team using ERC2771 meta-transactions
+- **Automated liquidations**: Protect system solvency through automated position liquidation
+
+### Use Cases
+- **Speculating**: Capitalize on small price movements with minimal capital via high leverage
+- **Hedging**: Quickly hedge spot positions over a 1-minute period
+- **Yield Farming**: Provide liquidity by selling options and collecting premiums
+- **Market Making**: Simultaneous buying and selling to capture bid-ask spreads
+
+## Architecture & Implementation Choices
+
+### 1. Upgradeable Proxy Pattern
+The contract uses OpenZeppelin's UUPS (Universal Upgradeable Proxy Standard) pattern, allowing for future improvements while maintaining state continuity.
+
+### 2. ERC2771 Meta-Transactions
+Implements gasless trading through trusted forwarders, enabling users to trade without holding native tokens for gas.
+
+### 3. Cycle-Based Trading
+- Each cycle is identified by its expiry timestamp (Unix timestamp)
+- Strike price is set to the oracle price at cycle initiation
+- Trading is only allowed during active cycles (before expiry)
+
+### 4. Three-Level Bitmap Orderbook
+The orderbook uses an efficient three-level bitmap structure for O(1) best price discovery:
+- **L1 (Summary)**: 256-bit summary of which 65k-tick blocks have liquidity
+- **L2 (Mid)**: 256-bit bitmap for each L1 block, showing which 256-tick sub-blocks have orders
+- **L3 (Detail)**: 256-bit bitmap for each L2 block, showing exact ticks with liquidity
+
+### 5. Position Tracking
+User positions are tracked efficiently in a packed struct:
+```solidity
+struct UserAccount {
+    bool activeInCycle;
+    bool liquidationQueued;
+    uint64 balance;              // Collateral balance
+    uint64 liquidationFeeOwed;
+    uint64 scratchPnL;           // Temporary PnL storage during settlement
+    uint48 _gap;                 // Reserved for future use
+    uint32 longCalls;            // Actual positions
+    uint32 shortCalls;
+    uint32 longPuts;
+    uint32 shortPuts;
+    uint32 pendingLongCalls;     // Pending limit orders
+    uint32 pendingShortCalls;
+    uint32 pendingLongPuts;
+    uint32 pendingShortPuts;
+}
 ```
-npx @layerzerolabs/hyperliquid-composer set-block --size big --network mainnet --private-key $PRIVATE_KEY
+
+### 6. Two-Phase Settlement
+To ensure fair social loss distribution:
+- **Phase 1**: Calculate PnL, debit losers immediately, store winners' PnL
+- **Phase 2**: Credit winners pro-rata based on available funds after accounting for bad debt
+
+### 7. Taker Queue System
+Unfilled market orders are queued in buckets corresponding to each market side, allowing them to be filled by incoming limit orders.
+
+### 8. Oracle Integration
+Uses a precompiled contract at address `0x0000000000000000000000000000000000000806` for price feeds, ensuring reliable and gas-efficient price updates.
+
+## Constants & Configuration
+
+```solidity
+uint256 constant TICK_SZ = 1e4;              // 0.01 USDT tick size
+uint256 constant MAX_OPEN_LIMIT_ORDERS = 256; // Max orders per user
+uint256 constant MM_BPS = 10;                 // 0.10% Maintenance Margin
+uint256 constant CONTRACT_SIZE = 100;         // Position size divisor
+int256 constant makerFeeBps = -200;          // -2.00% (rebate to makers)
+int256 constant takerFeeBps = 700;           // +7.00% (fee from takers)
+uint256 constant liquidationFeeBps = 10;     // 0.1% liquidation fee
+uint256 constant DEFAULT_EXPIRY = 1 minutes; // Cycle duration
 ```
 
-This will tell hypercore that any tx coming from signing wallet will be in slow block for hyperEVM. This needs some HYPE or USDC on **hyperCore** to work, as this tells the chain that the signing wallet is a "Core user".
+## Public/External Functions
 
-Run forge script:
+### Collateral Management
 
-```
-forge script script/Market.s.sol --broadcast
-```
+#### `depositCollateral(uint256 amount, bytes memory signature)`
+Deposits USDC collateral with whitelist signature verification.
+- **Parameters**: 
+  - `amount`: Amount of USDC to deposit (6 decimals)
+  - `signature`: Signature from whitelist signer to authorize the address
+- **Effects**: Adds user to whitelist and credits their balance
+- **Events**: `CollateralDeposited`
 
-Switch back to fast blocks with:
-```
-npx @layerzerolabs/hyperliquid-composer set-block --size small --network mainnet --private-key $PRIVATE_KEY
-```
+#### `depositCollateral(uint256 amount)`
+Deposits USDC collateral for already whitelisted users.
+- **Parameters**: `amount`: Amount of USDC to deposit
+- **Requirements**: User must be whitelisted
+- **Events**: `CollateralDeposited`
 
-Deployment is expensive. Deploying a proxy and the current Market implementation cost ~4.5m gas at 19 gwei, which was about $14
+#### `withdrawCollateral(uint256 amount)`
+Withdraws USDC collateral from the platform.
+- **Parameters**: `amount`: Amount to withdraw
+- **Requirements**: 
+  - User must have no open positions or orders
+  - Sufficient balance available
+- **Events**: `CollateralWithdrawn`
+
+### Trading Functions
+
+#### `long(uint256 size, uint256 cycleId)`
+Places a "long" position (buy call + sell put) for directional upward exposure.
+- **Parameters**:
+  - `size`: Number of contracts (scaled by CONTRACT_SIZE)
+  - `cycleId`: Target cycle (0 for current active cycle)
+- **Effects**: Places market orders for CALL_BUY and PUT_SELL
+- **Use Case**: Betting that price will go up
+
+#### `short(uint256 size, uint256 cycleId)`
+Places a "short" position (buy put + sell call) for directional downward exposure.
+- **Parameters**:
+  - `size`: Number of contracts
+  - `cycleId`: Target cycle (0 for current active cycle)
+- **Effects**: Places market orders for PUT_BUY and CALL_SELL
+- **Use Case**: Betting that price will go down
+
+#### `placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)`
+Places individual orders with full control over side and price.
+- **Parameters**:
+  - `side`: Market side (CALL_BUY, CALL_SELL, PUT_BUY, PUT_SELL)
+  - `size`: Order size
+  - `limitPrice`: Limit price (0 for market order)
+  - `cycleId`: Target cycle
+- **Returns**: Order ID
+- **Effects**: 
+  - Market orders: Immediately matched against orderbook, remainder queued
+  - Limit orders: Added to orderbook if not crossing
+
+#### `cancelOrder(uint256 orderId)`
+Cancels an existing limit order.
+- **Parameters**: `orderId`: ID of order to cancel
+- **Requirements**: 
+  - Market must be live
+  - Caller must own the order
+  - User cannot be liquidatable
+- **Effects**: Removes order from orderbook and updates position tracking
+- **Events**: `LimitOrderCancelled`
+
+### Risk Management
+
+#### `liquidate(address trader)`
+Liquidates an undercollateralized trader.
+- **Parameters**: `trader`: Address to liquidate
+- **Requirements**: 
+  - Market must be live
+  - Trader must be liquidatable (balance < required margin)
+- **Effects**:
+  - Cancels all maker orders
+  - Clears taker queue entries
+  - Places market orders to close net short positions
+  - Queues liquidation fee collection
+- **Events**: `Liquidated`
+
+#### `isLiquidatable(address trader)` / `isLiquidatable(address trader, uint64 price)`
+Checks if a trader can be liquidated.
+- **Parameters**: 
+  - `trader`: Address to check
+  - `price`: Oracle price (optional, fetches current if not provided)
+- **Returns**: Boolean indicating liquidation eligibility
+- **Formula**: `balance < requiredMargin(netShortExposure * maintenanceMargin + currentLoss)`
+
+### Cycle Management
+
+#### `startCycle()`
+Initiates a new 1-minute trading cycle.
+- **Requirements**:
+  - No active cycle, or active cycle is expired and settled
+  - Valid oracle price available
+- **Effects**:
+  - Creates new cycle with current timestamp + 1 minute as expiry
+  - Sets strike price to current oracle price
+  - Resets settlement state
+- **Events**: `CycleStarted`
+
+#### `settleChunk(uint256 max)`
+Processes settlement for a batch of traders.
+- **Parameters**: `max`: Maximum number of traders to process
+- **Two-Phase Process**:
+  - **Phase 1**: Calculate PnL, debit losers, accumulate winners' PnL
+  - **Phase 2**: Credit winners proportionally after social loss calculation
+- **Effects**: Updates trader balances and positions
+- **Events**: `PriceFixed`, `Settled`, `CycleSettled`
+
+## Settlement Mechanics
+
+### PnL Calculation
+For each trader, PnL is calculated based on the intrinsic value of their positions:
+
+**Call Options**: `max(settlementPrice - strikePrice, 0) * longCalls - max(settlementPrice - strikePrice, 0) * shortCalls`
+
+**Put Options**: `max(strikePrice - settlementPrice, 0) * longPuts - max(strikePrice - settlementPrice, 0) * shortPuts`
+
+### Social Loss Distribution
+When total losses exceed available collateral:
+1. **Phase 1**: Debit all losers immediately, accumulate total positive PnL
+2. **Phase 2**: Calculate loss ratio = `badDebt / totalPositivePnL`
+3. Credit winners: `winnerPnL * (1 - lossRatio)`
+
+### Fee Structure
+- **Maker Fee**: -2.00% (rebate - makers get paid)
+- **Taker Fee**: +7.00% (fee - takers pay)
+- **Liquidation Fee**: 0.1% of notional value being liquidated
+- **Net House Fee**: 5.00% (taker fee + maker rebate)
+
+## Risk Parameters
+
+### Margin Requirements
+- **Maintenance Margin**: 0.10% of strike notional value
+- **Buffer**: Current loss + maintenance margin on net short exposure
+- **Liquidation Trigger**: Balance < required margin
+
+### Position Limits
+- **Max Open Orders**: 256 limit orders per user
+- **No Position Limits**: Users can take unlimited size positions if they have sufficient collateral
+
+## Events
+
+The contract emits comprehensive events for all major operations:
+- `CycleStarted`, `CycleSettled`
+- `CollateralDeposited`, `CollateralWithdrawn`
+- `LimitOrderPlaced`, `LimitOrderFilled`, `LimitOrderCancelled`
+- `TakerOrderPlaced`, `TakerOrderRemaining`
+- `Liquidated`, `Settled`, `PriceFixed`
+
+## Security Features
+
+1. **Pausable**: Emergency pause functionality
+2. **Upgradeable**: UUPS proxy pattern for controlled upgrades
+3. **Access Control**: Owner-only functions for critical operations
+4. **Reentrancy Protection**: SafeERC20 for token transfers
+5. **Overflow Protection**: Solidity 0.8+ automatic overflow checks
+6. **Liquidation Protection**: Automatic liquidation prevents system insolvency 

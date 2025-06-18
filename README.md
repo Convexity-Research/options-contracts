@@ -86,21 +86,21 @@ uint256 constant DEFAULT_EXPIRY = 1 minutes; // Cycle duration
 ### Collateral Management
 
 #### `depositCollateral(uint256 amount, bytes memory signature)`
-Deposits USDC collateral with whitelist signature verification.
+Deposits USDT collateral with whitelist signature verification.
 - **Parameters**: 
-  - `amount`: Amount of USDC to deposit (6 decimals)
+  - `amount`: Amount of USDT to deposit (6 decimals)
   - `signature`: Signature from whitelist signer to authorize the address
 - **Effects**: Adds user to whitelist and credits their balance
 - **Events**: `CollateralDeposited`
 
 #### `depositCollateral(uint256 amount)`
-Deposits USDC collateral for already whitelisted users.
-- **Parameters**: `amount`: Amount of USDC to deposit
+Deposits USDT collateral for already whitelisted users.
+- **Parameters**: `amount`: Amount of USDT to deposit
 - **Requirements**: User must be whitelisted
 - **Events**: `CollateralDeposited`
 
 #### `withdrawCollateral(uint256 amount)`
-Withdraws USDC collateral from the platform.
+Withdraws USDT collateral from the platform.
 - **Parameters**: `amount`: Amount to withdraw
 - **Requirements**: 
   - User must have no open positions or orders
@@ -211,7 +211,6 @@ When total losses exceed available collateral:
 - **Maker Fee**: -2.00% (rebate - makers get paid)
 - **Taker Fee**: +7.00% (fee - takers pay)
 - **Liquidation Fee**: 0.1% of notional value being liquidated
-- **Net House Fee**: 5.00% (taker fee + maker rebate)
 
 ## Risk Parameters
 

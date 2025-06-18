@@ -8,7 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -18,7 +18,7 @@ contract Market is
   IMarket,
   Initializable,
   UUPSUpgradeable,
-  OwnableUpgradeable,
+  AccessControlUpgradeable,
   PausableUpgradeable,
   ERC2771ContextUpgradeable
 {
@@ -38,6 +38,10 @@ contract Market is
   uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
   uint256 constant denominator = 10_000;
   uint256 constant DEFAULT_EXPIRY = 1 minutes;
+
+  //------- Roles -------
+  bytes32 public constant GOV_ROLE = keccak256("GOV_ROLE");
+  bytes32 public constant SECURITY_COUNCIL_ROLE = keccak256("SECURITY_COUNCIL_ROLE");
 
   //------- Gasless TX -------
   address private _trustedForwarder;
@@ -144,17 +148,26 @@ contract Market is
     _disableInitializers();
   }
 
-  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder)
-    external
-    initializer
-  {
-    __Ownable_init(_msgSender());
+  function initialize(
+    string memory _name,
+    address _feeRecipient,
+    address _collateralToken,
+    address _forwarder,
+    address _gov,
+    address _securityCouncil
+  ) external initializer {
+    __AccessControl_init();
     __Pausable_init();
 
     name = _name;
     feeRecipient = _feeRecipient;
     collateralToken = _collateralToken;
     _trustedForwarder = _forwarder;
+
+    _grantRole(GOV_ROLE, _gov);
+    _grantRole(SECURITY_COUNCIL_ROLE, _securityCouncil);
+    _setRoleAdmin(GOV_ROLE, GOV_ROLE);
+    _setRoleAdmin(SECURITY_COUNCIL_ROLE, GOV_ROLE);
   }
 
   // #######################################################################
@@ -168,7 +181,7 @@ contract Market is
     _depositCollateral(amount, trader);
   }
 
-  function depositCollateral(uint256 amount) external {
+  function depositCollateral(uint256 amount) external onlyWhitelisted {
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
@@ -308,151 +321,6 @@ contract Market is
       // Phase 2: Credit winners pro-rata based on loss ratio
       _doPhase2(cycleId, max);
     }
-  }
-
-  function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal {
-    uint256 n = traders.length;
-    uint256 i = cursor;
-    uint256 upper = i + max;
-    if (upper > n) upper = n;
-
-    while (i < upper) {
-      address trader = traders[i];
-
-      // Charge liquidation fee, if any
-      _chargeLiquidationFee(trader);
-
-      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
-
-      UserAccount storage ua = userAccounts[trader];
-      if (pnl < 0) {
-        // Loser - debit immediately
-        uint256 debit = uint256(-pnl);
-        uint256 balance = ua.balance;
-        uint256 amountPaid = balance < debit ? balance : debit;
-
-        ua.balance -= uint64(amountPaid);
-        uint256 unpaid = debit - amountPaid;
-        badDebt += unpaid;
-
-        emit Settled(cycleId, trader, pnl);
-      } else if (pnl > 0) {
-        // Winner - store PnL for phase 2
-        ua.scratchPnL = uint64(uint256(pnl));
-        posSum += uint256(pnl);
-      }
-      // If pnl == 0, do nothing but still emit event
-      else {
-        emit Settled(cycleId, trader, 0);
-      }
-
-      _clearAllPositions(trader);
-
-      unchecked {
-        ++i;
-      }
-    }
-    cursor = i;
-
-    if (i == n) {
-      // Phase 1 complete - calculate loss ratio and prepare for phase 2
-      settlementPhase = true;
-      cursor = 0; // Reset cursor for phase 2
-    }
-  }
-
-  // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
-  function _chargeLiquidationFee(address trader) internal {
-    UserAccount storage ua = userAccounts[trader];
-    if (ua.liquidationFeeOwed > 0) {
-      uint256 fee = ua.liquidationFeeOwed;
-      uint256 pay = ua.balance < fee ? ua.balance : fee;
-      ua.balance -= uint64(pay);
-      ua.liquidationFeeOwed -= uint64(pay);
-      _applyCashDelta(feeRecipient, int256(pay));
-    }
-  }
-
-  function _doPhase2(uint256 cycleId, uint256 max) internal {
-    Cycle storage C = cycles[cycleId];
-    uint256 n = traders.length;
-    uint256 i = cursor;
-    uint256 upper = i + max;
-    if (upper > n) upper = n;
-
-    // Calculate loss ratio once (using 1e12 precision)
-    uint256 lossRatio;
-    if (posSum == 0) lossRatio = 1e12; // no winners
-
-    else if (badDebt >= posSum) lossRatio = 1e12; // losers can't cover → 100 %
-
-    else lossRatio = (badDebt * 1e12) / posSum; // proper fractional loss
-
-    while (i < upper) {
-      address trader = traders[i];
-      uint256 rawPnl = userAccounts[trader].scratchPnL;
-
-      if (rawPnl > 0) {
-        // Credit winner pro-rata
-        uint256 credit = rawPnl * (1e12 - lossRatio) / 1e12;
-        userAccounts[trader].balance += uint64(credit);
-
-        // Emit event with the actual credited amount (after social loss)
-        emit Settled(cycleId, trader, int256(credit));
-
-        userAccounts[trader].scratchPnL = 0; // Gas refund
-      }
-
-      unchecked {
-        ++i;
-      }
-    }
-    cursor = i;
-
-    if (i == n) {
-      // Phase 2 complete - clean up everything
-      delete traders;
-      delete takerQ;
-      delete tqHead;
-
-      cursor = 0;
-      posSum = 0;
-      badDebt = 0;
-      settlementPhase = false;
-      C.isSettled = true;
-      activeCycle = 0;
-
-      emit CycleSettled(cycleId);
-    }
-  }
-
-  function _calculateTraderPnl(uint256 cycleId, uint64 price, address trader) internal view returns (int256 pnl) {
-    UserAccount memory uaMem = userAccounts[trader];
-    if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) return 0;
-
-    /* intrinsic of calls */
-    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
-    if (diff > 0) {
-      // long calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
-    } else {
-      // short calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
-    }
-
-    /* intrinsic of puts (mirror) */
-    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
-    if (diff > 0) {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
-    } else {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
-    }
-
-    return pnl;
   }
 
   function startCycle() external {
@@ -1139,6 +1007,151 @@ contract Market is
     return ua.balance < _requiredMargin(trader, price, true);
   }
 
+  function _calculateTraderPnl(uint256 cycleId, uint64 price, address trader) internal view returns (int256 pnl) {
+    UserAccount memory uaMem = userAccounts[trader];
+    if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) return 0;
+
+    /* intrinsic of calls */
+    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
+    if (diff > 0) {
+      // long calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    } else {
+      // short calls win
+      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    }
+
+    /* intrinsic of puts (mirror) */
+    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
+    if (diff > 0) {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    } else {
+      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
+      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    }
+
+    return pnl;
+  }
+
+  function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal {
+    uint256 n = traders.length;
+    uint256 i = cursor;
+    uint256 upper = i + max;
+    if (upper > n) upper = n;
+
+    while (i < upper) {
+      address trader = traders[i];
+
+      // Charge liquidation fee, if any
+      _chargeLiquidationFee(trader);
+
+      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
+
+      UserAccount storage ua = userAccounts[trader];
+      if (pnl < 0) {
+        // Loser - debit immediately
+        uint256 debit = uint256(-pnl);
+        uint256 balance = ua.balance;
+        uint256 amountPaid = balance < debit ? balance : debit;
+
+        ua.balance -= uint64(amountPaid);
+        uint256 unpaid = debit - amountPaid;
+        badDebt += unpaid;
+
+        emit Settled(cycleId, trader, pnl);
+      } else if (pnl > 0) {
+        // Winner - store PnL for phase 2
+        ua.scratchPnL = uint64(uint256(pnl));
+        posSum += uint256(pnl);
+      }
+      // If pnl == 0, do nothing but still emit event
+      else {
+        emit Settled(cycleId, trader, 0);
+      }
+
+      _clearAllPositions(trader);
+
+      unchecked {
+        ++i;
+      }
+    }
+    cursor = i;
+
+    if (i == n) {
+      // Phase 1 complete - calculate loss ratio and prepare for phase 2
+      settlementPhase = true;
+      cursor = 0; // Reset cursor for phase 2
+    }
+  }
+
+  // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
+  function _chargeLiquidationFee(address trader) internal {
+    UserAccount storage ua = userAccounts[trader];
+    if (ua.liquidationFeeOwed > 0) {
+      uint256 fee = ua.liquidationFeeOwed;
+      uint256 pay = ua.balance < fee ? ua.balance : fee;
+      ua.balance -= uint64(pay);
+      ua.liquidationFeeOwed -= uint64(pay);
+      _applyCashDelta(feeRecipient, int256(pay));
+    }
+  }
+
+  function _doPhase2(uint256 cycleId, uint256 max) internal {
+    Cycle storage C = cycles[cycleId];
+    uint256 n = traders.length;
+    uint256 i = cursor;
+    uint256 upper = i + max;
+    if (upper > n) upper = n;
+
+    // Calculate loss ratio once (using 1e12 precision)
+    uint256 lossRatio;
+    if (posSum == 0) lossRatio = 1e12; // no winners
+
+    else if (badDebt >= posSum) lossRatio = 1e12; // losers can't cover → 100 %
+
+    else lossRatio = (badDebt * 1e12) / posSum; // proper fractional loss
+
+    while (i < upper) {
+      address trader = traders[i];
+      uint256 rawPnl = userAccounts[trader].scratchPnL;
+
+      if (rawPnl > 0) {
+        // Credit winner pro-rata
+        uint256 credit = rawPnl * (1e12 - lossRatio) / 1e12;
+        userAccounts[trader].balance += uint64(credit);
+
+        // Emit event with the actual credited amount (after social loss)
+        emit Settled(cycleId, trader, int256(credit));
+
+        userAccounts[trader].scratchPnL = 0; // Gas refund
+      }
+
+      unchecked {
+        ++i;
+      }
+    }
+    cursor = i;
+
+    if (i == n) {
+      // Phase 2 complete - clean up everything
+      delete traders;
+      delete takerQ;
+      delete tqHead;
+
+      cursor = 0;
+      posSum = 0;
+      badDebt = 0;
+      settlementPhase = false;
+      C.isSettled = true;
+      activeCycle = 0;
+
+      emit CycleSettled(cycleId);
+    }
+  }
+
   // #######################################################################
   // #                                                                     #
   // #             Other helpers and views                                 #
@@ -1151,10 +1164,6 @@ contract Market is
 
   function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
-  }
-
-  function setTrustedForwarder(address _forwarder) external onlyOwner {
-    _trustedForwarder = _forwarder;
   }
 
   function _msgSender() internal view override(ERC2771ContextUpgradeable, ContextUpgradeable) returns (address sender) {
@@ -1181,5 +1190,28 @@ contract Market is
     _;
   }
 
-  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+  // #######################################################################
+  // #                                                                     #
+  // #                       Admin functions                               #
+  // #                                                                     #
+  // #######################################################################
+
+  function setTrustedForwarder(address _forwarder) external onlyRole(GOV_ROLE) {
+    _trustedForwarder = _forwarder;
+  }
+
+  function pause() external onlyRole(SECURITY_COUNCIL_ROLE) {
+    _pause();
+  }
+
+  function unpause() external onlyRole(SECURITY_COUNCIL_ROLE) {
+    _unpause();
+  }
+
+  function _authorizeUpgrade(address newImplementation) internal override onlyRole(GOV_ROLE) {}
+
+  modifier onlyWhitelisted() {
+    require(whitelist[_msgSender()], "Not whitelisted");
+    _;
+  }
 }

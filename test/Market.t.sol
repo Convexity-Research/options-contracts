@@ -64,7 +64,10 @@ contract MarketSuite is Test {
 
     _mockOracle(btcPrice);
 
+    vm.recordLogs();
     mkt.startCycle();
+    Vm.Log[] memory entries = vm.getRecordedLogs();
+    cycleId = uint256(entries[0].topics[1]); // There's only one log emitted in startCycle
   }
 
   // #######################################################################

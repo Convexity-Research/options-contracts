@@ -10,7 +10,7 @@ contract StartCycleScript is Script {
     vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
 
     Market market = Market(0x32cce11f39f46b0a60c7D7656c1Dbd8620fC0Fd2);
-    market.startCycle(block.timestamp + 1 days);
+    market.startCycle();
 
     vm.stopBroadcast();
   }

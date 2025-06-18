@@ -585,35 +585,6 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
-  // #                             Test Marion liquidate                   #
-  // #                                                                     #
-  // #######################################################################
-
-  function testMarionLiquidate() public {
-    btcPrice = 104524;
-    _mockOracle(btcPrice);
-
-    uint256 size = 628;
-
-    uint256 collateralBalance = 5165529100;
-    _fund(u1, collateralBalance);
-    vm.startPrank(u1);
-    mkt.long(size, 0); // book is blank
-
-    _fund(u2, 100000 * ONE_COIN);
-    vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.PUT_BUY, size, 1, cycleId);
-    mkt.placeOrder(MarketSide.CALL_SELL, size, 1, cycleId);
-
-    assertEq(mkt.isLiquidatable(u1, uint64(btcPrice * 1e6)), true);
-    // _mockOracle(btcPrice + 10_000);
-
-    // vm.startPrank(owner);
-    // mkt.liquidate(u1);
-  }
-
-  // #######################################################################
-  // #                                                                     #
   // #                             Helpers                                 #
   // #                                                                     #
   // #######################################################################

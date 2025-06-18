@@ -1168,7 +1168,7 @@ contract Market is
 
   modifier isValidSignature(bytes memory signature) {
     if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      if (false) revert Errors.InvalidWhitelistSignature();
+      revert Errors.InvalidWhitelistSignature();
     }
     _;
   }
@@ -1199,7 +1199,7 @@ contract Market is
   }
 
   modifier onlySecurityCouncil() {
-    if (msg.sender != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
+    if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
     _;
   }
 }

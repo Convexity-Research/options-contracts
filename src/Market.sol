@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.30;
+pragma solidity 0.8.30;
 
 import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
@@ -8,7 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/metatx/ERC2771ContextUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -18,7 +18,7 @@ contract Market is
   IMarket,
   Initializable,
   UUPSUpgradeable,
-  AccessControlUpgradeable,
+  OwnableUpgradeable,
   PausableUpgradeable,
   ERC2771ContextUpgradeable
 {
@@ -38,16 +38,13 @@ contract Market is
   uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
   uint256 constant denominator = 10_000;
   uint256 constant DEFAULT_EXPIRY = 1 minutes;
-
-  //------- Roles -------
-  bytes32 public constant GOV_ROLE = keccak256("GOV_ROLE");
-  bytes32 public constant SECURITY_COUNCIL_ROLE = keccak256("SECURITY_COUNCIL_ROLE");
+  address constant SECURITY_COUNCIL = 0xAd8997fAaAc3DA36CA0aA88a0AAf948A6C3a5338;
 
   //------- Gasless TX -------
   address private _trustedForwarder;
 
   //------- Whitelist -------
-  address private constant WHITELIST_SIGNER = 0x1FaE1550229fE09ef3e266d8559acdcFC154e72f;
+  address private constant WHITELIST_SIGNER = 0x988EeB53b37f5418aCdaD66cF09B60991ED01f45;
   mapping(address => bool) public whitelist;
 
   //------- user account -------
@@ -148,26 +145,17 @@ contract Market is
     _disableInitializers();
   }
 
-  function initialize(
-    string memory _name,
-    address _feeRecipient,
-    address _collateralToken,
-    address _forwarder,
-    address _gov,
-    address _securityCouncil
-  ) external initializer {
-    __AccessControl_init();
+  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder)
+    external
+    initializer
+  {
+    __Ownable_init(_msgSender());
     __Pausable_init();
 
     name = _name;
     feeRecipient = _feeRecipient;
     collateralToken = _collateralToken;
     _trustedForwarder = _forwarder;
-
-    _grantRole(GOV_ROLE, _gov);
-    _grantRole(SECURITY_COUNCIL_ROLE, _securityCouncil);
-    _setRoleAdmin(GOV_ROLE, GOV_ROLE);
-    _setRoleAdmin(SECURITY_COUNCIL_ROLE, GOV_ROLE);
   }
 
   // #######################################################################
@@ -175,23 +163,23 @@ contract Market is
   // #                  Public functions                                   #
   // #                                                                     #
   // #######################################################################
-  function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) {
+  function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) whenNotPaused {
     address trader = _msgSender();
     whitelist[trader] = true;
     _depositCollateral(amount, trader);
   }
 
-  function depositCollateral(uint256 amount) external onlyWhitelisted {
+  function depositCollateral(uint256 amount) external onlyWhitelisted whenNotPaused {
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external {
+  function withdrawCollateral(uint256 amount) external whenNotPaused {
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size, uint256 cycleId) external {
+  function long(uint256 size, uint256 cycleId) external whenNotPaused {
     if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
     address trader = _msgSender();
 
@@ -199,7 +187,7 @@ contract Market is
     _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
   }
 
-  function short(uint256 size, uint256 cycleId) external {
+  function short(uint256 size, uint256 cycleId) external whenNotPaused {
     if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
     address trader = _msgSender();
 
@@ -209,6 +197,7 @@ contract Market is
 
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
     external
+    whenNotPaused
     returns (uint256 orderId)
   {
     if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
@@ -217,13 +206,13 @@ contract Market is
     return 0;
   }
 
-  function cancelOrder(uint256 orderId) external {
-    require(_isMarketLive(), "Market not live");
+  function cancelOrder(uint256 orderId) external whenNotPaused {
     address trader = _msgSender();
-    require(!isLiquidatable(trader, _getOraclePrice()), "Cannot cancel order while liquidatable");
+    if (isLiquidatable(trader, _getOraclePrice())) revert Errors.TraderLiquidatable();
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
 
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
-    require(M.trader == trader, "Not owner");
+    if (M.trader != trader) revert Errors.NotOrderOwner();
 
     uint32 tickKey = M.key;
     Level storage L = ob[activeCycle].levels[tickKey];
@@ -254,7 +243,7 @@ contract Market is
     else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint32(M.size);
     else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint32(M.size);
     else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint32(M.size);
-    else revert("Invalid side");
+    else revert();
 
     // Remove from user's order tracking
     _removeOrderFromTracking(M.trader, uint32(orderId));
@@ -263,10 +252,10 @@ contract Market is
     delete makerNodes[uint32(orderId)];
   }
 
-  function liquidate(address trader) external {
-    require(_isMarketLive(), "Market not live");
+  function liquidate(address trader) external whenNotPaused {
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
     uint64 price = _getOraclePrice();
-    require(isLiquidatable(trader, price), "Not liquidatable");
+    if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     // Cancel all maker orders
     uint32[] memory orderIds = userOrders[trader];
@@ -300,19 +289,19 @@ contract Market is
     emit Liquidated(activeCycle, trader);
   }
 
-  function settleChunk(uint256 max) external {
+  function settleChunk(uint256 max) external whenNotPaused {
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
     uint64 settlementPrice = C.settlementPrice;
 
     if (settlementPrice == 0) {
-      require(block.timestamp >= activeCycle, "Not expired");
+      if (block.timestamp < activeCycle) revert Errors.NotExpired();
       settlementPrice = _getOraclePrice();
       C.settlementPrice = settlementPrice;
       emit PriceFixed(activeCycle, settlementPrice);
     }
 
-    require(!C.isSettled, "Cycle already settled");
+    if (C.isSettled) revert Errors.CycleAlreadySettled();
 
     if (!settlementPhase) {
       // Phase 1: Calculate PnL, debit losers immediately, store winners' PnL
@@ -323,18 +312,12 @@ contract Market is
     }
   }
 
-  function startCycle() external {
+  function startCycle() external whenNotPaused {
     uint256 expiry = block.timestamp + DEFAULT_EXPIRY;
-    if (activeCycle != 0) {
-      // If there is an active cycle, it must be in the past
-      require(activeCycle < block.timestamp, "Cycle already started");
-
-      // The previous cycle must be settled
-      require(cycles[activeCycle].isSettled, "Previous cycle not settled");
-    }
+    if (activeCycle != 0) revert Errors.CycleActive();
 
     uint64 price = _getOraclePrice();
-    require(price != 0, "Invalid oracle price");
+    if (price == 0) revert Errors.OraclePriceCallFailed();
 
     // Create new market
     cycles[expiry] = Cycle({
@@ -355,7 +338,7 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function _depositCollateral(uint256 amount, address trader) private {
-    require(amount > 0, "Invalid amount");
+    if (amount == 0) revert Errors.InvalidAmount();
 
     IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
     unchecked {
@@ -367,11 +350,11 @@ contract Market is
   }
 
   function _withdrawCollateral(uint256 amount, address trader) private {
-    require(amount > 0, "Invalid amount");
-    require(!_hasOpenPositionsOrOrders(trader), "In trader list");
+    if (amount == 0) revert Errors.InvalidAmount();
+    if (_hasOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
 
     uint256 balance = userAccounts[trader].balance;
-    require(balance >= amount, "Insufficient balance");
+    if (balance < amount) revert Errors.InsufficientBalance();
 
     unchecked {
       // We check amount above, and this saves some gas + code size
@@ -389,9 +372,9 @@ contract Market is
     uint256 limitPrice, // 0 = market
     address trader
   ) private {
-    require(_isMarketLive(), "Market not live");
-    require(!userAccounts[trader].liquidationQueued, "Account in liquidation");
-    require(size > 0, "Invalid amount");
+    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
+    if (size == 0) revert Errors.InvalidAmount();
 
     // Convert price to tick
     uint256 tick = limitPrice / TICK_SZ; // 1 tick = 0.01 USDT0
@@ -410,7 +393,7 @@ contract Market is
     }
 
     if (userAccounts[trader].balance < _requiredMargin(trader, _getOraclePrice(), false)) {
-      require(false, "Insufficient balance");
+      revert Errors.InsufficientBalance();
     }
 
     if (!userAccounts[trader].activeInCycle) {
@@ -807,7 +790,7 @@ contract Market is
 
   function _getOraclePrice() internal view returns (uint64) {
     (bool success, bytes memory result) = MARK_PX_PRECOMPILE.staticcall(abi.encode(0));
-    require(success, "Oracle price call failed");
+    if (!success) revert Errors.OraclePriceCallFailed();
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
     return price;
@@ -830,7 +813,7 @@ contract Market is
   }
 
   function _key(uint32 tick, MarketSide side) internal pure returns (uint32) {
-    require(tick < 1 << 24, "Tick too large");
+    if (tick >= 1 << 24) revert Errors.TickTooLarge();
     return tick | (_isPut(side) ? 1 << 31 : 0) | (_isBuy(side) ? 1 << 30 : 0);
   }
 
@@ -943,7 +926,7 @@ contract Market is
       userAccounts[user].balance += uint64(uint256(delta));
     } else if (delta < 0) {
       uint256 absVal = uint256(-delta);
-      require(userAccounts[user].balance >= absVal, "Insufficient balance");
+      if (userAccounts[user].balance < absVal) revert Errors.InsufficientBalance();
       userAccounts[user].balance -= uint64(absVal);
     }
   }
@@ -1185,7 +1168,7 @@ contract Market is
 
   modifier isValidSignature(bytes memory signature) {
     if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      require(false, "Invalid signature");
+      if (false) revert Errors.InvalidWhitelistSignature();
     }
     _;
   }
@@ -1196,22 +1179,27 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  function setTrustedForwarder(address _forwarder) external onlyRole(GOV_ROLE) {
+  function setTrustedForwarder(address _forwarder) external onlyOwner {
     _trustedForwarder = _forwarder;
   }
 
-  function pause() external onlyRole(SECURITY_COUNCIL_ROLE) {
+  function pause() external onlySecurityCouncil {
     _pause();
   }
 
-  function unpause() external onlyRole(SECURITY_COUNCIL_ROLE) {
+  function unpause() external onlySecurityCouncil {
     _unpause();
   }
 
-  function _authorizeUpgrade(address newImplementation) internal override onlyRole(GOV_ROLE) {}
+  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
   modifier onlyWhitelisted() {
-    require(whitelist[_msgSender()], "Not whitelisted");
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
+    _;
+  }
+
+  modifier onlySecurityCouncil() {
+    if (msg.sender != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
     _;
   }
 }

@@ -30,10 +30,12 @@ contract MarketSuite is Test {
   TransparentUpgradeableProxy proxy;
   MarketWithViews mkt;
 
-  address public owner = makeAddr("owner");
-  address public u1 = makeAddr("user1");
-  address public u2 = makeAddr("user2");
+  address owner = makeAddr("owner");
+  address u1 = makeAddr("user1");
+  address u2 = makeAddr("user2");
   address feeSink = makeAddr("feeSink");
+  address gov = makeAddr("gov");
+  address securityCouncil = makeAddr("securityCouncil");
   address signer;
   uint256 signerKey;
 
@@ -53,8 +55,9 @@ contract MarketSuite is Test {
     proxyAdmin = new ProxyAdmin(owner);
 
     // Init data
-    bytes memory initData =
-      abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt), address(0));
+    bytes memory initData = abi.encodeWithSelector(
+      Market.initialize.selector, "BTC", feeSink, address(usdt), address(0), gov, securityCouncil
+    );
 
     // Proxy
     proxy = new TransparentUpgradeableProxy(address(implementation), address(proxyAdmin), initData);

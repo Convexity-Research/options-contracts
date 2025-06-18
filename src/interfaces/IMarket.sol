@@ -37,17 +37,19 @@ struct TakerQ {
 
 interface IMarket {
   function name() external view returns (string memory);
-  // function startCycle(uint256 expiry) external;
-  // function activeCycle() external view returns (uint256);
+  function startCycle() external;
+  function activeCycle() external view returns (uint256);
 
-  // function depositCollateral(uint256 amount) external;
-  // function withdrawCollateral(uint256 amount) external;
+  function depositCollateral(uint256 amount) external;
+  function withdrawCollateral(uint256 amount) external;
 
-  // function placeOrder(OptionType option, Side side, uint256 size, uint256 limitPrice)
-  //   external
-  //   returns (uint256 orderId);
-  // function cancelOrder(uint256 orderId) external;
+  function long(uint256 size, uint256 cycleId) external;
+  function short(uint256 size, uint256 cycleId) external;
+  function cancelOrder(uint256 orderId) external;
+  function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
+    external
+    returns (uint256 orderId);
 
-  // function liquidate(uint256[] calldata orderIds, address trader) external;
-  // function settle(uint256 cycleId) external;
+  function liquidate(address trader) external;
+  function settleChunk(uint256 max) external;
 }

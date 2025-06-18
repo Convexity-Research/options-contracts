@@ -608,7 +608,6 @@ contract MarketSuite is Test {
     assertEq(mkt.isLiquidatable(u1, uint64(btcPrice * 1e6)), true);
     // _mockOracle(btcPrice + 10_000);
 
-
     // vm.startPrank(owner);
     // mkt.liquidate(u1);
   }

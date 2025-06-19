@@ -156,6 +156,7 @@ contract Market is
     feeRecipient = _feeRecipient;
     collateralToken = _collateralToken;
     _trustedForwarder = _forwarder;
+    _pause();
   }
 
   // #######################################################################

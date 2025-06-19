@@ -44,9 +44,8 @@ contract MarketSuite is Test {
     implementation = new MarketWithViews();
 
     // Init data
-    bytes memory initData = abi.encodeWithSelector(
-      Market.initialize.selector, "BTC", feeSink, address(usdt), address(0), gov, securityCouncil
-    );
+    bytes memory initData =
+      abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt), address(0), gov);
 
     // Proxy
     proxy = new ERC1967Proxy(address(implementation), initData);

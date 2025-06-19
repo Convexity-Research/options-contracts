@@ -145,11 +145,14 @@ contract Market is
     _disableInitializers();
   }
 
-  function initialize(string memory _name, address _feeRecipient, address _collateralToken, address _forwarder)
-    external
-    initializer
-  {
-    __Ownable_init(_msgSender());
+  function initialize(
+    string memory _name,
+    address _feeRecipient,
+    address _collateralToken,
+    address _forwarder,
+    address _governance
+  ) external initializer {
+    __Ownable_init(_governance);
     __Pausable_init();
 
     name = _name;

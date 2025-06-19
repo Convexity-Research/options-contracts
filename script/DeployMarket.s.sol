@@ -13,15 +13,15 @@ contract DeployUUPSProxy is Script {
   address usdt0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb;
   address forwarder = 0x9508120e06403E779088412A13bBa578edffD766;
   address feeRecipient = 0x17f8dec583Ab9af5De05FBBb4d4C2bfE767A0AC3;
-  Deployer contractDeployer = Deployer(0x9040B84350B16712E042a6f751dCa1C846B341B6);
+  Deployer contractDeployer = Deployer(0x93DE98a29020d46CF60d7Cf1c5a5Cd1d01F351bC);
 
-  bytes32 salt = 0x7718f518a3c20e84d1ac1cc1a610c6665d19ae8c93b0af4c7e56d503bcbc0586;
+  bytes32 salt = 0x27c44ac2208d5cceecce6399980bd5e843ab9f9ccaeade1d7c69087cad74d2b0;
   // address will be 0xB7C60aaa12Ab90731f3632d32945ED0459baDfE0
 
   function run() external {
     vm.createSelectFork("hyperevm");
     vm.startBroadcast(vm.envUint("OPT_FUN_DEPLOYER"));
-    address optFunDeployer = 0xc6Be45368F9d89A782001c059E52dCdad95D956d;
+    address optFunDeployer = vm.addr(vm.envUint("OPT_FUN_DEPLOYER"));
 
     console.log("Deploying with account:", optFunDeployer);
     console.log("Account balance:", optFunDeployer.balance);

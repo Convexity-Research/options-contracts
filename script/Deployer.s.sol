@@ -15,6 +15,5 @@ contract DeployerScript is Script {
 
     Deployer contractDeployer = new Deployer();
     console.log("Deployer deployed at:", address(contractDeployer));
-
   }
 }

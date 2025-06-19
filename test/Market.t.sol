@@ -591,6 +591,56 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
+  // #                          Scale Tests!!                              #
+  // #                                                                     #
+  // #######################################################################
+  // Use this test to manually chekc gas usage
+  function testMaxSettleChunk() public {
+    // Generate 200 users with random limit orders
+    uint256 numUsers = 1000;
+    uint256 collateralPerUser = 1000 * ONE_COIN; // 1000 USDT per user
+    uint256 maxOrderSize = 5; // Single digit order sizes to avoid margin issues
+    // Create users and place random orders
+    for (uint256 i = 0; i < numUsers; i++) {
+      address user = address(uint160(1000 + i)); // Generate unique addresses
+      _whitelistAddress(user);
+      _fund(user, collateralPerUser);
+      // Place 1-3 random limit orders per user
+      uint256 numOrders = (i % 3) + 1; // 1, 2, or 3 orders per user
+      for (uint256 j = 0; j < numOrders; j++) {
+        vm.startPrank(user);
+        // Random order parameters
+        uint256 orderSize = (i + j) % maxOrderSize + 1; // 1-5 contracts
+        MarketSide side = MarketSide((i + j) % 4); // Random market side
+        uint256 price = ONE_COIN + ((i + j) % 10) * ONE_COIN; // Random price between 1-100 USDT
+        mkt.placeOrder(side, orderSize, price, cycleId);
+        vm.stopPrank();
+      }
+    }
+    // Verify we have users in the system
+    assertEq(mkt.getNumTraders(), numUsers, "Incorrect number of traders");
+    // Fast forward to expiry
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 50); // Small price move for settlement
+    // Test settlement with small chunk size
+    uint256 chunkSize = 100; // Small chunk size for testing
+    // Phase 1: Calculate PnL and debit losers
+    mkt.settleChunk(chunkSize);
+    mkt.settleChunk(chunkSize);
+    // Continue phase 1 until complete
+    while (mkt.activeCycle() != 0) {
+      mkt.settleChunk(chunkSize);
+    }
+    // Verify cycle is settled
+    (bool settled,,) = mkt.cycles(cycleId);
+    assertTrue(settled, "Cycle should be settled");
+    assertEq(mkt.activeCycle(), 0, "Active cycle should be 0");
+    // Verify all traders have been processed
+    assertEq(mkt.getNumTraders(), 0, "All traders should be processed");
+  }
+
+  // #######################################################################
+  // #                                                                     #
   // #                             Helpers                                 #
   // #                                                                     #
   // #######################################################################

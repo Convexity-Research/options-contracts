@@ -1120,7 +1120,7 @@ contract Market is
 
     if (i == n) {
       // Phase 2 complete - clean up everything
-      delete traders;
+      assembly { sstore(traders.slot, 0) }
       delete takerQ;
       delete tqHead;
 

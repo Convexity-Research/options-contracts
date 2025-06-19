@@ -44,8 +44,6 @@ contract MarketSuite is Test {
   uint256 cycleId;
 
   function setUp() public {
-    signerKey = 0x17edc1e22b2fa63800979f12e31f4df4e5966edfa8205456f169ea8b2112dd49;
-    signer = 0x1FaE1550229fE09ef3e266d8559acdcFC154e72f;
     usdt = new Token("USDT0", "USDT0"); // 6-dec mock
 
     implementation = new MarketWithViews();
@@ -71,6 +69,9 @@ contract MarketSuite is Test {
     mkt.startCycle();
     Vm.Log[] memory entries = vm.getRecordedLogs();
     cycleId = uint256(entries[0].topics[1]); // There's only one log emitted in startCycle
+
+    _whitelistAddress(u1);
+    _whitelistAddress(u2);
   }
 
   // #######################################################################
@@ -598,9 +599,8 @@ contract MarketSuite is Test {
     deal(address(usdt), who, amount);
     vm.startPrank(who);
     usdt.approve(address(mkt), type(uint256).max);
-    bytes memory signature = _createSignature(who);
     vm.startPrank(who);
-    mkt.depositCollateral(amount, signature);
+    mkt.depositCollateral(amount);
   }
 
   function _tick(uint256 p) internal pure returns (uint32) {
@@ -609,12 +609,6 @@ contract MarketSuite is Test {
 
   function _key(uint32 t, bool put, bool bid) internal pure returns (uint32) {
     return t | (put ? 1 << 31 : 0) | (bid ? 1 << 30 : 0);
-  }
-
-  function _createSignature(address user) internal view returns (bytes memory) {
-    bytes32 messageHash = keccak256(abi.encodePacked(user));
-    (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, messageHash);
-    return abi.encodePacked(r, s, v);
   }
 
   // helper: open a 1-contract CALL long/short pair at 1 USDT premium
@@ -668,5 +662,10 @@ contract MarketSuite is Test {
       abi.encodeWithSelector(0x00000000),
       abi.encode(price * 10) // Oracle and Mark price feeds return with 1 decimal when reading L1 from HyperEVM
     );
+  }
+
+  function _whitelistAddress(address user) internal {
+    bytes32 slot = keccak256(abi.encode(user, uint256(4)));
+    vm.store(address(mkt), slot, bytes32(uint256(1)));
   }
 }

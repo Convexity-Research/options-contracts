@@ -554,17 +554,17 @@ contract MarketSuite is Test {
 
     uint32 tick = _tick(price);
     (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
-    
+
     // Test summary (L1) bitmap - should have bit l1 set
     assertTrue((mkt.summaries(uint256(side)) & BitScan.mask(l1)) != 0, "Summary bit not set");
-    
+
     // Test mid (L2) bitmap - should have bit l2 set in mid[l1]
     assertTrue((mkt.mids(side, l1) & BitScan.mask(l2)) != 0, "Mid bit not set");
-    
+
     // Test detail (L3) bitmap - should have bit l3 set in det[l1][l2]
     uint16 detKey = (uint16(l1) << 8) | l2;
     assertTrue((mkt.dets(side, detKey) & BitScan.mask(l3)) != 0, "Detail bit not set");
-    
+
     // Test level volume
     uint32 key = _key(tick, _isPut(side), _isBuy(side));
     Level memory lvl = mkt.levels(key);

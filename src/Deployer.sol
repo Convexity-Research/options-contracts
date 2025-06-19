@@ -26,6 +26,9 @@ contract Deployer is Ownable {
     bytes memory initialize = abi.encodeWithSelector(Market.initialize.selector, name, feeRecipient, usdt0, forwarder);
 
     address proxy = _deploy(salt, implementation, initialize);
+
+    Market(proxy).transferOwnership(owner());
+
     return proxy;
   }
 

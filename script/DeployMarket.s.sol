@@ -15,8 +15,8 @@ contract DeployUUPSProxy is Script {
   address feeRecipient = 0x17f8dec583Ab9af5De05FBBb4d4C2bfE767A0AC3;
   Deployer contractDeployer = Deployer(0x93DE98a29020d46CF60d7Cf1c5a5Cd1d01F351bC);
 
-  bytes32 salt = 0x27c44ac2208d5cceecce6399980bd5e843ab9f9ccaeade1d7c69087cad74d2b0;
-  // address will be 0xB7C60aaa12Ab90731f3632d32945ED0459baDfE0
+  bytes32 salt = 0x93814d313083c0991a51c8a7d1d25b64bf50420350872e2119df79e1e1e0ae92;
+  // address will be 0xB7C609cFfa0e47DB2467ea03fF3e598bF59361A5
 
   function run() external {
     vm.createSelectFork("hyperevm");

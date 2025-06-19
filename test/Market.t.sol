@@ -599,7 +599,6 @@ contract MarketSuite is Test {
     deal(address(usdt), who, amount);
     vm.startPrank(who);
     usdt.approve(address(mkt), type(uint256).max);
-    vm.startPrank(who);
     mkt.depositCollateral(amount);
   }
 

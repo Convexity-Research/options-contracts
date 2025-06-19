@@ -30,7 +30,7 @@ contract Market is
   address public collateralToken;
   uint256 constant collateralDecimals = 6;
   address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
-  uint256 constant TICK_SZ = 1e4; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
+  uint256 constant TICK_SZ = 1e2; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 constant makerFeeBps = -200; // -2.00 %, basis points. Negative means its a fee rebate, so pay out to makers
@@ -1124,7 +1124,9 @@ contract Market is
 
     if (i == n) {
       // Phase 2 complete - clean up everything
-      assembly { sstore(traders.slot, 0) }
+      assembly {
+        sstore(traders.slot, 0)
+      }
       delete takerQ;
       delete tqHead;
 

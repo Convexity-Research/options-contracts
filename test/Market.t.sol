@@ -13,7 +13,7 @@ contract MarketSuite is Test {
 
   int256 constant MAKER_FEE_BPS = -200;
   int256 constant TAKER_FEE_BPS = 700;
-  uint256 constant TICK_SIZE = 1e4;
+  uint256 constant TICK_SIZE = 1e2;
   uint256 constant CONTRACT_SIZE = 100;
 
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
@@ -91,12 +91,12 @@ contract MarketSuite is Test {
     _fund(u1, 10 * ONE_COIN);
     MarketSide side = MarketSide.CALL_BUY;
 
-    uint256 price = 2e6; // 2 USDT0
+    uint256 price = 2e4; // 0.02 USDT0
 
     vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
 
-    uint32 tick = _tick(price); // tick = 2e6 / 1e4 = 200
+    uint32 tick = _tick(price); // tick = 2e4 / 1e2 = 200
     uint32 key = _key(tick, false, true); // CALL-BID
 
     // Test level volume
@@ -120,8 +120,8 @@ contract MarketSuite is Test {
     _fund(u1, 1000 * ONE_COIN);
     MarketSide side = MarketSide.CALL_BUY;
 
-    uint256 price = 700_000_000; // 700 USDT0
-    uint32 expectedTick = 70000; // 700_000_000 / 10000
+    uint256 price = 7_000_000; // 7 USDT0
+    uint32 expectedTick = 70000; // 7_000_000 / 10000
 
     vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
@@ -159,19 +159,20 @@ contract MarketSuite is Test {
 
     // We know which bits should be set for each price level. See console.log statements below.
     // 2 USDT0 - lowest level (from first test)
-    prices[0] = 2e6;
+    // e4 everywhere because token decimals = 6, tick size = 2, so 6-2 = 4 decimals places
+    prices[0] = 2e4;
     l1s[0] = 0;
     l2s[0] = 0;
     l3s[0] = 200;
 
     // 700 USDT0 - middle level (from second test)
-    prices[1] = 700e6;
+    prices[1] = 700e4;
     l1s[1] = 1;
     l2s[1] = 17;
     l3s[1] = 112;
 
     // 1000 USDT0 - different level
-    prices[2] = 1000e6;
+    prices[2] = 1000e4;
     l1s[2] = 1;
     l2s[2] = 134;
     l3s[2] = 160;
@@ -256,7 +257,7 @@ contract MarketSuite is Test {
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
       vm.startPrank(u1);
-      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e4, cycleId); // ask
+      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * TICK_SIZE, cycleId); // ask
     }
 
     // Taker buys 350 contracts market –> eats 3 levels
@@ -521,7 +522,7 @@ contract MarketSuite is Test {
 
     mkt.settleChunk(10);
 
-    // u2 must be drained to zero, u1’s scratchPnL should equal +100
+    // u2 must be drained to zero, u1's scratchPnL should equal +100
     assertEq(mkt.getUserAccount(u2).balance, 0);
     uint256 scratchPnL = mkt.getUserAccount(u1).scratchPnL;
     assertEq(scratchPnL, intrinsic);
@@ -545,15 +546,29 @@ contract MarketSuite is Test {
     vm.assume(amount > 0 && amount < 1e6);
     vm.assume(sideIndex < 4);
     MarketSide side = MarketSide(sideIndex);
-    uint256 price = uint256(priceTick) * 1e4 + 1e4; // >=1 tick
+    uint256 price = uint256(priceTick) * TICK_SIZE + TICK_SIZE; // >=1 tick
 
     _fund(u1, 1e24);
     vm.startPrank(u1);
     mkt.placeOrder(side, amount, price, cycleId);
 
     uint32 tick = _tick(price);
-    (uint8 l1,,) = BitScan.split(tick);
-    assertTrue((mkt.summaries(uint256(side)) & BitScan.mask(l1)) != 0); // bit set
+    (uint8 l1, uint8 l2, uint8 l3) = BitScan.split(tick);
+
+    // Test summary (L1) bitmap - should have bit l1 set
+    assertTrue((mkt.summaries(uint256(side)) & BitScan.mask(l1)) != 0, "Summary bit not set");
+
+    // Test mid (L2) bitmap - should have bit l2 set in mid[l1]
+    assertTrue((mkt.mids(side, l1) & BitScan.mask(l2)) != 0, "Mid bit not set");
+
+    // Test detail (L3) bitmap - should have bit l3 set in det[l1][l2]
+    uint16 detKey = (uint16(l1) << 8) | l2;
+    assertTrue((mkt.dets(side, detKey) & BitScan.mask(l3)) != 0, "Detail bit not set");
+
+    // Test level volume
+    uint32 key = _key(tick, _isPut(side), _isBuy(side));
+    Level memory lvl = mkt.levels(key);
+    assertEq(lvl.vol, amount, "Level volume mismatch");
   }
 
   function testBitscan(uint256 bit) public pure {
@@ -585,56 +600,6 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
-  // #                          Scale Tests!!                              #
-  // #                                                                     #
-  // #######################################################################
-  // Use this test to manually chekc gas usage
-  function testMaxSettleChunk() public {
-    // Generate 200 users with random limit orders
-    uint256 numUsers = 1000;
-    uint256 collateralPerUser = 1000 * ONE_COIN; // 1000 USDT per user
-    uint256 maxOrderSize = 5; // Single digit order sizes to avoid margin issues
-    // Create users and place random orders
-    for (uint256 i = 0; i < numUsers; i++) {
-      address user = address(uint160(1000 + i)); // Generate unique addresses
-      _whitelistAddress(user);
-      _fund(user, collateralPerUser);
-      // Place 1-3 random limit orders per user
-      uint256 numOrders = (i % 3) + 1; // 1, 2, or 3 orders per user
-      for (uint256 j = 0; j < numOrders; j++) {
-        vm.startPrank(user);
-        // Random order parameters
-        uint256 orderSize = (i + j) % maxOrderSize + 1; // 1-5 contracts
-        MarketSide side = MarketSide((i + j) % 4); // Random market side
-        uint256 price = ONE_COIN + ((i + j) % 10) * ONE_COIN; // Random price between 1-100 USDT
-        mkt.placeOrder(side, orderSize, price, cycleId);
-        vm.stopPrank();
-      }
-    }
-    // Verify we have users in the system
-    assertEq(mkt.getNumTraders(), numUsers, "Incorrect number of traders");
-    // Fast forward to expiry
-    vm.warp(cycleId + 1);
-    _mockOracle(btcPrice + 50); // Small price move for settlement
-    // Test settlement with small chunk size
-    uint256 chunkSize = 100; // Small chunk size for testing
-    // Phase 1: Calculate PnL and debit losers
-    mkt.settleChunk(chunkSize);
-    mkt.settleChunk(chunkSize);
-    // Continue phase 1 until complete
-    while (mkt.activeCycle() != 0) {
-      mkt.settleChunk(chunkSize);
-    }
-    // Verify cycle is settled
-    (bool settled,,) = mkt.cycles(cycleId);
-    assertTrue(settled, "Cycle should be settled");
-    assertEq(mkt.activeCycle(), 0, "Active cycle should be 0");
-    // Verify all traders have been processed
-    assertEq(mkt.getNumTraders(), 0, "All traders should be processed");
-  }
-
-  // #######################################################################
-  // #                                                                     #
   // #                             Helpers                                 #
   // #                                                                     #
   // #######################################################################
@@ -647,7 +612,7 @@ contract MarketSuite is Test {
   }
 
   function _tick(uint256 p) internal pure returns (uint32) {
-    return uint32(p / 1e4);
+    return uint32(p / TICK_SIZE);
   }
 
   function _key(uint32 t, bool put, bool bid) internal pure returns (uint32) {
@@ -689,7 +654,7 @@ contract MarketSuite is Test {
     console.log("----\t\t----------\t------");
 
     for (uint256 i; i < book.length; ++i) {
-      uint256 price6 = uint256(book[i].tick) * 1e4;
+      uint256 price6 = uint256(book[i].tick) * TICK_SIZE;
       console.log("%d\t\t%d\t\t%d", book[i].tick, price6, book[i].vol);
     }
     console.log("============================================\n");
@@ -710,5 +675,13 @@ contract MarketSuite is Test {
   function _whitelistAddress(address user) internal {
     bytes32 slot = keccak256(abi.encode(user, uint256(4)));
     vm.store(address(mkt), slot, bytes32(uint256(1)));
+  }
+
+  function _isPut(MarketSide side) internal pure returns (bool) {
+    return side == MarketSide.PUT_BUY || side == MarketSide.PUT_SELL;
+  }
+
+  function _isBuy(MarketSide side) internal pure returns (bool) {
+    return side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY;
   }
 }

@@ -6,11 +6,7 @@ import "forge-std/StdUtils.sol";
 import "./mocks/MarketWithViews.sol";
 import {BitScan} from "../src/lib/Bitscan.sol";
 import {Token} from "./mocks/Token.sol";
-import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
-import {
-  TransparentUpgradeableProxy,
-  ITransparentUpgradeableProxy
-} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract MarketSuite is Test {
   using BitScan for uint256;
@@ -26,8 +22,7 @@ contract MarketSuite is Test {
   Token usdt; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
 
   MarketWithViews implementation;
-  ProxyAdmin proxyAdmin;
-  TransparentUpgradeableProxy proxy;
+  ERC1967Proxy proxy;
   MarketWithViews mkt;
 
   address owner = makeAddr("owner");
@@ -35,7 +30,7 @@ contract MarketSuite is Test {
   address u2 = makeAddr("user2");
   address feeSink = makeAddr("feeSink");
   address gov = makeAddr("gov");
-  address securityCouncil = makeAddr("securityCouncil");
+  address securityCouncil = 0xAd8997fAaAc3DA36CA0aA88a0AAf948A6C3a5338;
   address signer;
   uint256 signerKey;
 
@@ -48,17 +43,16 @@ contract MarketSuite is Test {
 
     implementation = new MarketWithViews();
 
-    // ProxyAdmin with owner as `owner`
-    vm.startPrank(owner);
-    proxyAdmin = new ProxyAdmin(owner);
-
     // Init data
-    bytes memory initData = abi.encodeWithSelector(
-      Market.initialize.selector, "BTC", feeSink, address(usdt), address(0), gov, securityCouncil
-    );
+    bytes memory initData =
+      abi.encodeWithSelector(Market.initialize.selector, "BTC", feeSink, address(usdt), address(0), gov);
 
     // Proxy
-    proxy = new TransparentUpgradeableProxy(address(implementation), address(proxyAdmin), initData);
+    proxy = new ERC1967Proxy(address(implementation), initData);
+
+    vm.startPrank(securityCouncil);
+    Market(address(proxy)).unpause();
+    vm.startPrank(owner);
 
     // Interface to interact with proxy
     mkt = MarketWithViews(address(proxy));
@@ -649,7 +643,6 @@ contract MarketSuite is Test {
     deal(address(usdt), who, amount);
     vm.startPrank(who);
     usdt.approve(address(mkt), type(uint256).max);
-    vm.startPrank(who);
     mkt.depositCollateral(amount);
   }
 

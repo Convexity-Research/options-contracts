@@ -13,7 +13,7 @@ contract MarketSuite is Test {
 
   int256 constant MAKER_FEE_BPS = -200;
   int256 constant TAKER_FEE_BPS = 700;
-  uint256 constant TICK_SIZE = 1e3;
+  uint256 constant TICK_SIZE = 1e2;
   uint256 constant CONTRACT_SIZE = 100;
 
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
@@ -91,12 +91,12 @@ contract MarketSuite is Test {
     _fund(u1, 10 * ONE_COIN);
     MarketSide side = MarketSide.CALL_BUY;
 
-    uint256 price = 2e5; // 0.2 USDT0
+    uint256 price = 2e4; // 0.02 USDT0
 
     vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
 
-    uint32 tick = _tick(price); // tick = 2e5 / 1e3 = 200
+    uint32 tick = _tick(price); // tick = 2e4 / 1e2 = 200
     uint32 key = _key(tick, false, true); // CALL-BID
 
     // Test level volume
@@ -120,8 +120,8 @@ contract MarketSuite is Test {
     _fund(u1, 1000 * ONE_COIN);
     MarketSide side = MarketSide.CALL_BUY;
 
-    uint256 price = 70_000_000; // 70 USDT0
-    uint32 expectedTick = 70000; // 70_000_000 / 10000
+    uint256 price = 7_000_000; // 7 USDT0
+    uint32 expectedTick = 70000; // 7_000_000 / 10000
 
     vm.startPrank(u1);
     mkt.placeOrder(side, LOT, price, cycleId);
@@ -159,19 +159,20 @@ contract MarketSuite is Test {
 
     // We know which bits should be set for each price level. See console.log statements below.
     // 2 USDT0 - lowest level (from first test)
-    prices[0] = 2e5;
+    // e4 everywhere because token decimals = 6, tick size = 2, so 6-2 = 4 decimals places
+    prices[0] = 2e4;
     l1s[0] = 0;
     l2s[0] = 0;
     l3s[0] = 200;
 
     // 700 USDT0 - middle level (from second test)
-    prices[1] = 700e5;
+    prices[1] = 700e4;
     l1s[1] = 1;
     l2s[1] = 17;
     l3s[1] = 112;
 
     // 1000 USDT0 - different level
-    prices[2] = 1000e5;
+    prices[2] = 1000e4;
     l1s[2] = 1;
     l2s[2] = 134;
     l3s[2] = 160;
@@ -256,7 +257,7 @@ contract MarketSuite is Test {
     // Three makers @ 1,2,700 USD
     for (uint256 i; i < 3; ++i) {
       vm.startPrank(u1);
-      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * 1e3, cycleId); // ask
+      mkt.placeOrder(MarketSide.PUT_SELL, LOT, ticks[i] * TICK_SIZE, cycleId); // ask
     }
 
     // Taker buys 350 contracts market –> eats 3 levels
@@ -545,7 +546,7 @@ contract MarketSuite is Test {
     vm.assume(amount > 0 && amount < 1e6);
     vm.assume(sideIndex < 4);
     MarketSide side = MarketSide(sideIndex);
-    uint256 price = uint256(priceTick) * 1e3 + 1e3; // >=1 tick
+    uint256 price = uint256(priceTick) * TICK_SIZE + TICK_SIZE; // >=1 tick
 
     _fund(u1, 1e24);
     vm.startPrank(u1);

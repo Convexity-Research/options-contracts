@@ -30,7 +30,7 @@ contract Market is
   address public collateralToken;
   uint256 constant collateralDecimals = 6;
   address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
-  uint256 constant TICK_SZ = 1e2; // 0.01 USDT0 → 10 000 wei (only works for 6-decimals tokens)
+  uint256 constant TICK_SZ = 1e2; // 0.0001 USDT0 → 100 wei (only works for 6-decimals tokens)
   uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
   uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
   int256 constant makerFeeBps = -200; // -2.00 %, basis points. Negative means its a fee rebate, so pay out to makers
@@ -184,7 +184,7 @@ contract Market is
   }
 
   function long(uint256 size, uint256 cycleId) external whenNotPaused {
-    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
+    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
@@ -192,7 +192,7 @@ contract Market is
   }
 
   function short(uint256 size, uint256 cycleId) external whenNotPaused {
-    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
+    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
@@ -204,7 +204,7 @@ contract Market is
     whenNotPaused
     returns (uint256 orderId)
   {
-    if (cycleId != 0 && cycleId != activeCycle) revert("Invalid cycle");
+    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
     address trader = _msgSender();
     _placeOrder(side, size, limitPrice, trader);
     return 0;
@@ -246,8 +246,7 @@ contract Market is
     if (side == MarketSide.PUT_BUY) P.pendingLongPuts -= uint32(M.size);
     else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint32(M.size);
     else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint32(M.size);
-    else if (side == MarketSide.CALL_SELL) P.pendingShortCalls -= uint32(M.size);
-    else revert();
+    else P.pendingShortCalls -= uint32(M.size);
 
     // Remove from user's order tracking
     _removeOrderFromTracking(M.trader, uint32(orderId));
@@ -552,8 +551,7 @@ contract Market is
     if (side == MarketSide.PUT_BUY) ua.pendingLongPuts += uint32(size);
     else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts += uint32(size);
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls += uint32(size);
-    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls += uint32(size);
-    else revert("Invalid side");
+    else ua.pendingShortCalls += uint32(size);
   }
 
   function _settleFill(

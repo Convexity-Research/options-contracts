@@ -582,7 +582,8 @@ contract Market is
       // Dir signed direction from pov of taker: -1 when taker buys, since they're paying premium
       int256 dir = isTakerBuy ? int256(-1) : int256(1);
 
-      // Calculate fees based on premium
+      // Calculate fees based on premium. makerFeeBps is negative, so it's a rebate. takerFeeBps is positive, so it's a
+      // fee.
       int256 makerFee = premium * makerFeeBps / int256(denominator);
       int256 takerFee = premium * takerFeeBps / int256(denominator);
 
@@ -591,25 +592,48 @@ contract Market is
       cashTaker = dir * premium - takerFee;
 
       // We need a safeguard against the situation where the 'resting' party - and if they're a buyer paying premium -
-      // has insufficient balance to pay the premium (for whatever reason). The 'resting party' is a limit order in the
-      // orderbook, or a market order if it ends up in the takerQueue. Either of these scenarios could lead to denial of
-      // service, so we remove the resting orders completelyorders
+      // has insufficient balance to pay the premium (for whatever reason). The 'resting party' is a limit order on the
+      // orderbook, or a market order in the takerQueue. Either of these scenarios could lead to denial of
+      // service, so we remove the resting orders completely
+      // Skip insolvency checks for liquidations, as the liquidated user is paying premium. Insolvency for this case is
+      // handled after this block
+      // No need for insolvency checks for 'non resting' buyers otherwise, as that can only happen with tx initiation
+      // (which would fail margin checks and revert immediately)
       if (!isLiquidationOrder) {
+        // Scenario 1: resting taker in queue
         if (isTakerQueue && isTakerBuy) {
-          if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
+          if (uaTaker.balance < uint256(-cashTaker)) {
+            // queued taker cannot pay the premium. Leave the queue entry
+            // untouched and simply give up on this match
             return 0;
-          } else if (!isTakerQueue && !isTakerBuy) {
-            ob[activeCycle].makerNodes[makerOrderId].size = 0;
-            if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+          }
+        }
+
+        // Scenario 2: resting maker in orderbook
+        if (!isTakerQueue && !isTakerBuy) {
+          // maker is the premium payer
+          if (uaMaker.balance < uint256(-cashMaker)) {
+            // maker can't pay. Zero out the order. No need to handle orderbook state changes, as
+            // that happens in the calling function (_marketOrder)
+            Maker storage M = ob[activeCycle].makerNodes[makerOrderId];
+            uint128 makerOrderSize = M.size;
+            M.size = 0;
+
+            if (_isPut(side)) uaMaker.pendingLongPuts -= uint32(makerOrderSize);
+            else uaMaker.pendingLongCalls -= uint32(makerOrderSize);
+
+            return 0;
           }
         }
       }
 
       // Apply cash deltas - for liquidations, handle insufficient balance as bad debt
-      if (isLiquidationOrder && cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
+      if (isLiquidationOrder && uaTaker.balance < uint256(-cashTaker)) {
+        // cashTaker is always negative (liquidatee is always buying)
         // Liquidation order: taker doesn't have enough balance, add to bad debt
         uint256 shortfall = uint256(-cashTaker) - uaTaker.balance;
         badDebt += shortfall;
+        cashTaker += int256(shortfall);
         uaTaker.balance = 0; // Zero out taker balance
         _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
       } else {
@@ -1033,9 +1057,10 @@ contract Market is
       address trader = traders[i];
 
       // Charge liquidation fee, if any
-      _chargeLiquidationFee(trader);
+      uint256 feePaid = _chargeLiquidationFee(trader);
 
-      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
+      // pnl
+      int256 pnl = _calculateTraderPnl(cycleId, price, trader) - int256(feePaid);
 
       UserAccount storage ua = userAccounts[trader];
       if (pnl < 0) {
@@ -1075,15 +1100,18 @@ contract Market is
   }
 
   // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
-  function _chargeLiquidationFee(address trader) internal {
+  function _chargeLiquidationFee(address trader) internal returns (uint256) {
     UserAccount storage ua = userAccounts[trader];
-    if (ua.liquidationFeeOwed > 0) {
-      uint256 fee = ua.liquidationFeeOwed;
-      uint256 pay = ua.balance < fee ? ua.balance : fee;
+    uint256 fee = ua.liquidationFeeOwed;
+    uint256 pay;
+    if (fee > 0) {
+      pay = ua.balance < fee ? ua.balance : fee;
       ua.balance -= uint64(pay);
-      ua.liquidationFeeOwed -= uint64(pay);
-      _applyCashDelta(feeRecipient, int256(pay));
+      ua.liquidationFeeOwed = 0;
+      userAccounts[feeRecipient].balance += uint64(pay);
     }
+
+    return pay;
   }
 
   function _doPhase2(uint256 cycleId, uint256 max) internal {

@@ -272,7 +272,7 @@ contract Market is
     _clearTakerQueueEntries(trader);
 
     // Clear user's order tracking
-    delete userOrders[trader];
+    _clearUserOrders(trader);
 
     UserAccount storage ua = userAccounts[trader];
     uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
@@ -804,6 +804,18 @@ contract Market is
     _ob.takerOrderPtr = id;
   }
 
+  function _clearUserOrders(address trader) internal {
+    assembly {
+      // Compute the storage slot of userOrders[trader].length
+      mstore(0x00, trader) // left-pad addr to 32 bytes
+      mstore(0x20, userOrders.slot) // mapping’s base slot
+      let slot := keccak256(0x00, 0x40)
+
+      // Zero the length word — O(1) gas
+      sstore(slot, 0)
+    }
+  }
+
   // #######################################################################
   // #                                                                     #
   // #                  Internal Orderbook helpers                         #
@@ -966,6 +978,8 @@ contract Market is
       let slot := ua.slot
       sstore(add(slot, 1), 0)
     }
+
+    _clearUserOrders(trader);
   }
 
   function _requiredMargin(

@@ -20,4 +20,5 @@ library Errors {
   error TraderLiquidatable();
   error NotSecurityCouncil();
   error InvalidCycle();
+  error SettlementOnlyMode();
 }

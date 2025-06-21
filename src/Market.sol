@@ -83,6 +83,7 @@ contract Market is
   uint256 posSum; // total positive PnL (winners)
   uint256 badDebt; // grows whenever we meet an under-collateralised loser
   bool settlementPhase; // false = phase 1, true = phase 2
+  bool settlementOnlyMode; // true = only allow settlement, no new cycles
 
   //------- Orderbook -------
   mapping(uint256 => OrderbookState) internal ob;
@@ -292,8 +293,11 @@ contract Market is
     emit Liquidated(activeCycle, trader);
   }
 
-  function settleChunk(uint256 max) external whenNotPaused {
+  function settleChunk(uint256 max) external {
     if (activeCycle == 0) revert Errors.CycleNotStarted();
+    // Allow settlement when paused if in settlement-only mode
+    if (paused() && !settlementOnlyMode) revert EnforcedPause();
+
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
     uint64 settlementPrice = C.settlementPrice;
@@ -307,16 +311,31 @@ contract Market is
 
     if (C.isSettled) revert Errors.CycleAlreadySettled();
 
+    uint256 iterationsUsed = 0;
+
     if (!settlementPhase) {
       // Phase 1: Calculate PnL, debit losers immediately, store winners' PnL
-      _doPhase1(cycleId, settlementPrice, max);
+      uint256 phase1Iterations = _doPhase1(cycleId, settlementPrice, max);
+      iterationsUsed += phase1Iterations;
+      
+      // If phase 1 is complete and we have iterations left, proceed to phase 2
+      if (settlementPhase && iterationsUsed < max) {
+        uint256 remainingIterations = max - iterationsUsed;
+        _doPhase2(cycleId, remainingIterations);
+      }
     } else {
       // Phase 2: Credit winners pro-rata based on loss ratio
       _doPhase2(cycleId, max);
     }
   }
 
-  function startCycle() external whenNotPaused {
+  function startCycle() external {
+    if (paused() && !settlementOnlyMode) revert EnforcedPause();
+    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
+    _startCycle();
+  }
+
+  function _startCycle() internal {
     uint256 expiry = block.timestamp + DEFAULT_EXPIRY;
     if (activeCycle != 0) revert Errors.CycleActive();
 
@@ -788,7 +807,7 @@ contract Market is
     assembly {
       // Compute the storage slot of userOrders[trader].length
       mstore(0x00, trader) // left-pad addr to 32 bytes
-      mstore(0x20, userOrders.slot) // mapping’s base slot
+      mstore(0x20, userOrders.slot) // mappings base slot
       let slot := keccak256(0x00, 0x40)
 
       // Zero the length word — O(1) gas
@@ -1039,11 +1058,13 @@ contract Market is
     return pnl;
   }
 
-  function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal {
+  function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal returns (uint256) {
     uint256 n = traders.length;
     uint256 i = cursor;
     uint256 upper = i + max;
     if (upper > n) upper = n;
+
+    uint256 startingI = i;
 
     while (i < upper) {
       address trader = traders[i];
@@ -1089,6 +1110,8 @@ contract Market is
       settlementPhase = true;
       cursor = 0; // Reset cursor for phase 2
     }
+
+    return i - startingI;
   }
 
   // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
@@ -1158,6 +1181,11 @@ contract Market is
       activeCycle = 0;
 
       emit CycleSettled(cycleId);
+      
+      // Automatically start new cycle unless in settlement-only mode
+      if (!settlementOnlyMode && !paused()) {
+        _startCycle();
+      }
     }
   }
 
@@ -1211,10 +1239,17 @@ contract Market is
 
   function pause() external onlySecurityCouncil {
     _pause();
+    settlementOnlyMode = false; // Full pause
+  }
+
+  function pauseSettlementOnly() external onlySecurityCouncil {
+    settlementOnlyMode = true;
+    // Don't call _pause() - we want settlement to continue
   }
 
   function unpause() external onlySecurityCouncil {
     _unpause();
+    settlementOnlyMode = false;
   }
 
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}

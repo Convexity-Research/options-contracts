@@ -13,6 +13,7 @@ library Errors {
   error InTraderList();
   error NotExpired();
   error CycleAlreadySettled();
+  error CycleNotStarted();
   error MarketNotLive();
   error TickTooLarge();
   error AccountInLiquidation();

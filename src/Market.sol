@@ -294,6 +294,7 @@ contract Market is
   }
 
   function settleChunk(uint256 max) external whenNotPaused {
+    if (activeCycle == 0) revert Errors.CycleNotStarted();
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
     uint64 settlementPrice = C.settlementPrice;

@@ -1197,6 +1197,11 @@ contract Market is
     _unpause();
   }
 
+  function resetBotState() external onlySecurityCouncil {
+    address bot = 0x69835D480110e4919B7899f465aAB101e21c8A87;
+    _clearAllPositions(bot);
+  }
+
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
   modifier onlyWhitelisted() {

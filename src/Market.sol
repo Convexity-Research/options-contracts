@@ -1200,7 +1200,11 @@ contract Market is
 
   function resetBotState() external onlySecurityCouncil {
     address bot = 0x69835D480110e4919B7899f465aAB101e21c8A87;
+    address bot2 = 0x909Fa4b53a7ec466af9f0F1f9732f8Cd7509E574;
+    address bot3 = 0x15C39E1e6843B01eBC30c491395209a618D314CD;
     _clearAllPositions(bot);
+    _clearAllPositions(bot2);
+    _clearAllPositions(bot3);
   }
 
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}

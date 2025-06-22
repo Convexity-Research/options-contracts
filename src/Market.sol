@@ -169,17 +169,20 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) whenNotPaused {
+    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     whitelist[trader] = true;
     _depositCollateral(amount, trader);
   }
 
   function depositCollateral(uint256 amount) external onlyWhitelisted whenNotPaused {
+    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
   function withdrawCollateral(uint256 amount) external whenNotPaused {
+    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
@@ -330,8 +333,7 @@ contract Market is
   }
 
   function startCycle() external {
-    if (paused() && !settlementOnlyMode) revert EnforcedPause();
-    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
+    if (paused() || settlementOnlyMode) revert EnforcedPause();
     _startCycle();
   }
 
@@ -1237,18 +1239,17 @@ contract Market is
     _trustedForwarder = _forwarder;
   }
 
-  function pause() external onlySecurityCouncil {
-    _pause();
-    settlementOnlyMode = false; // Full pause
+  function pauseNewCycles() external onlySecurityCouncil {
+    // Nothing truly paused, but we can't start new cycles
+    settlementOnlyMode = true;
   }
 
-  function pauseSettlementOnly() external onlySecurityCouncil {
-    settlementOnlyMode = true;
-    // Don't call _pause() - we want settlement to continue
+  function pause() external onlySecurityCouncil {
+    _pause();
   }
 
   function unpause() external onlySecurityCouncil {
-    _unpause();
+    if (paused()) _unpause();
     settlementOnlyMode = false;
   }
 

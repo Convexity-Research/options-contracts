@@ -688,9 +688,7 @@ contract MarketSuite is Test {
     for (uint256 i; i < 8; ++i) {
       address user = makeAddr(string(abi.encodePacked("multi", vm.toString(i))));
       _fund(user, 200 * ONE_COIN);
-      if (i & 1 == 1) {
-        _openCallPair(makeAddr(string(abi.encodePacked("multi", vm.toString(i - 1)))), user);
-      }
+      if (i & 1 == 1) _openCallPair(makeAddr(string(abi.encodePacked("multi", vm.toString(i - 1)))), user);
     }
 
     uint256 cycleIdBefore = mkt.activeCycle();
@@ -746,7 +744,7 @@ contract MarketSuite is Test {
 
   function testPauseUnpause() public {
     vm.startPrank(securityCouncil);
-    
+
     // Standard full pause()
     mkt.pause();
     assertEq(mkt.paused(), true);
@@ -760,10 +758,10 @@ contract MarketSuite is Test {
     vm.warp(cycleId + 1);
     vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
     mkt.settleChunk(100);
-    
+
     mkt.unpause();
     mkt.settleChunk(100);
-    
+
     // Pause but allow settling
     mkt.pauseNewCycles();
 
@@ -775,7 +773,7 @@ contract MarketSuite is Test {
 
     assertEq(logs[0].topics[0], keccak256("PriceFixed(uint256,uint64)"));
     assertEq(logs[1].topics[0], keccak256("CycleSettled(uint256)"));
-    
+
     assertEq(mkt.activeCycle(), 0);
 
     // Unpause and start a new cycle

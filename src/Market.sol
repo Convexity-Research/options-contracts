@@ -320,7 +320,7 @@ contract Market is
       // Phase 1: Calculate PnL, debit losers immediately, store winners' PnL
       uint256 phase1Iterations = _doPhase1(cycleId, settlementPrice, max);
       iterationsUsed += phase1Iterations;
-      
+
       // If phase 1 is complete and we have iterations left, proceed to phase 2
       if (settlementPhase && iterationsUsed < max) {
         uint256 remainingIterations = max - iterationsUsed;
@@ -1183,11 +1183,9 @@ contract Market is
       activeCycle = 0;
 
       emit CycleSettled(cycleId);
-      
+
       // Automatically start new cycle unless in settlement-only mode
-      if (!settlementOnlyMode && !paused()) {
-        _startCycle();
-      }
+      if (!settlementOnlyMode && !paused()) _startCycle();
     }
   }
 

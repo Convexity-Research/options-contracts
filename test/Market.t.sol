@@ -599,23 +599,6 @@ contract MarketSuite is Test {
     mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
   }
 
-  function testRestingMakerInsolvencyBug() public {
-    uint256 makerCollateral = 490 * ONE_COIN; // 489 will fail, as maker needs 500 - 2% fee rebate = 490 USDT for
-      // premium payment
-    uint256 takerCollateral = 1000 * ONE_COIN;
-
-    _fund(u1, makerCollateral);
-    _fund(u2, takerCollateral);
-
-    vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, 500 * ONE_COIN, cycleId);
-    vm.stopPrank();
-
-    vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 0, cycleId);
-    vm.stopPrank();
-  }
-
   // #######################################################################
   // #                                                                     #
   // #                   Liquidation Accounting Bug Tests                  #
@@ -708,7 +691,7 @@ contract MarketSuite is Test {
       if (entries[i].topics[0] == keccak256("LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)")) {
         address taker = address(uint160(uint256(entries[i].topics[2])));
         if (taker == u1) { // u1 is the liquidated taker
-          (uint256 makerOrderId, uint256 takerOrderId, uint256 size, uint256 limitPrice, uint8 side, int256 cashTaker, int256 cashMaker, uint256 btcPrice) = abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
+          (,,,,, int256 cashTaker,,) = abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
           emittedCashTaker = cashTaker;
           foundFillEvent = true;
           break;

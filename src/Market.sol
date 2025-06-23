@@ -590,37 +590,16 @@ contract Market is
       cashTaker = dir * premium - takerFee;
 
       // We need a safeguard against the situation where the 'resting' party - and if they're a buyer paying premium -
-      // has insufficient balance to pay the premium (for whatever reason). The 'resting party' is a limit order on the
-      // orderbook, or a market order in the takerQueue. Either of these scenarios could lead to denial of
-      // service, so we remove the resting orders completely
-      // Skip insolvency checks for liquidations, as the liquidated user is paying premium. Insolvency for this case is
-      // handled after this block
-      // No need for insolvency checks for 'non resting' buyers otherwise, as that can only happen with tx initiation
-      // (which would fail margin checks and revert immediately)
+      // has insufficient balance to pay the premium (for whatever reason). The 'resting party' is a limit order in the
+      // orderbook, or a market order if it ends up in the takerQueue. Either of these scenarios could lead to denial of
+      // service, so we remove the resting orders completelyorders
       if (!isLiquidationOrder) {
-        // Scenario 1: resting taker in queue
         if (isTakerQueue && isTakerBuy) {
-          if (uaTaker.balance < uint256(-cashTaker)) {
-            // queued taker cannot pay the premium. Leave the queue entry
-            // untouched and simply give up on this match
+          if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
             return 0;
-          }
-        }
-
-        // Scenario 2: resting maker in orderbook
-        if (!isTakerQueue && !isTakerBuy) {
-          // maker is the premium payer
-          if (uaMaker.balance < uint256(-cashMaker)) {
-            // maker can't pay. Zero out the order. No need to handle orderbook state changes, as
-            // that happens in the calling function (_marketOrder)
-            Maker storage M = ob[activeCycle].makerNodes[makerOrderId];
-            uint128 makerOrderSize = M.size;
-            M.size = 0;
-
-            if (_isPut(side)) uaMaker.pendingLongPuts -= uint32(makerOrderSize);
-            else uaMaker.pendingLongCalls -= uint32(makerOrderSize);
-
-            return 0;
+          } else if (!isTakerQueue && !isTakerBuy) {
+            ob[activeCycle].makerNodes[makerOrderId].size = 0;
+            if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
           }
         }
       }

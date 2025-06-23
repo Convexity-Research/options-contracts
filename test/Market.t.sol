@@ -598,6 +598,25 @@ contract MarketSuite is Test {
     mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
   }
 
+  function testRestingMakerInsolvencyBug() public {
+    uint256 makerCollateral = 490 * ONE_COIN; // 489 will fail, as maker needs 500 - 2% fee rebate = 490 USDT for
+      // premium payment
+    uint256 takerCollateral = 1000 * ONE_COIN;
+
+    _fund(u1, makerCollateral);
+    _fund(u2, takerCollateral);
+
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, 500 * ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    console.log("User 2 market order:");
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 0, cycleId);
+    vm.stopPrank();
+  }
+
   // #######################################################################
   // #                                                                     #
   // #                             Helpers                                 #

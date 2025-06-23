@@ -610,8 +610,6 @@ contract MarketSuite is Test {
     mkt.placeOrder(MarketSide.CALL_BUY, 1, 500 * ONE_COIN, cycleId);
     vm.stopPrank();
 
-    console.log("User 2 market order:");
-
     vm.startPrank(u2);
     mkt.placeOrder(MarketSide.CALL_SELL, 1, 0, cycleId);
     vm.stopPrank();

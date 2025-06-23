@@ -19,4 +19,5 @@ library Errors {
   error AccountInLiquidation();
   error TraderLiquidatable();
   error NotSecurityCouncil();
+  error InvalidCycle();
 }

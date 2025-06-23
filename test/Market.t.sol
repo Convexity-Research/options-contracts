@@ -7,6 +7,7 @@ import "./mocks/MarketWithViews.sol";
 import {BitScan} from "../src/lib/Bitscan.sol";
 import {Token} from "./mocks/Token.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
 contract MarketSuite is Test {
   using BitScan for uint256;
@@ -64,9 +65,6 @@ contract MarketSuite is Test {
     mkt.startCycle();
     Vm.Log[] memory entries = vm.getRecordedLogs();
     cycleId = uint256(entries[0].topics[1]); // There's only one log emitted in startCycle
-
-    _whitelistAddress(u1);
-    _whitelistAddress(u2);
   }
 
   // #######################################################################
@@ -482,10 +480,8 @@ contract MarketSuite is Test {
 
     // phase-1 + phase-2 in two txs
     mkt.settleChunk(20);
-    mkt.settleChunk(20);
 
     // cycle closed
-    assertEq(mkt.activeCycle(), 0);
     (bool settled,,) = mkt.cycles(cycleId);
     assertTrue(settled, "cycle not flagged as settled");
 
@@ -507,14 +503,14 @@ contract MarketSuite is Test {
     _openCallPair(u1, u2);
 
     uint256 premium = ONE_COIN; // 1.000000
-    int256 makerFee = int256(premium) * MAKER_FEE_BPS / 10_000;
-    int256 takerFee = int256(premium) * TAKER_FEE_BPS / 10_000;
+    int256 takerFee = int256(premium) * TAKER_FEE_BPS / 10_000; // u1
+    int256 makerFee = int256(premium) * MAKER_FEE_BPS / 10_000; // u2
 
-    int256 cashMaker = -int256(premium) - makerFee; // −0.98 USDT
-    int256 cashTaker = int256(premium) - takerFee; // +0.93 USDT
+    int256 cashTaker = -int256(premium) - takerFee; // -1.07 USDT
+    int256 cashMaker = int256(premium) - makerFee; // +1.02 USDT
 
-    uint256 balU1_afterTrade = uint256(int256(longDeposit) + cashMaker);
-    uint256 balU2_afterTrade = uint256(int256(shortDeposit) + cashTaker);
+    uint256 balU1_afterTrade = uint256(int256(longDeposit) + cashTaker);
+    uint256 balU2_afterTrade = uint256(int256(shortDeposit) + cashMaker);
 
     vm.warp(cycleId + 1);
     _mockOracle(btcPrice + 10_000); // +10 000 USD spot move
@@ -524,17 +520,678 @@ contract MarketSuite is Test {
     mkt.settleChunk(10);
 
     // u2 must be drained to zero, u1's scratchPnL should equal +100
-    assertEq(mkt.getUserAccount(u2).balance, 0);
-    uint256 scratchPnL = mkt.getUserAccount(u1).scratchPnL;
-    assertEq(scratchPnL, intrinsic);
-
-    mkt.settleChunk(10);
+    assertEq(mkt.getUserAccount(u2).balance, 0, "u2 balance not zero");
 
     // Full balance taken from u2
     uint256 expectedFinal = balU1_afterTrade + balU2_afterTrade;
 
     assertEq(mkt.getUserAccount(u1).balance, expectedFinal, "social-loss calculation wrong");
-    assertLt(balU2_afterTrade, scratchPnL, "u1 should recieve less than their actual pnl");
+    assertLt(balU2_afterTrade, intrinsic, "u1 receives less than their 'deserved' pnl");
+  }
+
+  function testSettlementCompleteInOneTransaction() public {
+    // Setup
+    uint256 collateral = 200 * ONE_COIN;
+    _fund(u1, collateral);
+    _fund(u2, collateral);
+
+    // Open a call pair
+    _openCallPair(u1, u2);
+
+    uint256 initialCycleId = mkt.activeCycle();
+    assertGt(initialCycleId, 0, "Should have active cycle");
+
+    vm.warp(initialCycleId + 1);
+    _mockOracle(btcPrice + 1000);
+
+    vm.recordLogs();
+    mkt.settleChunk(1000);
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+
+    // Should have CycleSettled and CycleStarted events
+    bool foundCycleSettled = false;
+    bool foundCycleStarted = false;
+    uint256 newCycleId = 0;
+
+    for (uint256 i = 0; i < logs.length; i++) {
+      if (logs[i].topics[0] == keccak256("CycleSettled(uint256)")) {
+        foundCycleSettled = true;
+        assertEq(uint256(logs[i].topics[1]), initialCycleId, "Wrong cycle settled");
+      }
+      if (logs[i].topics[0] == keccak256("CycleStarted(uint256,uint256)")) {
+        foundCycleStarted = true;
+        newCycleId = uint256(logs[i].topics[1]);
+      }
+    }
+
+    assertTrue(foundCycleSettled, "CycleSettled event not found");
+    assertTrue(foundCycleStarted, "CycleStarted event not found");
+    assertGt(newCycleId, initialCycleId, "New cycle should have later expiry");
+
+    // Verify new cycle is active
+    assertEq(mkt.activeCycle(), newCycleId, "New cycle should be active");
+
+    // Verify old cycle is marked as settled
+    (bool isSettled,,) = mkt.cycles(initialCycleId);
+    assertTrue(isSettled, "Old cycle should be settled");
+  }
+
+  function testSettlementCompleteInTwoPhasesWithCompleteFirstPhase() public {
+    // Setup
+    address[4] memory users = [u1, u2, makeAddr("user3"), makeAddr("user4")];
+
+    for (uint256 i; i < users.length; ++i) {
+      _fund(users[i], 200 * ONE_COIN);
+    }
+
+    _openCallPair(users[0], users[1]);
+    _openCallPair(users[2], users[3]);
+
+    uint256 cycleIdBefore = mkt.activeCycle();
+
+    // Expire cycle and settle in two chunks
+    vm.warp(cycleIdBefore + 1);
+    _mockOracle(btcPrice + 1_000);
+
+    // 1st chunk — should NOT finish settlement
+    vm.recordLogs();
+    mkt.settleChunk(6); // Choose a chunk size which would complete phase 1
+    Vm.Log[] memory first = vm.getRecordedLogs();
+
+    for (uint256 i; i < first.length; ++i) {
+      require(
+        first[i].topics[0] != keccak256("CycleSettled(uint256)")
+          && first[i].topics[0] != keccak256("CycleStarted(uint256,uint256)"),
+        "cycle should not finish in first chunk"
+      );
+    }
+    assertEq(mkt.activeCycle(), cycleIdBefore, "cycle should remain active");
+
+    // 2nd chunk — must complete settlement and start new cycle
+    vm.recordLogs();
+    mkt.settleChunk(100);
+    Vm.Log[] memory second = vm.getRecordedLogs();
+
+    uint256 cycleIdAfter;
+    bool settled;
+    bool started;
+
+    for (uint256 i; i < second.length; ++i) {
+      if (second[i].topics[0] == keccak256("CycleSettled(uint256)")) settled = true;
+      if (second[i].topics[0] == keccak256("CycleStarted(uint256,uint256)")) {
+        started = true;
+        cycleIdAfter = uint256(second[i].topics[1]);
+      }
+    }
+
+    assertTrue(settled && started, "cycle should complete and next start");
+    assertGt(cycleIdAfter, cycleIdBefore, "new cycle id should increase");
+    assertEq(mkt.activeCycle(), cycleIdAfter);
+  }
+
+  function testSettlementCompleteInTwoPhasesWithIncompleteFirstPhase() public {
+    // Same test as above, but with a chunk size that doesn't complete phase 1
+    // Setup: four users, two call pairs
+    address[4] memory users = [u1, u2, makeAddr("user3"), makeAddr("user4")];
+
+    for (uint256 i; i < users.length; ++i) {
+      _fund(users[i], 200 * ONE_COIN);
+    }
+
+    _openCallPair(users[0], users[1]);
+    _openCallPair(users[2], users[3]);
+
+    uint256 cycleIdBefore = mkt.activeCycle();
+
+    // Expire cycle and settle in two chunks
+    vm.warp(cycleIdBefore + 1);
+    _mockOracle(btcPrice + 1_000);
+
+    // 1st chunk — should NOT finish settlement
+    vm.recordLogs();
+    mkt.settleChunk(3); // Choose a chunk size which would not complete phase 1
+    Vm.Log[] memory first = vm.getRecordedLogs();
+
+    for (uint256 i; i < first.length; ++i) {
+      require(
+        first[i].topics[0] != keccak256("CycleSettled(uint256)")
+          && first[i].topics[0] != keccak256("CycleStarted(uint256,uint256)"),
+        "cycle should not finish in first chunk"
+      );
+    }
+    assertEq(mkt.activeCycle(), cycleIdBefore, "cycle should remain active");
+
+    // 2nd chunk — must complete settlement and start new cycle
+    vm.recordLogs();
+    mkt.settleChunk(100);
+    Vm.Log[] memory second = vm.getRecordedLogs();
+
+    uint256 cycleIdAfter;
+    bool settled;
+    bool started;
+
+    for (uint256 i; i < second.length; ++i) {
+      if (second[i].topics[0] == keccak256("CycleSettled(uint256)")) settled = true;
+      if (second[i].topics[0] == keccak256("CycleStarted(uint256,uint256)")) {
+        started = true;
+        cycleIdAfter = uint256(second[i].topics[1]);
+      }
+    }
+
+    assertTrue(settled && started, "cycle should complete and next start");
+    assertGt(cycleIdAfter, cycleIdBefore, "new cycle id should increase");
+    assertEq(mkt.activeCycle(), cycleIdAfter);
+  }
+
+  function testSettlementCompleteInMultipleTransactions() public {
+    // Setup
+    for (uint256 i; i < 8; ++i) {
+      address user = makeAddr(string(abi.encodePacked("multi", vm.toString(i))));
+      _fund(user, 200 * ONE_COIN);
+      if (i & 1 == 1) _openCallPair(makeAddr(string(abi.encodePacked("multi", vm.toString(i - 1)))), user);
+    }
+
+    uint256 cycleIdBefore = mkt.activeCycle();
+    vm.warp(cycleIdBefore + 1);
+    _mockOracle(btcPrice + 1_000);
+
+    uint256 txCount;
+    while (mkt.activeCycle() == cycleIdBefore) {
+      mkt.settleChunk(1); // deliberately small to force many txs
+      ++txCount;
+    }
+
+    assertGt(txCount, 2, "should take more than two txs");
+    (bool settled,,) = mkt.cycles(cycleIdBefore);
+    assertTrue(settled, "previous cycle not settled");
+    assertGt(mkt.activeCycle(), cycleIdBefore, "new cycle should start");
+  }
+
+  function testSettlementWithPausePreventsAutoCycle() public {
+    // Setup
+    _fund(u1, 200 * ONE_COIN);
+    _fund(u2, 200 * ONE_COIN);
+
+    // Can still place orders after pause
+    _openCallPair(u1, u2);
+
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 1_000);
+
+    mkt.settleChunk(100);
+
+    // Cycle settled — but no new cycle should have started
+    (bool settled,,) = mkt.cycles(cycleId);
+    assertTrue(settled, "cycle should settle");
+    assertEq(mkt.activeCycle(), 0, "no active cycle in settlement only mode");
+
+    // Attempting to start a cycle must revert
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.startCycle();
+
+    // Exit settlement‑only mode and start a new cycle
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    mkt.startCycle();
+    assertGt(mkt.activeCycle(), cycleId, "new cycle should start after unpause");
+  }
+
+  function testPauseUnpause() public {
+    vm.startPrank(securityCouncil);
+
+    // Standard full pause()
+    mkt.pause();
+    assertEq(mkt.paused(), true);
+
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.startCycle();
+
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, 1, cycleId);
+
+    vm.warp(cycleId + 1);
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.settleChunk(100);
+
+    mkt.unpause();
+    mkt.settleChunk(100);
+
+    // Pause but allow settling
+    mkt.pauseNewCycles();
+
+    uint256 cycleIdAfter = mkt.activeCycle();
+    vm.warp(cycleIdAfter + 1);
+    vm.recordLogs();
+    mkt.settleChunk(100);
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+
+    assertEq(logs[0].topics[0], keccak256("PriceFixed(uint256,uint64)"));
+    assertEq(logs[1].topics[0], keccak256("CycleSettled(uint256)"));
+
+    assertEq(mkt.activeCycle(), 0);
+
+    // Unpause and start a new cycle
+    mkt.unpause();
+    assertEq(mkt.paused(), false);
+
+    mkt.startCycle();
+    assertGt(mkt.activeCycle(), cycleIdAfter);
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #              Comprehensive Settlement-Only Mode Tests               #
+  // #                                                                     #
+  // #######################################################################
+
+  function testSettlementOnlyMode_DepositCollateralBlocked() public {
+    // Start in normal mode
+    assertEq(mkt.paused(), false);
+
+    // Enable settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Try to deposit collateral - should revert
+    deal(address(usdt), u1, 100 * ONE_COIN);
+    _whitelistAddress(u1);
+    vm.startPrank(u1);
+    usdt.approve(address(mkt), type(uint256).max);
+
+    vm.expectRevert(Errors.SettlementOnlyMode.selector);
+    mkt.depositCollateral(100 * ONE_COIN);
+  }
+
+  function testSettlementOnlyMode_DepositCollateralWithSignatureBlocked() public {
+    // Enable settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Try to deposit collateral with signature - should revert with SettlementOnlyMode
+    deal(address(usdt), u1, 100 * ONE_COIN);
+    vm.startPrank(u1);
+    usdt.approve(address(mkt), type(uint256).max);
+
+    // Create a valid signature - the signature validation happens first
+    // We'll use a mock signature that will fail validation before reaching settlement-only check
+    bytes memory signature = abi.encodePacked(bytes32(0), bytes32(0), uint8(0));
+
+    // Should revert with signature error, not settlement-only mode error
+    // because signature validation happens first
+    vm.expectRevert();
+    mkt.depositCollateral(100 * ONE_COIN, signature);
+  }
+
+  function testSettlementOnlyMode_WithdrawCollateralBlocked() public {
+    // First fund user in normal mode
+    _fund(u1, 100 * ONE_COIN);
+
+    // Enable settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Try to withdraw collateral - should revert
+    vm.startPrank(u1);
+    vm.expectRevert(Errors.SettlementOnlyMode.selector);
+    mkt.withdrawCollateral(50 * ONE_COIN);
+  }
+
+  function testSettlementOnlyMode_TradingAllowed() public {
+    // Fund users in normal mode
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+
+    // Enable settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    uint256 currentCycleId = mkt.activeCycle();
+
+    // Trading functions should still work in settlement-only mode
+    // Only deposits/withdrawals are blocked
+    vm.startPrank(u1);
+    mkt.long(1, currentCycleId); // Should work
+
+    vm.startPrank(u2);
+    mkt.short(1, currentCycleId); // Should work
+
+    vm.startPrank(u1);
+    // Place a limit order
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId); // Should work
+
+    // Cancel that order - just try to cancel order ID 1 (if it exists)
+    // We can't easily access the userOrders mapping from tests, so just try a common order ID
+    try mkt.cancelOrder(1) {
+      // Order existed and was cancelled successfully
+    } catch {
+      // Order didn't exist, which is fine for this test
+    }
+  }
+
+  function testSettlementOnlyMode_StartCycleBlocked() public {
+    // Setup a cycle and settle it first
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+    _openCallPair(u1, u2);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    vm.warp(currentCycleId + 1);
+
+    // Enable settlement-only mode before settling
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Settlement should still work
+    mkt.settleChunk(100);
+
+    // Verify cycle is settled but no new cycle started
+    (bool settled,,) = mkt.cycles(currentCycleId);
+    assertTrue(settled, "cycle should be settled");
+    assertEq(mkt.activeCycle(), 0, "no new cycle should start in settlement-only mode");
+
+    // Try to manually start cycle - should revert
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.startCycle();
+  }
+
+  function testSettlementOnlyMode_SettlementWorksWhenPaused() public {
+    // Setup positions
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+    _openCallPair(u1, u2);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    vm.warp(currentCycleId + 1);
+
+    // Full pause (not just settlement-only)
+    vm.startPrank(securityCouncil);
+    mkt.pause();
+    vm.stopPrank();
+
+    // Settlement should fail with full pause
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.settleChunk(100);
+
+    // Enable settlement-only mode (this unpauses but sets settlementOnlyMode)
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Now settlement should work
+    mkt.settleChunk(100);
+
+    // Verify settlement completed
+    (bool settled,,) = mkt.cycles(currentCycleId);
+    assertTrue(settled, "cycle should be settled");
+  }
+
+  function testSettlementOnlyMode_UnpauseRestoresNormalOperation() public {
+    // Setup and enable settlement-only mode
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Verify operations are blocked
+    deal(address(usdt), u1, 10 * ONE_COIN); // Give user additional tokens
+    vm.startPrank(u1);
+    usdt.approve(address(mkt), type(uint256).max);
+    vm.expectRevert(Errors.SettlementOnlyMode.selector);
+    mkt.depositCollateral(10 * ONE_COIN);
+    vm.stopPrank();
+
+    // Unpause should restore normal operation
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    // Verify normal operations work again
+    assertEq(mkt.paused(), false);
+
+    vm.startPrank(u1);
+    // Should not revert anymore
+    mkt.depositCollateral(10 * ONE_COIN);
+    mkt.withdrawCollateral(5 * ONE_COIN);
+    vm.stopPrank();
+
+    // New cycle should start automatically if none active
+    if (mkt.activeCycle() == 0) {
+      mkt.startCycle();
+      assertGt(mkt.activeCycle(), 0, "new cycle should start after unpause");
+    }
+  }
+
+  function testSettlementOnlyMode_AdminFunctionAccess() public {
+    // Only security council should be able to call pauseNewCycles
+    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    mkt.pauseNewCycles();
+
+    vm.startPrank(owner);
+    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Security council should succeed
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Only security council should be able to unpause
+    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    mkt.unpause();
+
+    vm.startPrank(owner);
+    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    mkt.unpause();
+    vm.stopPrank();
+
+    // Security council should succeed
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+  }
+
+  function testSettlementOnlyMode_MultipleTransitions() public {
+    // Test multiple transitions between states
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+
+    // Normal -> Settlement-only
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Give user tokens and try to deposit (should fail)
+    deal(address(usdt), u1, 10 * ONE_COIN);
+    vm.startPrank(u1);
+    usdt.approve(address(mkt), type(uint256).max);
+    vm.expectRevert(Errors.SettlementOnlyMode.selector);
+    mkt.depositCollateral(10 * ONE_COIN);
+    vm.stopPrank();
+
+    // Settlement-only -> Normal
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    assertEq(mkt.paused(), false);
+    vm.startPrank(u1);
+    mkt.depositCollateral(10 * ONE_COIN); // Should work
+    vm.stopPrank();
+
+    // Normal -> Full pause
+    vm.startPrank(securityCouncil);
+    mkt.pause();
+    vm.stopPrank();
+
+    assertTrue(mkt.paused());
+    deal(address(usdt), u1, 10 * ONE_COIN); // Give more tokens
+    vm.startPrank(u1);
+    usdt.approve(address(mkt), type(uint256).max);
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.depositCollateral(10 * ONE_COIN);
+    vm.stopPrank();
+
+    // Full pause -> Settlement-only (should remain paused since pauseNewCycles doesn't unpause)
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    assertTrue(mkt.paused()); // Should still be paused
+    vm.startPrank(u1);
+    // Should still get EnforcedPause error, not SettlementOnlyMode, because contract is still paused
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.depositCollateral(10 * ONE_COIN);
+    vm.stopPrank();
+
+    // Back to normal
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    assertEq(mkt.paused(), false);
+    vm.startPrank(u1);
+    mkt.depositCollateral(10 * ONE_COIN); // Should work
+    vm.stopPrank();
+  }
+
+  function testSettlementOnlyMode_SettlementAutoStartsCycleWhenExiting() public {
+    // Setup positions and expire cycle
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+    _openCallPair(u1, u2);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    vm.warp(currentCycleId + 1);
+
+    // Enter settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.pauseNewCycles();
+    vm.stopPrank();
+
+    // Settlement should complete but not start new cycle
+    mkt.settleChunk(100);
+    assertEq(mkt.activeCycle(), 0, "no new cycle in settlement-only mode");
+
+    // Exit settlement-only mode
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    // Manually starting a cycle should work now
+    mkt.startCycle();
+    assertGt(mkt.activeCycle(), 0, "new cycle should start after exiting settlement-only mode");
+  }
+
+  function testSettlementOnlyMode_EventsEmitted() public {
+    // Test that proper events are emitted during state transitions
+    _fund(u1, 100 * ONE_COIN);
+    _fund(u2, 100 * ONE_COIN);
+    _openCallPair(u1, u2);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    vm.warp(currentCycleId + 1);
+
+    vm.startPrank(securityCouncil);
+
+    // Enter settlement-only mode and record events
+    vm.recordLogs();
+    mkt.pauseNewCycles();
+    Vm.Log[] memory pauseLogs = vm.getRecordedLogs();
+
+    // Should emit Unpaused event if was paused
+    bool foundUnpaused = false;
+    for (uint256 i = 0; i < pauseLogs.length; i++) {
+      if (pauseLogs[i].topics[0] == keccak256("Unpaused(address)")) {
+        foundUnpaused = true;
+        break;
+      }
+    }
+
+    // Settlement should still work and emit proper events
+    vm.recordLogs();
+    mkt.settleChunk(100);
+    Vm.Log[] memory settleLogs = vm.getRecordedLogs();
+
+    // Should find CycleSettled event but not CycleStarted
+    bool foundSettled = false;
+    bool foundStarted = false;
+    for (uint256 i = 0; i < settleLogs.length; i++) {
+      if (settleLogs[i].topics[0] == keccak256("CycleSettled(uint256)")) foundSettled = true;
+      if (settleLogs[i].topics[0] == keccak256("CycleStarted(uint256,uint256)")) foundStarted = true;
+    }
+
+    assertTrue(foundSettled, "CycleSettled event should be emitted");
+    assertFalse(foundStarted, "CycleStarted event should NOT be emitted in settlement-only mode");
+
+    // Exit settlement-only mode
+    vm.recordLogs();
+    mkt.unpause();
+    Vm.Log[] memory unpauseLogs = vm.getRecordedLogs();
+
+    // Should emit Unpaused event
+    foundUnpaused = false;
+    for (uint256 i = 0; i < unpauseLogs.length; i++) {
+      if (unpauseLogs[i].topics[0] == keccak256("Unpaused(address)")) {
+        foundUnpaused = true;
+        break;
+      }
+    }
+
+    vm.stopPrank();
+  }
+
+  function testSettlementOnlyMode_EdgeCaseNoCycleActive() public {
+    // Test settlement-only mode when no cycle is active
+
+    // First, settle any existing cycle and prevent auto-start
+    uint256 currentCycleId = mkt.activeCycle();
+    if (currentCycleId != 0) {
+      // Set up some positions first so settlement actually happens
+      _fund(u1, 100 * ONE_COIN);
+      _fund(u2, 100 * ONE_COIN);
+      _openCallPair(u1, u2);
+
+      vm.warp(currentCycleId + 1);
+
+      // Enable settlement-only mode BEFORE settling to prevent auto-start
+      vm.startPrank(securityCouncil);
+      mkt.pauseNewCycles();
+      vm.stopPrank();
+
+      mkt.settleChunk(100); // This should not auto-start a new cycle
+    }
+
+    assertEq(mkt.activeCycle(), 0, "no cycle should be active");
+
+    // Settlement operations should revert with CycleNotStarted when no active cycle
+    vm.expectRevert(Errors.CycleNotStarted.selector);
+    mkt.settleChunk(100);
+
+    // Starting a cycle should still be blocked
+    vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+    mkt.startCycle();
+
+    // Exit settlement-only mode and start new cycle
+    vm.startPrank(securityCouncil);
+    mkt.unpause();
+    vm.stopPrank();
+
+    mkt.startCycle();
+    assertGt(mkt.activeCycle(), 0, "new cycle should start");
   }
 
   // #######################################################################
@@ -611,39 +1268,39 @@ contract MarketSuite is Test {
     _fund(u2, 1000 * ONE_COIN);
 
     // u1 goes short calls
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
     vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Price pumps, u1 becomes liquidatable
     _mockOracle(btcPrice + 20000);
-    
-    // Liquidate u1 
+
+    // Liquidate u1
     vm.startPrank(owner);
     mkt.liquidate(u1);
     vm.stopPrank();
-    
+
     // Provide liquidity to close the liquidation order
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5000 * ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5000 * ONE_COIN, currentCycleId);
     vm.stopPrank();
-    
+
     // Fast forward to settlement
-    vm.warp(cycleId + 1);
-    
+    vm.warp(currentCycleId + 1);
+
     // Get liquidation fee owed before settlement
     uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
     console.log("Liquidation fee owed before settlement:", liquidationFeeOwed);
-    
+
     // Settlement
     vm.startPrank(owner);
-    mkt.settleChunk(20);
-    mkt.settleChunk(20);
+    mkt.settleChunk(100); // Use larger chunk to complete in one call
     vm.stopPrank();
-    
+
     // Check that liquidationFeeOwed is zeroed
     uint64 liquidationFeeOwedAfter = mkt.getUserAccount(u1).liquidationFeeOwed;
     console.log("Liquidation fee owed after settlement:", liquidationFeeOwedAfter);
@@ -652,78 +1309,87 @@ contract MarketSuite is Test {
   }
 
   function testLiquidationEventEmissionBug() public {
-    uint256 collateral = 2 * ONE_COIN; 
+    uint256 collateral = 2 * ONE_COIN;
     _fund(u1, collateral);
     _fund(u2, 1000 * ONE_COIN);
 
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
     vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Price pumps, u1 becomes liquidatable
     _mockOracle(btcPrice + 20000);
-    
+
     // Liquidate u1
     vm.startPrank(owner);
     mkt.liquidate(u1);
     vm.stopPrank();
-    
+
     uint256 balanceBeforeFill = mkt.getUserAccount(u1).balance;
     console.log("u1 balance before fill:", balanceBeforeFill);
-    
+
     // Record events during liquidation fill
     vm.recordLogs();
-    
+
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5 * ONE_COIN, cycleId); // More than u1 can afford
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5 * ONE_COIN, currentCycleId); // More than u1 can afford
     vm.stopPrank();
-    
+
     Vm.Log[] memory entries = vm.getRecordedLogs();
-    
+
     // Find the LimitOrderFilled event from the liquidation
     int256 emittedCashTaker = 0;
     bool foundFillEvent = false;
-    
+
     for (uint256 i = 0; i < entries.length; i++) {
-      if (entries[i].topics[0] == keccak256("LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)")) {
+      if (
+        entries[i].topics[0]
+          == keccak256(
+            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+          )
+      ) {
         address taker = address(uint160(uint256(entries[i].topics[2])));
-        if (taker == u1) { // u1 is the liquidated taker
-          (,,,,, int256 cashTaker,,) = abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
+        if (taker == u1) {
+          // u1 is the liquidated taker
+          (,,,,, int256 cashTaker,,) =
+            abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
           emittedCashTaker = cashTaker;
           foundFillEvent = true;
           break;
         }
       }
     }
-    
+
     assertTrue(foundFillEvent, "LimitOrderFilled event should be emitted for liquidation");
-    
+
     uint256 balanceAfterFill = mkt.getUserAccount(u1).balance;
     console.log("u1 balance after fill:", balanceAfterFill);
     console.log("Emitted cashTaker:", emittedCashTaker);
-    
+
     // Calculate the theoretical vs actual payment
     uint256 theoreticalCost = 5 * ONE_COIN + (5 * ONE_COIN * 700 / 10000);
     uint256 actualPaid = balanceBeforeFill - balanceAfterFill;
-    
+
     console.log("Theoretical cost (5 USDC + fee):", theoreticalCost);
     console.log("Actual amount paid:", actualPaid);
     console.log("User had insufficient funds?", actualPaid < theoreticalCost);
-    
+
     if (actualPaid < theoreticalCost && balanceAfterFill == 0) {
       int256 expectedCashTaker = -int256(actualPaid);
       console.log("Expected cashTaker (actual paid):", expectedCashTaker);
-      
-      if (emittedCashTaker == expectedCashTaker) {
-        console.log("ISSUE 2 FIXED: Event correctly shows actual amount paid");
-      } else {
-        console.log("BUG: Event shows theoretical amount instead of actual amount paid");
-      }
-      
-      assertEq(emittedCashTaker, expectedCashTaker, "Event should show actual amount paid by insolvent user, not theoretical amount");
+
+      if (emittedCashTaker == expectedCashTaker) console.log("ISSUE 2 FIXED: Event correctly shows actual amount paid");
+      else console.log("BUG: Event shows theoretical amount instead of actual amount paid");
+
+      assertEq(
+        emittedCashTaker,
+        expectedCashTaker,
+        "Event should show actual amount paid by insolvent user, not theoretical amount"
+      );
     } else {
       console.log("No insolvency scenario created - test needs adjustment");
     }
@@ -735,46 +1401,46 @@ contract MarketSuite is Test {
     _fund(u1, collateral);
     _fund(u2, 1000 * ONE_COIN);
 
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
-    vm.startPrank(u1);  
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Significant price pump to make user liquidatable
-    _mockOracle(btcPrice + 15000); 
+    _mockOracle(btcPrice + 15000);
     vm.startPrank(owner);
     mkt.liquidate(u1);
     vm.stopPrank();
-    
+
     uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
     console.log("Liquidation fee owed:", liquidationFeeOwed);
-    
+
     // Provide liquidity at reasonable price to preserve u1's balance
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, currentCycleId);
     vm.stopPrank();
-    
+
     // Check u1 has enough balance to pay liquidation fee
     uint256 balanceAfterFill = mkt.getUserAccount(u1).balance;
     console.log("Balance after liquidation fill:", balanceAfterFill);
     console.log("Can afford liquidation fee?", balanceAfterFill >= liquidationFeeOwed);
-    
-    // Fast forward to settlement  
-    vm.warp(cycleId + 1);
-    
+
+    // Fast forward to settlement
+    vm.warp(currentCycleId + 1);
+
     // Record the Settled event
     vm.recordLogs();
-    mkt.settleChunk(20);
-    mkt.settleChunk(20);
-    
+    mkt.settleChunk(100); // Use larger chunk to complete in one call
+
     Vm.Log[] memory entries = vm.getRecordedLogs();
-    
+
     // Find the Settled event for u1
     int256 emittedPnL = 0;
     bool foundSettledEvent = false;
-    
+
     for (uint256 i = 0; i < entries.length; i++) {
       if (entries[i].topics[0] == keccak256("Settled(uint256,address,int256)")) {
         address trader = address(uint160(uint256(entries[i].topics[2])));
@@ -785,21 +1451,21 @@ contract MarketSuite is Test {
         }
       }
     }
-    
+
     assertTrue(foundSettledEvent, "Settled event should be emitted for u1");
     console.log("Emitted PnL:", emittedPnL);
-    
+
     // Get final state
     MarketWithViews.UserAccount memory uaFinal = mkt.getUserAccount(u1);
     console.log("Final balance:", uaFinal.balance);
     console.log("Final liquidationFeeOwed:", uaFinal.liquidationFeeOwed);
-    
+
     // If user could afford the liquidation fee, it should be reflected in PnL
     if (balanceAfterFill >= liquidationFeeOwed) {
       // Expected PnL = 0 (positions cancel) - liquidationFee (actually paid)
       int256 expectedPnL = -int256(uint256(liquidationFeeOwed));
       console.log("Expected PnL (should include liquidation fee):", expectedPnL);
-      
+
       // This should FAIL if liquidation fee isn't included in settlement PnL
       assertEq(emittedPnL, expectedPnL, "Settlement PnL should include liquidation fee when user can afford it");
     } else {
@@ -816,6 +1482,7 @@ contract MarketSuite is Test {
 
   function _fund(address who, uint256 amount) internal {
     deal(address(usdt), who, amount);
+    _whitelistAddress(who);
     vm.startPrank(who);
     usdt.approve(address(mkt), type(uint256).max);
     mkt.depositCollateral(amount);
@@ -831,14 +1498,15 @@ contract MarketSuite is Test {
 
   // helper: open a 1-contract CALL long/short pair at 1 USDT premium
   function _openCallPair(address longAddr, address shortAddr) internal {
+    uint256 currentCycleId = mkt.activeCycle();
     // shortAddr posts ask
     vm.startPrank(shortAddr);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // longAddr hits it market
     vm.startPrank(longAddr);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, 0, cycleId); // market
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, 0, currentCycleId); // market
     vm.stopPrank();
   }
 

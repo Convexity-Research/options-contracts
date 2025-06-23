@@ -18,6 +18,7 @@ contract MarketSuite is Test {
 
   uint256 constant ONE_COIN = 1_000_000; // 6-dec → 1.00
   uint256 constant LOT = 100; // contracts
+  uint256 constant DEFAULT_EXPIRY = 1 minutes;
 
   Token usdt; // USDT0 = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb on hyperEVM. 6 decimals
 
@@ -613,6 +614,215 @@ contract MarketSuite is Test {
     vm.startPrank(u2);
     mkt.placeOrder(MarketSide.CALL_SELL, 1, 0, cycleId);
     vm.stopPrank();
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                   Liquidation Accounting Bug Tests                  #
+  // #                                                                     #
+  // #######################################################################
+
+  function testLiquidationFeeNotZeroedBug() public {
+    uint256 collateral = 2 * ONE_COIN;
+    _fund(u1, collateral);
+    _fund(u2, 1000 * ONE_COIN);
+
+    // u1 goes short calls
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    // Price pumps, u1 becomes liquidatable
+    _mockOracle(btcPrice + 20000);
+    
+    // Liquidate u1 
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+    
+    // Provide liquidity to close the liquidation order
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5000 * ONE_COIN, cycleId);
+    vm.stopPrank();
+    
+    // Fast forward to settlement
+    vm.warp(cycleId + 1);
+    
+    // Get liquidation fee owed before settlement
+    uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
+    console.log("Liquidation fee owed before settlement:", liquidationFeeOwed);
+    
+    // Settlement
+    vm.startPrank(owner);
+    mkt.settleChunk(20);
+    mkt.settleChunk(20);
+    vm.stopPrank();
+    
+    // Check that liquidationFeeOwed is zeroed
+    uint64 liquidationFeeOwedAfter = mkt.getUserAccount(u1).liquidationFeeOwed;
+    console.log("Liquidation fee owed after settlement:", liquidationFeeOwedAfter);
+
+    assertEq(liquidationFeeOwedAfter, 0, "LiquidationFeeOwed should be zero after settlement");
+  }
+
+  function testLiquidationEventEmissionBug() public {
+    uint256 collateral = 2 * ONE_COIN; 
+    _fund(u1, collateral);
+    _fund(u2, 1000 * ONE_COIN);
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    // Price pumps, u1 becomes liquidatable
+    _mockOracle(btcPrice + 20000);
+    
+    // Liquidate u1
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+    
+    uint256 balanceBeforeFill = mkt.getUserAccount(u1).balance;
+    console.log("u1 balance before fill:", balanceBeforeFill);
+    
+    // Record events during liquidation fill
+    vm.recordLogs();
+    
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5 * ONE_COIN, cycleId); // More than u1 can afford
+    vm.stopPrank();
+    
+    Vm.Log[] memory entries = vm.getRecordedLogs();
+    
+    // Find the LimitOrderFilled event from the liquidation
+    int256 emittedCashTaker = 0;
+    bool foundFillEvent = false;
+    
+    for (uint256 i = 0; i < entries.length; i++) {
+      if (entries[i].topics[0] == keccak256("LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)")) {
+        address taker = address(uint160(uint256(entries[i].topics[2])));
+        if (taker == u1) { // u1 is the liquidated taker
+          (uint256 makerOrderId, uint256 takerOrderId, uint256 size, uint256 limitPrice, uint8 side, int256 cashTaker, int256 cashMaker, uint256 btcPrice) = abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
+          emittedCashTaker = cashTaker;
+          foundFillEvent = true;
+          break;
+        }
+      }
+    }
+    
+    assertTrue(foundFillEvent, "LimitOrderFilled event should be emitted for liquidation");
+    
+    uint256 balanceAfterFill = mkt.getUserAccount(u1).balance;
+    console.log("u1 balance after fill:", balanceAfterFill);
+    console.log("Emitted cashTaker:", emittedCashTaker);
+    
+    // Calculate the theoretical vs actual payment
+    uint256 theoreticalCost = 5 * ONE_COIN + (5 * ONE_COIN * 700 / 10000);
+    uint256 actualPaid = balanceBeforeFill - balanceAfterFill;
+    
+    console.log("Theoretical cost (5 USDC + fee):", theoreticalCost);
+    console.log("Actual amount paid:", actualPaid);
+    console.log("User had insufficient funds?", actualPaid < theoreticalCost);
+    
+    if (actualPaid < theoreticalCost && balanceAfterFill == 0) {
+      int256 expectedCashTaker = -int256(actualPaid);
+      console.log("Expected cashTaker (actual paid):", expectedCashTaker);
+      
+      if (emittedCashTaker == expectedCashTaker) {
+        console.log("ISSUE 2 FIXED: Event correctly shows actual amount paid");
+      } else {
+        console.log("BUG: Event shows theoretical amount instead of actual amount paid");
+      }
+      
+      assertEq(emittedCashTaker, expectedCashTaker, "Event should show actual amount paid by insolvent user, not theoretical amount");
+    } else {
+      console.log("No insolvency scenario created - test needs adjustment");
+    }
+  }
+
+  // Liquidation fee should be included in settlement PnL when user can afford it
+  function testLiquidationFeeIncludedInSettlementPnL() public {
+    uint256 collateral = 100 * ONE_COIN;
+    _fund(u1, collateral);
+    _fund(u2, 1000 * ONE_COIN);
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+    vm.startPrank(u1);  
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    // Significant price pump to make user liquidatable
+    _mockOracle(btcPrice + 15000); 
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+    
+    uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
+    console.log("Liquidation fee owed:", liquidationFeeOwed);
+    
+    // Provide liquidity at reasonable price to preserve u1's balance
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, cycleId);
+    vm.stopPrank();
+    
+    // Check u1 has enough balance to pay liquidation fee
+    uint256 balanceAfterFill = mkt.getUserAccount(u1).balance;
+    console.log("Balance after liquidation fill:", balanceAfterFill);
+    console.log("Can afford liquidation fee?", balanceAfterFill >= liquidationFeeOwed);
+    
+    // Fast forward to settlement  
+    vm.warp(cycleId + 1);
+    
+    // Record the Settled event
+    vm.recordLogs();
+    mkt.settleChunk(20);
+    mkt.settleChunk(20);
+    
+    Vm.Log[] memory entries = vm.getRecordedLogs();
+    
+    // Find the Settled event for u1
+    int256 emittedPnL = 0;
+    bool foundSettledEvent = false;
+    
+    for (uint256 i = 0; i < entries.length; i++) {
+      if (entries[i].topics[0] == keccak256("Settled(uint256,address,int256)")) {
+        address trader = address(uint160(uint256(entries[i].topics[2])));
+        if (trader == u1) {
+          emittedPnL = abi.decode(entries[i].data, (int256));
+          foundSettledEvent = true;
+          break;
+        }
+      }
+    }
+    
+    assertTrue(foundSettledEvent, "Settled event should be emitted for u1");
+    console.log("Emitted PnL:", emittedPnL);
+    
+    // Get final state
+    MarketWithViews.UserAccount memory uaFinal = mkt.getUserAccount(u1);
+    console.log("Final balance:", uaFinal.balance);
+    console.log("Final liquidationFeeOwed:", uaFinal.liquidationFeeOwed);
+    
+    // If user could afford the liquidation fee, it should be reflected in PnL
+    if (balanceAfterFill >= liquidationFeeOwed) {
+      // Expected PnL = 0 (positions cancel) - liquidationFee (actually paid)
+      int256 expectedPnL = -int256(uint256(liquidationFeeOwed));
+      console.log("Expected PnL (should include liquidation fee):", expectedPnL);
+      
+      // This should FAIL if liquidation fee isn't included in settlement PnL
+      assertEq(emittedPnL, expectedPnL, "Settlement PnL should include liquidation fee when user can afford it");
+    } else {
+      console.log("User couldn't afford liquidation fee, test invalid");
+      assertTrue(false, "Test setup failed - user should have enough balance");
+    }
   }
 
   // #######################################################################

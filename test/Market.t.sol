@@ -858,11 +858,12 @@ contract MarketSuite is Test {
     _fund(u2, 1000 * ONE_COIN);
 
     // u1 goes short calls
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
     vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Price pumps, u1 becomes liquidatable
@@ -875,11 +876,11 @@ contract MarketSuite is Test {
     
     // Provide liquidity to close the liquidation order
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5000 * ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5000 * ONE_COIN, currentCycleId);
     vm.stopPrank();
     
     // Fast forward to settlement
-    vm.warp(cycleId + 1);
+    vm.warp(currentCycleId + 1);
     
     // Get liquidation fee owed before settlement
     uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
@@ -887,8 +888,7 @@ contract MarketSuite is Test {
     
     // Settlement
     vm.startPrank(owner);
-    mkt.settleChunk(20);
-    mkt.settleChunk(20);
+    mkt.settleChunk(100); // Use larger chunk to complete in one call
     vm.stopPrank();
     
     // Check that liquidationFeeOwed is zeroed
@@ -903,11 +903,12 @@ contract MarketSuite is Test {
     _fund(u1, collateral);
     _fund(u2, 1000 * ONE_COIN);
 
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
     vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Price pumps, u1 becomes liquidatable
@@ -925,7 +926,7 @@ contract MarketSuite is Test {
     vm.recordLogs();
     
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5 * ONE_COIN, cycleId); // More than u1 can afford
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 5 * ONE_COIN, currentCycleId); // More than u1 can afford
     vm.stopPrank();
     
     Vm.Log[] memory entries = vm.getRecordedLogs();
@@ -982,11 +983,12 @@ contract MarketSuite is Test {
     _fund(u1, collateral);
     _fund(u2, 1000 * ONE_COIN);
 
+    uint256 currentCycleId = mkt.activeCycle();
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
     vm.startPrank(u1);  
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
 
     // Significant price pump to make user liquidatable
@@ -1000,7 +1002,7 @@ contract MarketSuite is Test {
     
     // Provide liquidity at reasonable price to preserve u1's balance
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, currentCycleId);
     vm.stopPrank();
     
     // Check u1 has enough balance to pay liquidation fee
@@ -1009,12 +1011,11 @@ contract MarketSuite is Test {
     console.log("Can afford liquidation fee?", balanceAfterFill >= liquidationFeeOwed);
     
     // Fast forward to settlement  
-    vm.warp(cycleId + 1);
+    vm.warp(currentCycleId + 1);
     
     // Record the Settled event
     vm.recordLogs();
-    mkt.settleChunk(20);
-    mkt.settleChunk(20);
+    mkt.settleChunk(100); // Use larger chunk to complete in one call
     
     Vm.Log[] memory entries = vm.getRecordedLogs();
     

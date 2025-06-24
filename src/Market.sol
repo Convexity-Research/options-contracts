@@ -1034,30 +1034,22 @@ contract Market is
   function _calculateTraderPnl(uint256 cycleId, uint64 price, address trader) internal view returns (int256 pnl) {
     UserAccount memory uaMem = userAccounts[trader];
     if ((uaMem.longCalls | uaMem.shortCalls | uaMem.longPuts | uaMem.shortPuts) == 0) return 0;
-
-    /* intrinsic of calls */
-    int256 diff = int256(uint256(price)) - int256(uint256(cycles[cycleId].strikePrice));
-    if (diff > 0) {
-      // long calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
-    } else {
-      // short calls win
-      pnl += diff * int256(uint256(uaMem.longCalls)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortCalls)) / int256(CONTRACT_SIZE);
+    uint64 strike = cycles[cycleId].strikePrice;
+    // 1) Calls in-the-money   (price > strike)
+    if (price > strike) {
+      uint256 intrinsic = price - strike;
+      int256 netCalls = int256(uint256(uaMem.longCalls)) - int256(uint256(uaMem.shortCalls));
+      pnl = int256(intrinsic) * netCalls / int256(CONTRACT_SIZE);
+      return pnl;
     }
-
-    /* intrinsic of puts (mirror) */
-    diff = int256(uint256(cycles[cycleId].strikePrice)) - int256(uint256(price));
-    if (diff > 0) {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
-    } else {
-      pnl += diff * int256(uint256(uaMem.longPuts)) / int256(CONTRACT_SIZE);
-      pnl -= diff * int256(uint256(uaMem.shortPuts)) / int256(CONTRACT_SIZE);
+    // 2) Puts in-the-money   (price < strike)
+    if (price < strike) {
+      uint256 intrinsic = strike - price;
+      int256 netPuts = int256(uint256(uaMem.longPuts)) - int256(uint256(uaMem.shortPuts));
+      pnl = int256(intrinsic) * netPuts / int256(CONTRACT_SIZE);
+      return pnl;
     }
-
-    return pnl;
+    return 0;
   }
 
   function _doPhase1(uint256 cycleId, uint64 price, uint256 max) internal returns (uint256) {

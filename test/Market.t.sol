@@ -1266,7 +1266,7 @@ contract MarketSuite is Test {
     uint256 traderDeposit = 6 * ONE_COIN + 100000; // A bit extra to cover fees
     uint256 mmDeposit = 1_000 * ONE_COIN;
 
-    int256 backendBalance = 0;
+    int256 backendBalance;
 
     // fund accounts
     _fund(u1, traderDeposit); // will be liquidated
@@ -1295,6 +1295,8 @@ contract MarketSuite is Test {
     //  premium legs net to zero -> only taker fees are paid (2×0.07 USDT)
     uint256 fee = 2 * orderSize * premiumPrice * uint256(TAKER_FEE_BPS) / 10_000; // 2x for buyCall and sellPut
     assertEq(mkt.getUserAccount(u1).balance, balBefore - fee, "post-trade balance incorrect");
+    backendBalance += _getCashTakerFromLimitOrderFilledEvents(lg);
+    assertEq(uint256(backendBalance), mkt.getUserAccount(u1).balance, "backend balance incorrect");
 
     // ---------------------------------------------------------------------
     // 2.  BTC price dumps -> u1 short-put deeply ITM -> liquidatable
@@ -1310,20 +1312,21 @@ contract MarketSuite is Test {
     // ---------------------------------------------------------------------
     // 3.  Liquidate (orders are FILLED, no queue left)
     // ---------------------------------------------------------------------
-    vm.recordLogs();
     vm.startPrank(owner);
     balBefore = mkt.getUserAccount(u1).balance;
+    vm.recordLogs();
     mkt.liquidate(u1);
-    vm.stopPrank();
     lg = vm.getRecordedLogs();
+    vm.stopPrank();
 
     fee = orderSize * premiumPrice * uint256(TAKER_FEE_BPS) / 10_000; // 2x for buyCall and sellPut
 
-    console.log("balBefore", balBefore);
-    console.log("fee", fee);
-    console.log("premiumPrice", premiumPrice);
-    console.log("orderSize", orderSize);
-    assertEq(mkt.getUserAccount(u1).balance, balBefore - fee - (premiumPrice * orderSize), "balance after liquidation wrong");
+    assertEq(
+      mkt.getUserAccount(u1).balance, balBefore - fee - (premiumPrice * orderSize), "balance after liquidation wrong"
+    );
+
+    uint256 liqFeeOwed = _getLiquidationFeeOwed(lg);
+    backendBalance = 0; // We have to manually set to zero in backend
 
     //   liquidation flags
     MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
@@ -1336,20 +1339,21 @@ contract MarketSuite is Test {
     bool empty = q.length == 0 || head >= q.length || q[head].size == 0;
     assertTrue(empty, "taker queue should be empty");
 
-    //   event sanity
-    bool seenLiquidated = false;
-    bool seenFilled = false;
-    for (uint256 i; i < lg.length; ++i) {
-      if (lg[i].topics[0] == keccak256("Liquidated(uint256,address)")) seenLiquidated = true;
-      if (
-        lg[i].topics[0]
-          == keccak256(
-            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
-          ) && address(uint160(uint256(lg[i].topics[2]))) == u1
-      ) seenFilled = true;
-    }
-    assertTrue(seenLiquidated, "Liquidated evt missing");
-    assertTrue(seenFilled, "LimitOrderFilled evt missing");
+    // Go to settlement
+
+    vm.warp(cycleId + 1);
+    vm.recordLogs();
+    mkt.settleChunk(100);
+    lg = vm.getRecordedLogs();
+
+    uint256 liqFeePaid = _getLiquidationFeePaid(lg);
+
+    // The liquidation fee we recoup will be less than that first calculated, as we wait until after taker fees + premiums are paid
+    assertEq(liqFeePaid, liqFeeOwed - fee - (premiumPrice * orderSize), "liquidation fee paid should be equal to liquidation fee owed");
+
+    // Check user doesn't get any pnl on settlement. In this case, as liquidation orders are filled, pnl should be zero
+    int256 pnl = _getPnl(lg, u1);
+    assertEq(pnl, 0, "pnl should be zero");
   }
 
   function testLiquidationFromPriceFall_OrdersUnfilled() public {}
@@ -1796,5 +1800,63 @@ contract MarketSuite is Test {
 
   function _isBuy(MarketSide side) internal pure returns (bool) {
     return side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY;
+  }
+
+  function _getLiquidationFeePaid(Vm.Log[] memory logs) internal pure returns (uint256) {
+    for (uint256 i; i < logs.length; ++i) {
+      if (logs[i].topics[0] == keccak256("LiquidationFeePaid(uint256,address,uint256)")) {
+        (uint256 liqFeePaid) = abi.decode(logs[i].data, (uint256));
+        return liqFeePaid;
+      }
+    }
+    return 0;
+  }
+
+  function _getLiquidationFeeOwed(Vm.Log[] memory logs) internal pure returns (uint256) {
+    console.log("checking liquidation fee owedlogs");
+    for (uint256 i; i < logs.length; ++i) {
+      if (logs[i].topics[0] == keccak256("Liquidated(uint256,address,uint256)")) {
+        console.log("found liquidation fee owed");
+        console.logBytes(logs[i].data);
+        (uint256 liqFeeOwed) = abi.decode(logs[i].data, (uint256));
+        return liqFeeOwed;
+      }
+    }
+    return 0;
+  }
+
+  function _getCashTakerFromLimitOrderFilledEvents(Vm.Log[] memory logs) internal view returns (int256 totalCashTaker) {
+    for (uint256 i; i < logs.length; ++i) {
+      if (
+        logs[i].topics[0]
+          == keccak256(
+            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+          ) && address(uint160(uint256(logs[i].topics[2]))) == u1 // taker == u1
+      ) {
+        (
+          ,
+          ,
+          ,
+          ,
+          , // ignore
+          int256 cashTaker,
+          ,
+          
+        ) = abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
+        totalCashTaker += cashTaker; // CALL leg & PUT leg
+      }
+    }
+  }
+
+  function _getPnl(Vm.Log[] memory logs, address trader) internal view returns (int256) {
+    for (uint256 i; i < logs.length; ++i) {
+      if (logs[i].topics[0] == keccak256("Settled(uint256,address,int256)")) {
+        if (address(uint160(uint256(logs[i].topics[2]))) == trader) {
+          (int256 pnl) = abi.decode(logs[i].data, (int256));
+          return pnl;
+        }
+      }
+    }
+    revert("Settled event not found");
   }
 }

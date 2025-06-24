@@ -14,8 +14,6 @@ import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/met
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import "forge-std/console.sol";
-
 contract Market is
   IMarket,
   Initializable,
@@ -75,8 +73,8 @@ contract Market is
 
   //------- Trading/Settlement -------
   address[] public traders;
-  mapping(address => uint32[]) public userOrders; // Track all order IDs per user
-  uint256 public cursor; // settlement iterator
+  mapping(address => uint32[]) userOrders; // Track all order IDs per user
+  uint256 cursor; // settlement iterator
 
   TakerQ[][4] internal takerQ; // 4 buckets
   uint256[4] public tqHead; // cursor per bucket
@@ -109,7 +107,8 @@ contract Market is
   event CycleSettled(uint256 indexed cycleId);
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
-  event Liquidated(uint256 indexed cycleId, address indexed trader);
+  event Liquidated(uint256 indexed cycleId, address indexed trader, uint256 liqFeeOwed);
+  event LiquidationFeePaid(uint256 indexed cycleId, address indexed trader, uint256 liqFeePaid);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
   event LimitOrderPlaced(
@@ -282,7 +281,7 @@ contract Market is
     }
 
     UserAccount storage ua = userAccounts[trader];
-    UserAccount storage house = userAccounts[address(this)];
+    UserAccount storage house = userAccounts[feeRecipient];
 
     int256 netShortCalls = int256(uint256(ua.shortCalls)) - int256(uint256(ua.longCalls));
     int256 netShortPuts = int256(uint256(ua.shortPuts)) - int256(uint256(ua.longPuts));
@@ -290,6 +289,7 @@ contract Market is
     // By definition, liquidation fee is the balance of the trader, since this only happens when trader exceeds 1000x
     // leverage, which means going under 0.1% margin
     ua.liquidationQueued = true;
+    uint256 liqFeeOwed = uint256(ua.balance);
 
     // Case 1: both sides net-short -> close both, confiscate nothing
     if (netShortCalls > 0 && netShortPuts > 0) {
@@ -302,6 +302,7 @@ contract Market is
 
       ua.longPuts -= uint32(uint256(-netShortPuts));
       house.longPuts += uint32(uint256(-netShortPuts)); // netShortPuts is negative (or 0), denoting the net long puts
+      traders.push(feeRecipient); // Add this contract to ensure it gets any liquidation-sourced longs
     }
     // Case 3: only puts net-short
     else {
@@ -309,9 +310,10 @@ contract Market is
 
       ua.longCalls -= uint32(uint256(-netShortCalls));
       house.longCalls += uint32(uint256(-netShortCalls)); // netShortCalls is negative, denoting the net long calls
+      traders.push(feeRecipient); // Add this contract to ensure it gets any liquidation-sourced longs
     }
 
-    emit Liquidated(activeCycle, trader);
+    emit Liquidated(activeCycle, trader, liqFeeOwed);
   }
 
   function settleChunk(uint256 max) external {
@@ -696,14 +698,12 @@ contract Market is
     // Liquidation check
     {
       if (isLiquidationOrder) {
-        console.log("liquidation order checking");
         uint256 shortCalls = uaTaker.shortCalls;
         uint256 shortPuts = uaTaker.shortPuts;
         uint256 longCalls = uaTaker.longCalls;
         uint256 longPuts = uaTaker.longPuts;
 
         if (longCalls >= shortCalls && longPuts >= shortPuts) {
-          console.log("liquidation completed");
           uaTaker.liquidationQueued = false;
           uaTaker.liquidationCompleted = 1;
         }
@@ -1139,9 +1139,11 @@ contract Market is
     UserAccount storage ua = userAccounts[trader];
     if (ua.liquidationCompleted == 0) return;
 
-    userAccounts[feeRecipient].balance += ua.balance;
+    uint64 amt = ua.balance;
+    userAccounts[feeRecipient].balance += amt;
     ua.balance = 0;
     ua.liquidationCompleted = 0;
+    emit LiquidationFeePaid(activeCycle, trader, amt);
   }
 
   function _doPhase2(uint256 cycleId, uint256 max) internal {

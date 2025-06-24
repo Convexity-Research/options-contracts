@@ -267,13 +267,13 @@ contract Market is
 
     // Cancel limit orders and taker queue entries
     {
-      uint32[] memory ids = userOrders[trader];
-      for (uint256 k; k < ids.length; ++k) {
-        uint32 id = ids[k];
+      uint32[] memory orderIds = userOrders[trader];
+      for (uint256 k; k < orderIds.length; ++k) {
+        uint32 id = orderIds[k];
         if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
       }
 
-      // Clear user's order tracking
+      // Clear all taker queue entries for this trader
       _clearTakerQueueEntries(trader);
 
       // Clear user's order tracking

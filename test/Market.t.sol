@@ -1262,6 +1262,106 @@ contract MarketSuite is Test {
   // #                                                                     #
   // #######################################################################
 
+  function testLiquidationFromPriceFall_OrdersFilled() public {
+    uint256 traderDeposit = 6 * ONE_COIN + 100000; // A bit extra to cover fees
+    uint256 mmDeposit = 1_000 * ONE_COIN;
+
+    int256 backendBalance = 0;
+
+    // fund accounts
+    _fund(u1, traderDeposit); // will be liquidated
+    _fund(u2, mmDeposit); // market-maker / liquidity
+
+    backendBalance += int256(traderDeposit);
+
+    // ---------------------------------------------------------------------
+    // 1.  Provide resting liquidity so u1’s `long()` market order executes
+    // ---------------------------------------------------------------------
+    vm.startPrank(u2);
+    uint256 premiumPrice = 10000;
+    uint256 orderSize = 5;
+    mkt.placeOrder(MarketSide.CALL_SELL, orderSize, premiumPrice, 0); // ask
+    mkt.placeOrder(MarketSide.PUT_BUY, orderSize, premiumPrice, 0); // bid
+    vm.stopPrank();
+
+    // record initial balance & open long
+    uint256 balBefore = mkt.getUserAccount(u1).balance;
+    vm.startPrank(u1);
+    vm.recordLogs();
+    mkt.long(orderSize, 0); // market order
+    Vm.Log[] memory lg = vm.getRecordedLogs();
+    vm.stopPrank();
+
+    //  premium legs net to zero -> only taker fees are paid (2×0.07 USDT)
+    uint256 fee = 2 * orderSize * premiumPrice * uint256(TAKER_FEE_BPS) / 10_000; // 2x for buyCall and sellPut
+    assertEq(mkt.getUserAccount(u1).balance, balBefore - fee, "post-trade balance incorrect");
+
+    // ---------------------------------------------------------------------
+    // 2.  BTC price dumps -> u1 short-put deeply ITM -> liquidatable
+    // ---------------------------------------------------------------------
+    _mockOracle(btcPrice - 15_000);
+    assertTrue(mkt.isLiquidatable(u1), "should be liquidatable after price fall");
+
+    //  liquidity that will INSTANTLY close the puts inside `liquidate`
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.PUT_SELL, 5, premiumPrice, 0);
+    vm.stopPrank();
+
+    // ---------------------------------------------------------------------
+    // 3.  Liquidate (orders are FILLED, no queue left)
+    // ---------------------------------------------------------------------
+    vm.recordLogs();
+    vm.startPrank(owner);
+    balBefore = mkt.getUserAccount(u1).balance;
+    mkt.liquidate(u1);
+    vm.stopPrank();
+    lg = vm.getRecordedLogs();
+
+    fee = orderSize * premiumPrice * uint256(TAKER_FEE_BPS) / 10_000; // 2x for buyCall and sellPut
+
+    console.log("balBefore", balBefore);
+    console.log("fee", fee);
+    console.log("premiumPrice", premiumPrice);
+    console.log("orderSize", orderSize);
+    assertEq(mkt.getUserAccount(u1).balance, balBefore - fee - (premiumPrice * orderSize), "balance after liquidation wrong");
+
+    //   liquidation flags
+    MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
+    assertFalse(ua.liquidationQueued, "liq flag should be cleared");
+    assertEq(ua.liquidationCompleted, 1, "liquidationCompleted should be 1");
+
+    //   no remaining queued PUT-buys
+    (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    uint256 head = mkt.tqHead(uint256(MarketSide.PUT_BUY));
+    bool empty = q.length == 0 || head >= q.length || q[head].size == 0;
+    assertTrue(empty, "taker queue should be empty");
+
+    //   event sanity
+    bool seenLiquidated = false;
+    bool seenFilled = false;
+    for (uint256 i; i < lg.length; ++i) {
+      if (lg[i].topics[0] == keccak256("Liquidated(uint256,address)")) seenLiquidated = true;
+      if (
+        lg[i].topics[0]
+          == keccak256(
+            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+          ) && address(uint160(uint256(lg[i].topics[2]))) == u1
+      ) seenFilled = true;
+    }
+    assertTrue(seenLiquidated, "Liquidated evt missing");
+    assertTrue(seenFilled, "LimitOrderFilled evt missing");
+  }
+
+  function testLiquidationFromPriceFall_OrdersUnfilled() public {}
+
+  function testLiquidationFromPricePump_OrdersFilled() public {}
+
+  function testLiquidationFromPricePump_OrdersUnfilled() public {}
+
+  function testLiquidationFromPremiumOverpayment_Long() public {}
+
+  function testLiquidationFromPremiumOverpayment_Short() public {}
+
   function testLiquidationFeeNotZeroedBug() public {
     uint256 collateral = 2 * ONE_COIN;
     _fund(u1, collateral);
@@ -1292,9 +1392,9 @@ contract MarketSuite is Test {
     // Fast forward to settlement
     vm.warp(currentCycleId + 1);
 
-    // Get liquidation fee owed before settlement
-    uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
-    console.log("Liquidation fee owed before settlement:", liquidationFeeOwed);
+    // Check liquidation completed
+    uint64 liquidationCompleted = mkt.getUserAccount(u1).liquidationCompleted;
+    console.log("Liquidation completed before settlement:", liquidationCompleted);
 
     // Settlement
     vm.startPrank(owner);
@@ -1302,10 +1402,9 @@ contract MarketSuite is Test {
     vm.stopPrank();
 
     // Check that liquidationFeeOwed is zeroed
-    uint64 liquidationFeeOwedAfter = mkt.getUserAccount(u1).liquidationFeeOwed;
-    console.log("Liquidation fee owed after settlement:", liquidationFeeOwedAfter);
+    uint64 liquidationCompletedAfter = mkt.getUserAccount(u1).liquidationCompleted;
 
-    assertEq(liquidationFeeOwedAfter, 0, "LiquidationFeeOwed should be zero after settlement");
+    assertEq(liquidationCompletedAfter, 0, "LiquidationCompleted should be 0 after settlement");
   }
 
   function testLiquidationEventEmissionBug() public {
@@ -1392,85 +1491,6 @@ contract MarketSuite is Test {
       );
     } else {
       console.log("No insolvency scenario created - test needs adjustment");
-    }
-  }
-
-  // Liquidation fee should be included in settlement PnL when user can afford it
-  function testLiquidationFeeIncludedInSettlementPnL() public {
-    uint256 collateral = 100 * ONE_COIN;
-    _fund(u1, collateral);
-    _fund(u2, 1000 * ONE_COIN);
-
-    uint256 currentCycleId = mkt.activeCycle();
-    vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
-    vm.stopPrank();
-    vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
-    vm.stopPrank();
-
-    // Significant price pump to make user liquidatable
-    _mockOracle(btcPrice + 15000);
-    vm.startPrank(owner);
-    mkt.liquidate(u1);
-    vm.stopPrank();
-
-    uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
-    console.log("Liquidation fee owed:", liquidationFeeOwed);
-
-    // Provide liquidity at reasonable price to preserve u1's balance
-    vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.CALL_SELL, 1, 10 * ONE_COIN, currentCycleId);
-    vm.stopPrank();
-
-    // Check u1 has enough balance to pay liquidation fee
-    uint256 balanceAfterFill = mkt.getUserAccount(u1).balance;
-    console.log("Balance after liquidation fill:", balanceAfterFill);
-    console.log("Can afford liquidation fee?", balanceAfterFill >= liquidationFeeOwed);
-
-    // Fast forward to settlement
-    vm.warp(currentCycleId + 1);
-
-    // Record the Settled event
-    vm.recordLogs();
-    mkt.settleChunk(100); // Use larger chunk to complete in one call
-
-    Vm.Log[] memory entries = vm.getRecordedLogs();
-
-    // Find the Settled event for u1
-    int256 emittedPnL = 0;
-    bool foundSettledEvent = false;
-
-    for (uint256 i = 0; i < entries.length; i++) {
-      if (entries[i].topics[0] == keccak256("Settled(uint256,address,int256)")) {
-        address trader = address(uint160(uint256(entries[i].topics[2])));
-        if (trader == u1) {
-          emittedPnL = abi.decode(entries[i].data, (int256));
-          foundSettledEvent = true;
-          break;
-        }
-      }
-    }
-
-    assertTrue(foundSettledEvent, "Settled event should be emitted for u1");
-    console.log("Emitted PnL:", emittedPnL);
-
-    // Get final state
-    MarketWithViews.UserAccount memory uaFinal = mkt.getUserAccount(u1);
-    console.log("Final balance:", uaFinal.balance);
-    console.log("Final liquidationFeeOwed:", uaFinal.liquidationFeeOwed);
-
-    // If user could afford the liquidation fee, it should be reflected in PnL
-    if (balanceAfterFill >= liquidationFeeOwed) {
-      // Expected PnL = 0 (positions cancel) - liquidationFee (actually paid)
-      int256 expectedPnL = -int256(uint256(liquidationFeeOwed));
-      console.log("Expected PnL (should include liquidation fee):", expectedPnL);
-
-      // This should FAIL if liquidation fee isn't included in settlement PnL
-      assertEq(emittedPnL, expectedPnL, "Settlement PnL should include liquidation fee when user can afford it");
-    } else {
-      console.log("User couldn't afford liquidation fee, test invalid");
-      assertTrue(false, "Test setup failed - user should have enough balance");
     }
   }
 

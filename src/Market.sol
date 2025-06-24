@@ -14,6 +14,8 @@ import {ERC2771ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/met
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import "forge-std/console.sol";
+
 contract Market is
   IMarket,
   Initializable,
@@ -54,7 +56,7 @@ contract Market is
     bool activeInCycle;
     bool liquidationQueued;
     uint64 balance;
-    uint64 liquidationFeeOwed;
+    uint64 liquidationCompleted;
     uint64 scratchPnL;
     uint48 _gap; // 48 remaining bits for future use. Packs position data into next slot
     uint32 longCalls;
@@ -264,34 +266,50 @@ contract Market is
     uint64 price = _getOraclePrice();
     if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
-    // Cancel all maker orders
-    uint32[] memory orderIds = userOrders[trader];
-    for (uint256 k; k < orderIds.length; ++k) {
-      uint32 id = orderIds[k];
-      // Double check order still exists before cancelling
-      if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
+    // Cancel limit orders and taker queue entries
+    {
+      uint32[] memory ids = userOrders[trader];
+      for (uint256 k; k < ids.length; ++k) {
+        uint32 id = ids[k];
+        if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
+      }
+
+      // Clear user's order tracking
+      _clearTakerQueueEntries(trader);
+
+      // Clear user's order tracking
+      _clearUserOrders(trader);
     }
 
-    // Clear all taker queue entries for this trader
-    _clearTakerQueueEntries(trader);
-
-    // Clear user's order tracking
-    _clearUserOrders(trader);
-
     UserAccount storage ua = userAccounts[trader];
-    uint256 shortCalls = ua.shortCalls > ua.longCalls ? ua.shortCalls - ua.longCalls : 0;
-    uint256 shortPuts = ua.shortPuts > ua.longPuts ? ua.shortPuts - ua.longPuts : 0;
+    UserAccount storage house = userAccounts[address(this)];
 
-    // Calculate liquidation fee based on notional value of NET position being liquidated
-    uint256 liquidationFee = (shortCalls + shortPuts) * price * liquidationFeeBps / denominator / CONTRACT_SIZE;
+    int256 netShortCalls = int256(uint256(ua.shortCalls)) - int256(uint256(ua.longCalls));
+    int256 netShortPuts = int256(uint256(ua.shortPuts)) - int256(uint256(ua.longPuts));
 
-    ua.liquidationFeeOwed = uint64(liquidationFee);
+    // By definition, liquidation fee is the balance of the trader, since this only happens when trader exceeds 1000x
+    // leverage, which means going under 0.1% margin
     ua.liquidationQueued = true;
 
-    // Now execute market orders to close positions
-    // Users may have insufficient balance to cover buying the puts/calls, but this is handled in _marketOrder
-    if (shortCalls > 0) _marketOrder(MarketSide.CALL_BUY, uint128(shortCalls), trader, 0);
-    if (shortPuts > 0) _marketOrder(MarketSide.PUT_BUY, uint128(shortPuts), trader, 0);
+    // Case 1: both sides net-short -> close both, confiscate nothing
+    if (netShortCalls > 0 && netShortPuts > 0) {
+      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, 0);
+      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, 0);
+    }
+    // Case 2: only calls net-short. Net calls and confiscate net long puts
+    else if (netShortCalls > 0) {
+      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, 0);
+
+      ua.longPuts -= uint32(uint256(-netShortPuts));
+      house.longPuts += uint32(uint256(-netShortPuts)); // netShortPuts is negative (or 0), denoting the net long puts
+    }
+    // Case 3: only puts net-short
+    else {
+      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, 0);
+
+      ua.longCalls -= uint32(uint256(-netShortCalls));
+      house.longCalls += uint32(uint256(-netShortCalls)); // netShortCalls is negative, denoting the net long calls
+    }
 
     emit Liquidated(activeCycle, trader);
   }
@@ -678,12 +696,17 @@ contract Market is
     // Liquidation check
     {
       if (isLiquidationOrder) {
+        console.log("liquidation order checking");
         uint256 shortCalls = uaTaker.shortCalls;
         uint256 shortPuts = uaTaker.shortPuts;
         uint256 longCalls = uaTaker.longCalls;
         uint256 longPuts = uaTaker.longPuts;
 
-        if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
+        if (longCalls >= shortCalls && longPuts >= shortPuts) {
+          console.log("liquidation completed");
+          uaTaker.liquidationQueued = false;
+          uaTaker.liquidationCompleted = 1;
+        }
       }
     }
 
@@ -1064,10 +1087,9 @@ contract Market is
       address trader = traders[i];
 
       // Charge liquidation fee, if any
-      uint256 feePaid = _chargeLiquidationFee(trader);
+      _chargeLiquidationFee(trader);
 
-      // pnl
-      int256 pnl = _calculateTraderPnl(cycleId, price, trader) - int256(feePaid);
+      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
 
       UserAccount storage ua = userAccounts[trader];
       if (pnl < 0) {
@@ -1080,7 +1102,10 @@ contract Market is
         uint256 unpaid = debit - amountPaid;
         badDebt += unpaid;
 
-        emit Settled(cycleId, trader, pnl);
+        // Emit pnl as normal if not liquidated. Don't emit negative pnls for liquidated users who couldn't get their
+        // positions closed out, as their balance is already 0
+        if (ua.liquidationCompleted == 0) emit Settled(cycleId, trader, pnl);
+        else emit Settled(cycleId, trader, 0);
       } else if (pnl > 0) {
         // Winner - store PnL for phase 2
         ua.scratchPnL = uint64(uint256(pnl));
@@ -1109,18 +1134,14 @@ contract Market is
   }
 
   // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
-  function _chargeLiquidationFee(address trader) internal returns (uint256) {
+  // We also don't charge fee if the user's liquidation orders didn't get matched.
+  function _chargeLiquidationFee(address trader) internal {
     UserAccount storage ua = userAccounts[trader];
-    uint256 fee = ua.liquidationFeeOwed;
-    uint256 pay;
-    if (fee > 0) {
-      pay = ua.balance < fee ? ua.balance : fee;
-      ua.balance -= uint64(pay);
-      ua.liquidationFeeOwed = 0;
-      userAccounts[feeRecipient].balance += uint64(pay);
-    }
+    if (ua.liquidationCompleted == 0) return;
 
-    return pay;
+    userAccounts[feeRecipient].balance += ua.balance;
+    ua.balance = 0;
+    ua.liquidationCompleted = 0;
   }
 
   function _doPhase2(uint256 cycleId, uint256 max) internal {

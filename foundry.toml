@@ -1,7 +1,7 @@
 [profile.default]
   libs = ["lib"]
   optimizer = true
-  optimizer_runs = 1
+  optimizer_runs = 2
   out = "out"
   solc_version = "0.8.30"
   src = "src"

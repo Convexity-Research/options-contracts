@@ -1476,6 +1476,221 @@ contract MarketSuite is Test {
 
   // #######################################################################
   // #                                                                     #
+  // #                             Pnl                                     #
+  // #                                                                     #
+  // #######################################################################
+
+  function testLongThenMM_PriceUp() public {
+    uint256 deposit = 5_000 * ONE_COIN; // 5 000 USDT0
+    _fund(u1, deposit);
+    _fund(u2, deposit);
+
+    vm.startPrank(u1);
+    mkt.long(10, 0); // 10 long calls + 10 short puts
+    vm.stopPrank();
+
+    uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
+    uint256 putPrem = 1 * ONE_COIN; // 1 USDT0 / put
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 10, callPrem, cycleId);
+    mkt.placeOrder(MarketSide.PUT_BUY, 10, putPrem, cycleId);
+    vm.stopPrank();
+
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 15_000); // 115 000 -> calls ITM by 15 000
+
+    mkt.settleChunk(20);
+
+    uint256 callPremAll = callPrem * 10; // 20 USDT0
+    uint256 putPremAll = putPrem * 10; // 10 USDT0
+
+    // taker fees (u1 pays two of them)
+    uint256 takerFeeCall = callPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 1.4
+    uint256 takerFeePut = putPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 0.7
+
+    // u1 cash flow during trade
+    int256 cashU1 = -int256(callPremAll) - int256(takerFeeCall) + int256(putPremAll) - int256(takerFeePut);
+
+    // intrinsic P/L (calls ITM)
+    uint256 intrinsic = 15_000 * ONE_COIN * 10 / CONTRACT_SIZE;
+
+    // final expected balances
+    uint256 expectU1 = uint256(int256(deposit) + cashU1 + int256(intrinsic));
+    int256 makerFeeCall = int256(callPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+    int256 makerFeePut = int256(putPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+
+    int256 cashU2 = int256(callPremAll) - makerFeeCall - int256(putPremAll) - makerFeePut;
+
+    uint256 expectU2 = uint256(int256(deposit) + cashU2 - int256(intrinsic));
+
+    uint256 balU1 = mkt.getUserAccount(u1).balance;
+    uint256 balU2 = mkt.getUserAccount(u2).balance;
+
+    assertEq(balU1, expectU1, "u1 balance mismatch after pump");
+    assertEq(balU2, expectU2, "u2 balance mismatch after pump");
+  }
+
+  function testLongThenMM_PriceDown() public {
+    uint256 deposit = 5_000 * ONE_COIN; // 5 000 USDT0
+    _fund(u1, deposit);
+    _fund(u2, deposit);
+
+    vm.startPrank(u1);
+    mkt.long(10, 0); // 10 long calls + 10 short puts
+    vm.stopPrank();
+
+    uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
+    uint256 putPrem = 1 * ONE_COIN; // 1 USDT0 / put
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 10, callPrem, cycleId);
+    mkt.placeOrder(MarketSide.PUT_BUY, 10, putPrem, cycleId);
+    vm.stopPrank();
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice - 15_000); // 85 000 -> puts ITM by 15 000
+
+    mkt.settleChunk(20);
+
+    uint256 callPremAll = callPrem * 10; // 20 USDT0
+    uint256 putPremAll = putPrem * 10; // 10 USDT0
+
+    // taker fees (u1 pays two of them)
+    uint256 takerFeeCall = callPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 1.4
+    uint256 takerFeePut = putPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 0.7
+
+    // u1 cash flow during trade
+    int256 cashU1 = -int256(callPremAll) - int256(takerFeeCall) + int256(putPremAll) - int256(takerFeePut);
+
+    // intrinsic P/L (puts ITM)
+    uint256 intrinsic = 15_000 * ONE_COIN * 10 / CONTRACT_SIZE;
+
+    // final expected balances
+    uint256 expectU1 = uint256(int256(deposit) + cashU1 - int256(intrinsic));
+    int256 makerFeeCall = int256(callPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+    int256 makerFeePut = int256(putPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+
+    int256 cashU2 = int256(callPremAll) - makerFeeCall - int256(putPremAll) - makerFeePut;
+
+    uint256 expectU2 = uint256(int256(deposit) + cashU2 + int256(intrinsic));
+
+    uint256 balU1 = mkt.getUserAccount(u1).balance;
+    uint256 balU2 = mkt.getUserAccount(u2).balance;
+
+    assertEq(balU1, expectU1, "u1 balance mismatch after dump");
+    assertEq(balU2, expectU2, "u2 balance mismatch after dump");
+  }
+
+  function testShortThenMM_PriceUp() public {
+    uint256 deposit = 5_000 * ONE_COIN; // 5 000 USDT0
+    _fund(u1, deposit);
+    _fund(u2, deposit);
+
+    vm.startPrank(u1);
+    mkt.short(10, 0); // 10 short calls + 10 long puts
+    vm.stopPrank();
+
+    uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
+    uint256 putPrem = 1 * ONE_COIN; // 1 USDT0 / put
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 10, callPrem, cycleId);
+    mkt.placeOrder(MarketSide.PUT_SELL, 10, putPrem, cycleId);
+    vm.stopPrank();
+
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice + 15_000); // 115 000 -> calls ITM by 15 000
+
+    mkt.settleChunk(20);
+
+    uint256 callPremAll = callPrem * 10; // 20 USDT0
+    uint256 putPremAll = putPrem * 10; // 10 USDT0
+
+    // taker fees (u1 pays two of them)
+    uint256 takerFeeCall = callPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 1.4
+    uint256 takerFeePut = putPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 0.7
+
+    // u1 cash flow during trade
+    int256 cashU1 = int256(callPremAll) // +20
+      - int256(putPremAll) // -10
+      - int256(takerFeeCall) // -1.4
+      - int256(takerFeePut); // -0.7
+
+    // intrinsic P/L (short calls lose)
+    uint256 intrinsic = 15_000 * ONE_COIN * 10 / CONTRACT_SIZE; // 1 500 USDT0
+
+    // final expected balances
+    uint256 expectU1 = uint256(int256(deposit) + cashU1 - int256(intrinsic));
+    int256 makerFeeCall = int256(callPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+    int256 makerFeePut = int256(putPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+
+    int256 cashU2 = -int256(callPremAll) - makerFeeCall + int256(putPremAll) - makerFeePut;
+
+    uint256 expectU2 = uint256(int256(deposit) + cashU2 + int256(intrinsic));
+
+    uint256 balU1 = mkt.getUserAccount(u1).balance;
+    uint256 balU2 = mkt.getUserAccount(u2).balance;
+
+    assertEq(balU1, expectU1, "u1 balance mismatch after pump");
+    assertEq(balU2, expectU2, "u2 balance mismatch after pump");
+  }
+
+  function testShortThenMM_PriceDown() public {
+    uint256 deposit = 5_000 * ONE_COIN; // 5 000 USDT0
+    _fund(u1, deposit);
+    _fund(u2, deposit);
+
+    vm.startPrank(u1);
+    mkt.short(10, 0); // 10 short calls + 10 long puts
+    vm.stopPrank();
+
+    uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
+    uint256 putPrem = 1 * ONE_COIN; // 1 USDT0 / put
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 10, callPrem, cycleId);
+    mkt.placeOrder(MarketSide.PUT_SELL, 10, putPrem, cycleId);
+    vm.stopPrank();
+
+    vm.warp(cycleId + 1);
+    _mockOracle(btcPrice - 15_000); // 85 000 -> puts ITM by 15 000
+
+    mkt.settleChunk(20);
+
+    uint256 callPremAll = callPrem * 10; // 20 USDT0
+    uint256 putPremAll = putPrem * 10; // 10 USDT0
+
+    // taker fees (u1 pays two of them)
+    uint256 takerFeeCall = callPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 1.4
+    uint256 takerFeePut = putPremAll * uint256(TAKER_FEE_BPS) / 10_000; // +7 % -> 0.7
+
+    // u1 cash flow during trade
+    int256 cashU1 = int256(callPremAll) // +20
+      - int256(putPremAll) // -10
+      - int256(takerFeeCall) // -1.4
+      - int256(takerFeePut); // -0.7
+
+    // intrinsic P/L (long puts win)
+    uint256 intrinsic = 15_000 * ONE_COIN * 10 / CONTRACT_SIZE; // 1 500 USDT0
+
+    // final expected balances
+    uint256 expectU1 = uint256(int256(deposit) + cashU1 + int256(intrinsic));
+    int256 makerFeeCall = int256(callPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+    int256 makerFeePut = int256(putPremAll) * int256(MAKER_FEE_BPS) / 10_000;
+
+    int256 cashU2 = -int256(callPremAll) - makerFeeCall + int256(putPremAll) - makerFeePut;
+
+    uint256 expectU2 = uint256(int256(deposit) + cashU2 - int256(intrinsic));
+
+    uint256 balU1 = mkt.getUserAccount(u1).balance;
+    uint256 balU2 = mkt.getUserAccount(u2).balance;
+
+    assertEq(balU1, expectU1, "u1 balance mismatch after dump");
+    assertEq(balU2, expectU2, "u2 balance mismatch after dump");
+  }
+
+  // #######################################################################
+  // #                                                                     #
   // #                             Helpers                                 #
   // #                                                                     #
   // #######################################################################

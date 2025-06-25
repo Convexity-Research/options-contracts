@@ -358,7 +358,7 @@ contract Market is
     if (activeCycle != 0) revert Errors.CycleActive();
 
     uint64 price = _getOraclePrice();
-    if (price == 0) revert(); // Errors.OraclePriceCallFailed();
+    if (price == 0) revert Errors.OraclePriceCallFailed();
 
     // Create new market
     cycles[expiry] = Cycle({
@@ -853,7 +853,7 @@ contract Market is
 
   function _getOraclePrice() internal view returns (uint64) {
     (bool success, bytes memory result) = MARK_PX_PRECOMPILE.staticcall(abi.encode(0));
-    if (!success) revert(); // Errors.OraclePriceCallFailed();
+    if (!success) revert Errors.OraclePriceCallFailed();
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
     return price;

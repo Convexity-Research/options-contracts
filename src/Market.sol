@@ -54,7 +54,7 @@ contract Market is
     bool activeInCycle;
     bool liquidationQueued;
     uint64 balance;
-    uint64 liquidationCompleted;
+    uint64 liquidationFeeOwed;
     uint64 scratchPnL;
     uint48 _gap; // 48 remaining bits for future use. Packs position data into next slot
     uint32 longCalls;
@@ -81,7 +81,7 @@ contract Market is
 
   // Two-phase settlement for fair social loss distribution
   uint256 posSum; // total positive PnL (winners)
-  uint256 badDebt; // grows whenever we meet an under-collateralised loser
+  int256 badDebt; // grows whenever we meet an under-collateralised loser
   bool settlementPhase; // false = phase 1, true = phase 2
   bool settlementOnlyMode; // true = only allow settlement, no new cycles
 
@@ -289,7 +289,7 @@ contract Market is
     // By definition, liquidation fee is the balance of the trader, since this only happens when trader exceeds 1000x
     // leverage, which means going under 0.1% margin
     ua.liquidationQueued = true;
-    uint256 liqFeeOwed = uint256(ua.balance);
+    ua.liquidationFeeOwed = uint64(ua.balance);
 
     // Case 1: both sides net-short -> close both, confiscate nothing
     if (netShortCalls > 0 && netShortPuts > 0) {
@@ -313,7 +313,7 @@ contract Market is
       traders.push(feeRecipient); // Add this contract to ensure it gets any liquidation-sourced longs
     }
 
-    emit Liquidated(activeCycle, trader, liqFeeOwed);
+    emit Liquidated(activeCycle, trader, ua.liquidationFeeOwed);
   }
 
   function settleChunk(uint256 max) external {
@@ -651,7 +651,7 @@ contract Market is
         // cashTaker is always negative (liquidatee is always buying)
         // Liquidation order: taker doesn't have enough balance, add to bad debt
         uint256 shortfall = uint256(-cashTaker) - uaTaker.balance;
-        badDebt += shortfall;
+        badDebt += int256(shortfall);
         cashTaker += int256(shortfall);
         uaTaker.balance = 0; // Zero out taker balance
         _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
@@ -703,10 +703,7 @@ contract Market is
         uint256 longCalls = uaTaker.longCalls;
         uint256 longPuts = uaTaker.longPuts;
 
-        if (longCalls >= shortCalls && longPuts >= shortPuts) {
-          uaTaker.liquidationQueued = false;
-          uaTaker.liquidationCompleted = 1;
-        }
+        if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
       }
     }
 
@@ -996,6 +993,7 @@ contract Market is
   function _clearAllPositions(address trader) internal {
     UserAccount storage ua = userAccounts[trader];
     ua.liquidationQueued = false;
+    ua.liquidationFeeOwed = 0;
     ua.activeInCycle = false;
     // Zero out second slot in UserAccount struct, which contains all the individual positions data
     assembly {
@@ -1085,39 +1083,64 @@ contract Market is
 
     while (i < upper) {
       address trader = traders[i];
-
-      // Charge liquidation fee, if any
-      _chargeLiquidationFee(trader);
-
-      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
-
       UserAccount storage ua = userAccounts[trader];
-      if (pnl < 0) {
-        // Loser - debit immediately
-        uint256 debit = uint256(-pnl);
-        uint256 balance = ua.balance;
-        uint256 amountPaid = balance < debit ? balance : debit;
 
-        ua.balance -= uint64(amountPaid);
-        uint256 unpaid = debit - amountPaid;
-        badDebt += unpaid;
+      // 1. intrinsic PnL at settlement price
+      int256 pnl = _calculateTraderPnl(cycleId, price, trader);
+      bool liq = (ua.liquidationFeeOwed > 0) || ua.liquidationQueued;
 
-        // Emit pnl as normal if not liquidated. Don't emit negative pnls for liquidated users who couldn't get their
-        // positions closed out, as their balance is already 0
-        if (ua.liquidationCompleted == 0) emit Settled(cycleId, trader, pnl);
-        else emit Settled(cycleId, trader, 0);
-      } else if (pnl > 0) {
-        // Winner - store PnL for phase 2
-        ua.scratchPnL = uint64(uint256(pnl));
-        posSum += uint256(pnl);
-      }
-      // If pnl == 0, do nothing but still emit event
-      else {
+      if (!liq) {
+        //  ──------------------ Normal Account ────────────────────────
+        if (pnl < 0) {
+          uint256 debit = uint256(-pnl);
+          uint256 paid = debit > ua.balance ? ua.balance : debit;
+          ua.balance -= uint64(paid);
+          if (debit > paid) badDebt += int256(debit - paid);
+          emit Settled(cycleId, trader, pnl);
+        } else if (pnl > 0) {
+          ua.scratchPnL = uint64(uint256(pnl));
+          posSum += uint256(pnl);
+          emit Settled(cycleId, trader, pnl);
+        } else {
+          emit Settled(cycleId, trader, 0);
+        }
+      } else {
+        //  ──------------------ Liquidation Account ────────────────────────
+        uint64 feeOwedBefore = ua.liquidationFeeOwed; // cache
+
+        if (pnl < 0) {
+          // 1) Loser: seize their entire balance, add |pnl| to badDebt
+          if (ua.balance > 0) {
+            userAccounts[feeRecipient].balance += ua.balance;
+            ua.balance = 0;
+            emit LiquidationFeePaid(activeCycle, trader, ua.balance);
+          }
+          badDebt += -pnl;
+        } else {
+          // 2) Winner (positive pnl): use pnl+balance to pay liquidation fee, surplus reduces badDebt
+          uint256 gain = uint256(pnl);
+          uint256 total = gain + ua.balance;
+
+          if (total >= feeOwedBefore) {
+            // Cover full fee first
+            userAccounts[feeRecipient].balance += feeOwedBefore;
+            emit LiquidationFeePaid(activeCycle, trader, feeOwedBefore);
+            uint256 excess = total - feeOwedBefore;
+
+            // Any excess reduces badDebt up to its size
+            badDebt -= int256(excess);
+          } else {
+            // Not enough – but take balance and +ve pnl
+            userAccounts[feeRecipient].balance += uint64(total);
+            emit LiquidationFeePaid(activeCycle, trader, total);
+          }
+          ua.balance = 0; // user never keeps anything
+          ua.liquidationFeeOwed = 0;
+        }
         emit Settled(cycleId, trader, 0);
       }
 
       _clearAllPositions(trader);
-
       unchecked {
         ++i;
       }
@@ -1133,19 +1156,6 @@ contract Market is
     return i - startingI;
   }
 
-  // Currently we eat the loss and don't socialize it if the user can't pay full liquidation fee
-  // We also don't charge fee if the user's liquidation orders didn't get matched.
-  function _chargeLiquidationFee(address trader) internal {
-    UserAccount storage ua = userAccounts[trader];
-    if (ua.liquidationCompleted == 0) return;
-
-    uint64 amt = ua.balance;
-    userAccounts[feeRecipient].balance += amt;
-    ua.balance = 0;
-    ua.liquidationCompleted = 0;
-    emit LiquidationFeePaid(activeCycle, trader, amt);
-  }
-
   function _doPhase2(uint256 cycleId, uint256 max) internal {
     Cycle storage C = cycles[cycleId];
     uint256 n = traders.length;
@@ -1155,11 +1165,14 @@ contract Market is
 
     // Calculate loss ratio once (using 1e12 precision)
     uint256 lossRatio;
+
     if (posSum == 0) lossRatio = 1e12; // no winners
 
-    else if (badDebt >= posSum) lossRatio = 1e12; // losers can't cover → 100 %
+    else if (badDebt >= int256(posSum)) lossRatio = 1e12; // losers can't cover → 100 %
 
-    else lossRatio = (badDebt * 1e12) / posSum; // proper fractional loss
+    else if (badDebt < 0) lossRatio = 0; // no losers
+
+    else lossRatio = (uint256(badDebt) * 1e12) / posSum; // proper fractional loss
 
     while (i < upper) {
       address trader = traders[i];

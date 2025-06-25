@@ -1331,7 +1331,7 @@ contract MarketSuite is Test {
     //   liquidation flags
     MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
     assertFalse(ua.liquidationQueued, "liq flag should be cleared");
-    assertEq(ua.liquidationCompleted, 1, "liquidationCompleted should be 1");
+    assertEq(ua.liquidationFeeOwed, liqFeeOwed, "liquidationFeeOwed should be equal to liquidation fee owed");
 
     //   no remaining queued PUT-buys
     (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
@@ -1340,7 +1340,6 @@ contract MarketSuite is Test {
     assertTrue(empty, "taker queue should be empty");
 
     // Go to settlement
-
     vm.warp(cycleId + 1);
     vm.recordLogs();
     mkt.settleChunk(100);
@@ -1348,8 +1347,13 @@ contract MarketSuite is Test {
 
     uint256 liqFeePaid = _getLiquidationFeePaid(lg);
 
-    // The liquidation fee we recoup will be less than that first calculated, as we wait until after taker fees + premiums are paid
-    assertEq(liqFeePaid, liqFeeOwed - fee - (premiumPrice * orderSize), "liquidation fee paid should be equal to liquidation fee owed");
+    // The liquidation fee we recoup will be less than that first calculated, as we wait until after taker fees +
+    // premiums are paid
+    assertEq(
+      liqFeePaid,
+      liqFeeOwed - fee - (premiumPrice * orderSize),
+      "liquidation fee paid should be equal to liquidation fee owed"
+    );
 
     // Check user doesn't get any pnl on settlement. In this case, as liquidation orders are filled, pnl should be zero
     int256 pnl = _getPnl(lg, u1);
@@ -1396,9 +1400,9 @@ contract MarketSuite is Test {
     // Fast forward to settlement
     vm.warp(currentCycleId + 1);
 
-    // Check liquidation completed
-    uint64 liquidationCompleted = mkt.getUserAccount(u1).liquidationCompleted;
-    console.log("Liquidation completed before settlement:", liquidationCompleted);
+    // Get liquidation fee owed before settlement
+    uint64 liquidationFeeOwed = mkt.getUserAccount(u1).liquidationFeeOwed;
+    console.log("Liquidation fee owed before settlement:", liquidationFeeOwed);
 
     // Settlement
     vm.startPrank(owner);
@@ -1406,9 +1410,10 @@ contract MarketSuite is Test {
     vm.stopPrank();
 
     // Check that liquidationFeeOwed is zeroed
-    uint64 liquidationCompletedAfter = mkt.getUserAccount(u1).liquidationCompleted;
+    uint64 liquidationFeeOwedAfter = mkt.getUserAccount(u1).liquidationFeeOwed;
+    console.log("Liquidation fee owed after settlement:", liquidationFeeOwedAfter);
 
-    assertEq(liquidationCompletedAfter, 0, "LiquidationCompleted should be 0 after settlement");
+    assertEq(liquidationFeeOwedAfter, 0, "LiquidationFeeOwed should be zero after settlement");
   }
 
   function testLiquidationEventEmissionBug() public {
@@ -1841,7 +1846,6 @@ contract MarketSuite is Test {
           , // ignore
           int256 cashTaker,
           ,
-          
         ) = abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
         totalCashTaker += cashTaker; // CALL leg & PUT leg
       }

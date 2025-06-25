@@ -108,6 +108,7 @@ contract Market is
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
   event Liquidated(uint256 indexed cycleId, address indexed trader, uint256 liqFeeOwed);
+  event LiquidationCleared(uint256 indexed cycleId, address indexed trader);
   event LiquidationFeePaid(uint256 indexed cycleId, address indexed trader, uint256 liqFeePaid);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
@@ -695,6 +696,10 @@ contract Market is
       }
     }
 
+    emit LimitOrderFilled(
+      activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
+    );
+
     // Liquidation check
     {
       if (isLiquidationOrder) {
@@ -703,13 +708,13 @@ contract Market is
         uint256 longCalls = uaTaker.longCalls;
         uint256 longPuts = uaTaker.longPuts;
 
-        if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
+        if (longCalls >= shortCalls && longPuts >= shortPuts) {
+          uaTaker.liquidationQueued = false;
+
+          emit LiquidationCleared(activeCycle, taker);
+        } 
       }
     }
-
-    emit LimitOrderFilled(
-      activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
-    );
 
     return size;
   }

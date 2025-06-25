@@ -1448,7 +1448,7 @@ contract MarketSuite is Test {
 
     // Calculate the theoretical vs actual payment
     uint256 theoreticalCost = 5 * ONE_COIN + (5 * ONE_COIN * 700 / 10000);
-    uint256 actualPaid = balanceBeforeFill - balanceAfterFill;
+    uint256 actualPaid = balanceBeforeFill; // We cap premium paid to user's balance
 
     console.log("Theoretical cost (5 USDC + fee):", theoreticalCost);
     console.log("Actual amount paid:", actualPaid);

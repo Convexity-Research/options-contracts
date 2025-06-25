@@ -654,6 +654,7 @@ contract Market is
       if (isLiquidationOrder && uaTaker.balance < uint256(-cashTaker)) {
         // cashTaker is always negative (liquidatee is always buying)
         cashMaker = int256(uint256(uaTaker.balance));
+        cashTaker = -int256(uint256(uaTaker.balance));
         uaTaker.balance = 0; // Zero out taker balance
         _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
       } else {

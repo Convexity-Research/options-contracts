@@ -1260,7 +1260,7 @@ contract MarketSuite is Test {
     backendBalance += int256(traderDeposit);
 
     // ---------------------------------------------------------------------
-    // 1.  Provide resting liquidity so u1’s `long()` market order executes
+    // 1.  Provide resting liquidity so u1's `long()` market order executes
     // ---------------------------------------------------------------------
     vm.startPrank(u2);
     uint256 premiumPrice = 10000;
@@ -1538,6 +1538,306 @@ contract MarketSuite is Test {
     } else {
       console.log("No insolvency scenario created - test needs adjustment");
     }
+  }
+
+  function testLongShortLiquidationZeroBalance() public {
+    // Setup: Fund both users with different collateral amounts
+    uint256 user1Collateral = 15 * ONE_COIN; // User 1 - less collateral, will be liquidated  
+    uint256 user2Collateral = 100 * ONE_COIN; // User 2 - more collateral, counterparty
+    
+    _fund(u1, user1Collateral);
+    _fund(u2, user2Collateral);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    uint256 callBuyPrice = 4 * ONE_COIN;  // 4 USDT for calls
+    uint256 callSellPrice = 3 * ONE_COIN; // 3 USDT for calls (lower, so orders will cross)
+    uint256 putBuyPrice = 2 * ONE_COIN;   // 2 USDT for puts  
+    uint256 putSellPrice = 1 * ONE_COIN;  // 1 USDT for puts (lower, so orders will cross)
+    uint256 orderSize = 3; // 3 contracts
+
+    // User 1 goes LONG (long calls + short puts) with higher call price and lower put price
+    vm.startPrank(u1);
+    mkt.long(orderSize, callBuyPrice, putSellPrice, currentCycleId);
+    vm.stopPrank();
+
+    // User 2 goes SHORT (short calls + long puts) with lower call price and higher put price
+    // This creates cross-priced orders that will execute against User 1's orders
+    vm.startPrank(u2);
+    vm.recordLogs();
+    mkt.short(orderSize, putBuyPrice, callSellPrice, currentCycleId);
+    Vm.Log[] memory initialTradeLogs = vm.getRecordedLogs();
+    vm.stopPrank();
+
+    // Verify LimitOrderFilled events were emitted for initial cross-priced trades
+    uint256 initialFillCount = _countLimitOrderFilledEvents(initialTradeLogs);
+    console.log("Initial trade LimitOrderFilled events:", initialFillCount);
+    assertEq(initialFillCount, 2, "Should have 2 LimitOrderFilled events for call and put trades");
+
+    // Verify positions after trade
+    MarketWithViews.UserAccount memory ua1 = mkt.getUserAccount(u1);
+    MarketWithViews.UserAccount memory ua2 = mkt.getUserAccount(u2);
+    
+    assertEq(ua1.longCalls, orderSize, "User 1 should have long calls");
+    assertEq(ua1.shortPuts, orderSize, "User 1 should have short puts");
+    assertEq(ua2.shortCalls, orderSize, "User 2 should have short calls");
+    assertEq(ua2.longPuts, orderSize, "User 2 should have long puts");
+
+    // Record balances after trade
+    uint256 u1BalanceAfterTrade = ua1.balance;
+    uint256 u2BalanceAfterTrade = ua2.balance;
+
+    console.log("u1 balance after trade:", u1BalanceAfterTrade);
+    console.log("u2 balance after trade:", u2BalanceAfterTrade);
+
+    // BTC price dumps significantly, making User 1 (short puts) liquidatable
+    _mockOracle(btcPrice - 20_000); // -20k makes short puts deeply ITM
+    
+    // Verify User 1 is now liquidatable
+    assertTrue(mkt.isLiquidatable(u1), "User 1 should be liquidatable after price dump");
+    assertFalse(mkt.isLiquidatable(u2), "User 2 should not be liquidatable");
+
+    // Record User 1's balance before liquidation
+    uint256 u1BalanceBeforeLiq = mkt.getUserAccount(u1).balance;
+    console.log("u1 balance before liquidation:", u1BalanceBeforeLiq);
+
+    // Liquidate User 1
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+
+    // Check liquidation state
+    ua1 = mkt.getUserAccount(u1);
+    assertTrue(ua1.liquidationQueued, "User 1 should have liquidation queued");
+    console.log("u1 liquidation fee owed:", ua1.liquidationFeeOwed);
+    console.log("u1 balance after liquidation (before settlement):", ua1.balance);
+
+    // Provide liquidity to fill the liquidation orders
+    // User 1's liquidation will create market orders to close their net short puts
+    vm.startPrank(u2);
+    vm.recordLogs();
+    mkt.placeOrder(MarketSide.PUT_SELL, orderSize, 10 * ONE_COIN, currentCycleId); // High price to ensure fill
+    Vm.Log[] memory liquidationFillLogs = vm.getRecordedLogs();
+    vm.stopPrank();
+
+    // Verify LimitOrderFilled event was emitted for liquidation order fill
+    uint256 liquidationFillCount = _countLimitOrderFilledEvents(liquidationFillLogs);
+    console.log("Liquidation order LimitOrderFilled events:", liquidationFillCount);
+    assertEq(liquidationFillCount, 1, "Should have 1 LimitOrderFilled event for liquidation order fill");
+
+    // Verify User 1's balance is now 0 after liquidation order execution
+    ua1 = mkt.getUserAccount(u1);
+    assertEq(ua1.balance, 0, "User 1 balance should be 0 after liquidation order execution");
+    console.log("u1 balance after liquidation order filled:", ua1.balance);
+
+    // Fast forward to settlement
+    vm.warp(currentCycleId + 1);
+    _mockOracle(btcPrice - 20_000); // Keep same settlement price
+
+    // Record events during settlement
+    vm.recordLogs();
+    mkt.settleChunk(100, false);
+    Vm.Log[] memory settlementLogs = vm.getRecordedLogs();
+
+    // Check if LiquidationFeePaid event was emitted for User 1
+    // Note: This event is only emitted if the user has balance > 0 during settlement
+    // In this case, the user's balance was consumed by liquidation order execution
+    bool foundLiquidationFeePaid = false;
+    uint256 liquidationFeePaid = 0;
+    
+    for (uint256 i = 0; i < settlementLogs.length; i++) {
+      if (settlementLogs[i].topics[0] == keccak256("LiquidationFeePaid(uint256,address,uint256)")) {
+        address liquidatedUser = address(uint160(uint256(settlementLogs[i].topics[2])));
+        if (liquidatedUser == u1) {
+          foundLiquidationFeePaid = true;
+          (liquidationFeePaid) = abi.decode(settlementLogs[i].data, (uint256));
+          break;
+        }
+      }
+    }
+
+    // In this test case, the liquidation order consumed the user's entire balance,
+    // so no LiquidationFeePaid event should be emitted during settlement
+    assertFalse(foundLiquidationFeePaid, "LiquidationFeePaid event should NOT be emitted when balance was consumed by liquidation orders");
+    console.log("Liquidation fee paid during settlement:", liquidationFeePaid);
+
+    // Verify User 1's final state after settlement
+    ua1 = mkt.getUserAccount(u1);
+    assertEq(ua1.balance, 0, "User 1 balance should be 0 after settlement");
+    assertEq(ua1.liquidationFeeOwed, 0, "User 1 liquidation fee owed should be 0 after settlement");
+    assertFalse(ua1.liquidationQueued, "User 1 liquidation should no longer be queued");
+    
+    // Verify all positions are cleared for User 1
+    assertEq(ua1.longCalls, 0, "User 1 long calls should be 0");
+    assertEq(ua1.shortCalls, 0, "User 1 short calls should be 0");
+    assertEq(ua1.longPuts, 0, "User 1 long puts should be 0");
+    assertEq(ua1.shortPuts, 0, "User 1 short puts should be 0");
+
+    console.log("Final u1 balance:", ua1.balance);
+    console.log("Final u1 liquidation fee owed:", ua1.liquidationFeeOwed);
+    console.log("Final u1 liquidation queued:", ua1.liquidationQueued);
+
+    // Check fee recipient balance after settlement
+    uint256 feeRecipientBalance = mkt.getUserAccount(feeSink).balance;
+    console.log("Fee recipient balance after settlement:", feeRecipientBalance);
+    
+    // In this case, the liquidation was handled through trade execution,
+    // not through settlement transfer, so fee recipient gets trading fees
+
+    // Verify User 2 has positive balance after settlement (positions are cleared during settlement)
+    ua2 = mkt.getUserAccount(u2);
+    assertGt(ua2.balance, 0, "User 2 should still have positive balance");
+    // Note: All positions are cleared during settlement for all users
+    assertEq(ua2.shortCalls, 0, "User 2 positions should be cleared after settlement");
+    assertEq(ua2.longPuts, 0, "User 2 positions should be cleared after settlement");
+  }
+
+  function testLongShortLiquidationZeroBalanceNoLiquidity() public {
+    // Setup: Fund both users with different collateral amounts
+    uint256 user1Collateral = 15 * ONE_COIN; // User 1 - less collateral, will be liquidated  
+    uint256 user2Collateral = 100 * ONE_COIN; // User 2 - more collateral, counterparty
+    
+    _fund(u1, user1Collateral);
+    _fund(u2, user2Collateral);
+
+    uint256 currentCycleId = mkt.activeCycle();
+    uint256 callBuyPrice = 4 * ONE_COIN;  // 4 USDT for calls
+    uint256 callSellPrice = 3 * ONE_COIN; // 3 USDT for calls (lower, so orders will cross)
+    uint256 putBuyPrice = 2 * ONE_COIN;   // 2 USDT for puts  
+    uint256 putSellPrice = 1 * ONE_COIN;  // 1 USDT for puts (lower, so orders will cross)
+    uint256 orderSize = 3; // 3 contracts
+
+    // User 1 goes LONG (long calls + short puts) with higher call price and lower put price
+    vm.startPrank(u1);
+    mkt.long(orderSize, callBuyPrice, putSellPrice, currentCycleId);
+    vm.stopPrank();
+
+    // User 2 goes SHORT (short calls + long puts) with lower call price and higher put price
+    // This creates cross-priced orders that will execute against User 1's orders
+    vm.startPrank(u2);
+    vm.recordLogs();
+    mkt.short(orderSize, putBuyPrice, callSellPrice, currentCycleId);
+    Vm.Log[] memory initialTradeLogs = vm.getRecordedLogs();
+    vm.stopPrank();
+
+    // Verify LimitOrderFilled events were emitted for initial cross-priced trades
+    uint256 initialFillCount = _countLimitOrderFilledEvents(initialTradeLogs);
+    console.log("Initial trade LimitOrderFilled events:", initialFillCount);
+    assertEq(initialFillCount, 2, "Should have 2 LimitOrderFilled events for call and put trades");
+
+    // Verify positions after trade
+    MarketWithViews.UserAccount memory ua1 = mkt.getUserAccount(u1);
+    MarketWithViews.UserAccount memory ua2 = mkt.getUserAccount(u2);
+    
+    assertEq(ua1.longCalls, orderSize, "User 1 should have long calls");
+    assertEq(ua1.shortPuts, orderSize, "User 1 should have short puts");
+    assertEq(ua2.shortCalls, orderSize, "User 2 should have short calls");
+    assertEq(ua2.longPuts, orderSize, "User 2 should have long puts");
+
+    // Record balances after trade
+    uint256 u1BalanceAfterTrade = ua1.balance;
+    uint256 u2BalanceAfterTrade = ua2.balance;
+
+    console.log("u1 balance after trade:", u1BalanceAfterTrade);
+    console.log("u2 balance after trade:", u2BalanceAfterTrade);
+
+    // BTC price dumps significantly, making User 1 (short puts) liquidatable
+    _mockOracle(btcPrice - 20_000); // -20k makes short puts deeply ITM
+    
+    // Verify User 1 is now liquidatable
+    assertTrue(mkt.isLiquidatable(u1), "User 1 should be liquidatable after price dump");
+    assertFalse(mkt.isLiquidatable(u2), "User 2 should not be liquidatable");
+
+    // Record User 1's balance before liquidation
+    uint256 u1BalanceBeforeLiq = mkt.getUserAccount(u1).balance;
+    console.log("u1 balance before liquidation:", u1BalanceBeforeLiq);
+
+    // Liquidate User 1
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+
+    // Check liquidation state
+    ua1 = mkt.getUserAccount(u1);
+    assertTrue(ua1.liquidationQueued, "User 1 should have liquidation queued");
+    console.log("u1 liquidation fee owed:", ua1.liquidationFeeOwed);
+    console.log("u1 balance after liquidation (before settlement):", ua1.balance);
+
+    // NOTE: In this test, we DO NOT provide liquidity to fill the liquidation orders
+    // The liquidation orders will remain in the taker queue unfilled
+
+    // Verify no additional LimitOrderFilled events occur (since no liquidity provided)
+    vm.recordLogs();
+    // No orders placed here - just checking that no spontaneous fills occur
+    Vm.Log[] memory noLiquidityLogs = vm.getRecordedLogs();
+    uint256 noLiquidityFillCount = _countLimitOrderFilledEvents(noLiquidityLogs);
+    console.log("LimitOrderFilled events without liquidity:", noLiquidityFillCount);
+    assertEq(noLiquidityFillCount, 0, "Should have 0 LimitOrderFilled events when no liquidity is provided");
+
+    // Verify User 1's balance is still the same (no liquidation order execution)
+    ua1 = mkt.getUserAccount(u1);
+    assertEq(ua1.balance, u1BalanceBeforeLiq, "User 1 balance should be unchanged when liquidation orders are unfilled");
+    console.log("u1 balance after liquidation (no liquidity provided):", ua1.balance);
+
+    // Fast forward to settlement
+    vm.warp(currentCycleId + 1);
+    _mockOracle(btcPrice - 20_000); // Keep same settlement price
+
+    // Record events during settlement
+    vm.recordLogs();
+    mkt.settleChunk(100, false);
+    Vm.Log[] memory settlementLogs = vm.getRecordedLogs();
+
+    // Check if LiquidationFeePaid event was emitted for User 1
+    // In this case, the user's balance was NOT consumed by liquidation order execution,
+    // so the liquidation fee should be paid during settlement
+    bool foundLiquidationFeePaid = false;
+    uint256 liquidationFeePaid = 0;
+    
+    for (uint256 i = 0; i < settlementLogs.length; i++) {
+      if (settlementLogs[i].topics[0] == keccak256("LiquidationFeePaid(uint256,address,uint256)")) {
+        address liquidatedUser = address(uint160(uint256(settlementLogs[i].topics[2])));
+        if (liquidatedUser == u1) {
+          foundLiquidationFeePaid = true;
+          (liquidationFeePaid) = abi.decode(settlementLogs[i].data, (uint256));
+          break;
+        }
+      }
+    }
+
+    // In this test case, the liquidation orders were NOT filled, so the user's balance
+    // should be available during settlement to pay the liquidation fee
+    assertTrue(foundLiquidationFeePaid, "LiquidationFeePaid event should be emitted when liquidation orders remain unfilled");
+    console.log("Liquidation fee paid during settlement:", liquidationFeePaid);
+
+    // Verify User 1's final state after settlement
+    ua1 = mkt.getUserAccount(u1);
+    assertEq(ua1.balance, 0, "User 1 balance should be 0 after settlement");
+    assertEq(ua1.liquidationFeeOwed, 0, "User 1 liquidation fee owed should be 0 after settlement");
+    assertFalse(ua1.liquidationQueued, "User 1 liquidation should no longer be queued");
+    
+    // Verify all positions are cleared for User 1
+    assertEq(ua1.longCalls, 0, "User 1 long calls should be 0");
+    assertEq(ua1.shortCalls, 0, "User 1 short calls should be 0");
+    assertEq(ua1.longPuts, 0, "User 1 long puts should be 0");
+    assertEq(ua1.shortPuts, 0, "User 1 short puts should be 0");
+
+    console.log("Final u1 balance:", ua1.balance);
+    console.log("Final u1 liquidation fee owed:", ua1.liquidationFeeOwed);
+    console.log("Final u1 liquidation queued:", ua1.liquidationQueued);
+
+    // Check fee recipient balance after settlement
+    uint256 feeRecipientBalance = mkt.getUserAccount(feeSink).balance;
+    console.log("Fee recipient balance after settlement:", feeRecipientBalance);
+    
+    // In this case, the liquidation fee should be transferred to fee recipient during settlement
+    assertGt(feeRecipientBalance, 0, "Fee recipient should have received liquidation fee during settlement");
+
+    // Verify User 2 has positive balance after settlement (positions are cleared during settlement)
+    ua2 = mkt.getUserAccount(u2);
+    assertGt(ua2.balance, 0, "User 2 should still have positive balance");
+    // Note: All positions are cleared during settlement for all users
+    assertEq(ua2.shortCalls, 0, "User 2 positions should be cleared after settlement");
+    assertEq(ua2.longPuts, 0, "User 2 positions should be cleared after settlement");
   }
 
   // #######################################################################
@@ -1896,5 +2196,15 @@ contract MarketSuite is Test {
       }
     }
     revert("Settled event not found");
+  }
+
+  function _countLimitOrderFilledEvents(Vm.Log[] memory logs) internal pure returns (uint256) {
+    uint256 count = 0;
+    for (uint256 i = 0; i < logs.length; i++) {
+      if (logs[i].topics[0] == keccak256("LimitOrderFilled(uint256,uint256,int256,uint256,uint256,uint8,address,address,int256,int256,uint256)")) {
+        count++;
+      }
+    }
+    return count;
   }
 }

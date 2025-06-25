@@ -482,7 +482,8 @@ contract MarketSuite is Test {
     mkt.settleChunk(20);
 
     // cycle closed
-    (bool settled,,) = mkt.cycles(cycleId);
+    Cycle memory cycle = mkt.getCycle(cycleId);
+    bool settled = cycle.isSettled;
     assertTrue(settled, "cycle not flagged as settled");
 
     // u1 received full 100 USDT (±1 tick for fees) – check delta not exact start
@@ -572,7 +573,8 @@ contract MarketSuite is Test {
     assertEq(mkt.activeCycle(), newCycleId, "New cycle should be active");
 
     // Verify old cycle is marked as settled
-    (bool isSettled,,) = mkt.cycles(initialCycleId);
+    Cycle memory cycle = mkt.getCycle(initialCycleId);
+    bool isSettled = cycle.isSettled;
     assertTrue(isSettled, "Old cycle should be settled");
   }
 
@@ -702,7 +704,8 @@ contract MarketSuite is Test {
     }
 
     assertGt(txCount, 2, "should take more than two txs");
-    (bool settled,,) = mkt.cycles(cycleIdBefore);
+    Cycle memory cycle = mkt.getCycle(cycleIdBefore);
+    bool settled = cycle.isSettled;
     assertTrue(settled, "previous cycle not settled");
     assertGt(mkt.activeCycle(), cycleIdBefore, "new cycle should start");
   }
@@ -725,7 +728,8 @@ contract MarketSuite is Test {
     mkt.settleChunk(100);
 
     // Cycle settled — but no new cycle should have started
-    (bool settled,,) = mkt.cycles(cycleId);
+    Cycle memory cycle = mkt.getCycle(cycleId);
+    bool settled = cycle.isSettled;
     assertTrue(settled, "cycle should settle");
     assertEq(mkt.activeCycle(), 0, "no active cycle in settlement only mode");
 
@@ -896,7 +900,8 @@ contract MarketSuite is Test {
     mkt.settleChunk(100);
 
     // Verify cycle is settled but no new cycle started
-    (bool settled,,) = mkt.cycles(currentCycleId);
+    Cycle memory cycle = mkt.getCycle(currentCycleId);
+    bool settled = cycle.isSettled;
     assertTrue(settled, "cycle should be settled");
     assertEq(mkt.activeCycle(), 0, "no new cycle should start in settlement-only mode");
 
@@ -932,7 +937,8 @@ contract MarketSuite is Test {
     mkt.settleChunk(100);
 
     // Verify settlement completed
-    (bool settled,,) = mkt.cycles(currentCycleId);
+    Cycle memory cycle = mkt.getCycle(currentCycleId);
+    bool settled = cycle.isSettled;
     assertTrue(settled, "cycle should be settled");
   }
 

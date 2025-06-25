@@ -69,7 +69,7 @@ contract Market is
 
   //------- Cycle state -------
   uint256 public activeCycle; // expiry unix timestamp as ID
-  mapping(uint256 => Cycle) public cycles;
+  mapping(uint256 => Cycle) cycles;
 
   //------- Trading/Settlement -------
   address[] traders;

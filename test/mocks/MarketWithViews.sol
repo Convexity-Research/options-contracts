@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import {Market, MarketSide} from "../../src/Market.sol";
 import {BitScan} from "../../src/lib/Bitscan.sol";
-import {Level} from "../../src/interfaces/IMarket.sol";
+import {Level, Cycle} from "../../src/interfaces/IMarket.sol";
 import {Errors} from "../../src/lib/Errors.sol";
 import {TakerQ} from "../../src/interfaces/IMarket.sol";
 
@@ -163,5 +163,9 @@ contract MarketWithViews is Market {
 
   function getTqHead(uint256 side) external view returns (uint256) {
     return tqHead[uint256(side)];
+  }
+
+  function getCycle(uint256 cycleId) external view returns (Cycle memory) {
+    return cycles[cycleId];
   }
 }

@@ -1457,7 +1457,7 @@ contract MarketSuite is Test {
       if (
         entries[i].topics[0]
           == keccak256(
-            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+            "LimitOrderFilled(uint256,int256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
           )
       ) {
         address taker = address(uint160(uint256(entries[i].topics[2])));
@@ -1835,7 +1835,7 @@ contract MarketSuite is Test {
       if (
         logs[i].topics[0]
           == keccak256(
-            "LimitOrderFilled(uint256,uint256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+            "LimitOrderFilled(uint256,int256,uint256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
           ) && address(uint160(uint256(logs[i].topics[2]))) == u1 // taker == u1
       ) {
         (

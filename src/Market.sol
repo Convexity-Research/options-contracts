@@ -99,7 +99,7 @@ contract Market is
     mapping(uint32 => Level) levels; // tickKey ⇒ Level
     mapping(uint32 => Maker) makerNodes; // nodeId  ⇒ Maker
     uint32 limitOrderPtr; // auto-increment id for limit orders
-    uint32 takerOrderPtr; // auto-increment id for taker orders
+    int32 takerOrderPtr; // auto-increment id for taker orders
   }
 
   //------- Events -------
@@ -136,10 +136,10 @@ contract Market is
     uint256 indexed cycleId, uint256 makerOrderId, uint256 size, uint256 limitPrice, address indexed maker
   );
   event TakerOrderPlaced(
-    uint256 indexed cycleId, uint32 takerOrderId, uint256 size, MarketSide side, address indexed taker
+    uint256 indexed cycleId, int32 takerOrderId, uint256 size, MarketSide side, address indexed taker
   );
   event TakerOrderRemaining(
-    uint256 indexed cycleId, uint32 takerOrderId, uint256 size, MarketSide side, address indexed taker
+    uint256 indexed cycleId, int32 takerOrderId, uint256 size, MarketSide side, address indexed taker
   );
 
   /// @custom:oz-upgrades-unsafe-allow constructor
@@ -291,6 +291,8 @@ contract Market is
     ua.liquidationQueued = true;
     ua.liquidationFeeOwed = uint64(ua.balance);
 
+    emit Liquidated(activeCycle, trader, ua.liquidationFeeOwed);
+
     // Case 1: both sides net-short -> close both, confiscate nothing
     if (netShortCalls > 0 && netShortPuts > 0) {
       _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, 0);
@@ -312,8 +314,6 @@ contract Market is
       house.longCalls += uint32(uint256(-netShortCalls)); // netShortCalls is negative, denoting the net long calls
       traders.push(feeRecipient); // Add this contract to ensure it gets any liquidation-sourced longs
     }
-
-    emit Liquidated(activeCycle, trader, ua.liquidationFeeOwed);
   }
 
   function settleChunk(uint256 max) external {
@@ -426,7 +426,7 @@ contract Market is
 
     if (limitPrice == 0 || _isCrossing(side, tick)) {
       // Market order
-      uint32 takerId = _nextTakerId(ob[activeCycle]);
+      int32 takerId = _nextTakerId(ob[activeCycle]);
       emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
       _marketOrder(side, uint128(size), trader, takerId);
     } else {
@@ -447,7 +447,7 @@ contract Market is
     }
   }
 
-  function _marketOrder(MarketSide side, uint128 want, address taker, uint32 takerOrderId) private {
+  function _marketOrder(MarketSide side, uint128 want, address taker, int32 takerOrderId) private {
     uint128 left = want;
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
@@ -598,7 +598,7 @@ contract Market is
 
   function _settleFill(
     uint32 makerOrderId,
-    uint32 takerOrderId,
+    int32 takerOrderId,
     MarketSide side,
     uint256 price, // 6 decimals
     uint256 size,
@@ -695,10 +695,8 @@ contract Market is
       }
     }
 
-    int256 _takerOrderId = isLiquidationOrder ? -int256(uint256(takerOrderId)) : int256(uint256(takerOrderId));
-
     emit LimitOrderFilled(
-      activeCycle, makerOrderId, _takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
+      activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
     );
 
     // Liquidation check
@@ -716,7 +714,7 @@ contract Market is
     return size;
   }
 
-  function _queueTaker(MarketSide side, uint256 qty, address trader, uint32 takerId) private {
+  function _queueTaker(MarketSide side, uint256 qty, address trader, int32 takerId) private {
     takerQ[uint256(side)].push(TakerQ({size: uint64(qty), trader: trader, takerOrderId: takerId}));
     UserAccount storage ua = userAccounts[trader];
     if (_isPut(side)) {
@@ -821,7 +819,7 @@ contract Market is
     _ob.limitOrderPtr = id;
   }
 
-  function _nextTakerId(OrderbookState storage _ob) private returns (uint32 id) {
+  function _nextTakerId(OrderbookState storage _ob) private returns (int32 id) {
     if (_ob.takerOrderPtr == 0) id = 2;
     else id = _ob.takerOrderPtr + 2;
     _ob.takerOrderPtr = id;

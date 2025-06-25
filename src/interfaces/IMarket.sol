@@ -32,7 +32,7 @@ struct Maker {
 struct TakerQ {
   address trader;
   uint64 size;
-  uint32 takerOrderId;
+  int32 takerOrderId;
 }
 
 interface IMarket {

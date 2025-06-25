@@ -291,12 +291,12 @@ contract Market is
 
     // Case 1: both sides net-short -> close both, confiscate nothing
     if (netShortCalls > 0 && netShortPuts > 0) {
-      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, 0);
-      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, 0);
+      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, -_nextTakerId(ob[activeCycle]));
+      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, -_nextTakerId(ob[activeCycle]));
     }
     // Case 2: only calls net-short. Net calls and confiscate net long puts
     else if (netShortCalls > 0) {
-      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, 0);
+      _marketOrder(MarketSide.CALL_BUY, uint128(uint256(netShortCalls)), trader, -_nextTakerId(ob[activeCycle]));
 
       ua.longPuts -= uint32(uint256(-netShortPuts));
       house.longPuts += uint32(uint256(-netShortPuts)); // netShortPuts is negative (or 0), denoting the net long puts
@@ -304,7 +304,7 @@ contract Market is
     }
     // Case 3: only puts net-short
     else {
-      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, 0);
+      _marketOrder(MarketSide.PUT_BUY, uint128(uint256(netShortPuts)), trader, -_nextTakerId(ob[activeCycle]));
 
       ua.longCalls -= uint32(uint256(-netShortCalls));
       house.longCalls += uint32(uint256(-netShortCalls)); // netShortCalls is negative, denoting the net long calls
@@ -604,7 +604,7 @@ contract Market is
     UserAccount storage uaTaker = userAccounts[taker];
 
     // Check if this is a liquidation order (taker is being liquidated)
-    bool isLiquidationOrder = takerOrderId == 0;
+    bool isLiquidationOrder = takerOrderId < 0;
 
     // Fees accounting
     int256 cashTaker;

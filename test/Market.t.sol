@@ -279,7 +279,7 @@ contract MarketSuite is Test {
     assertEq(q[0].size, 50, "incorrect queue size");
   }
 
-  function testLiquidation() public {
+  function testLiquidationPlain() public {
     // Maker
     _fund(u1, 1000 * ONE_COIN);
     vm.startPrank(u1);
@@ -316,6 +316,10 @@ contract MarketSuite is Test {
     uint256 takerFee = uint256(int256(TICK_SIZE) * TAKER_FEE_BPS / 10_000);
     assertEq(mkt.getUserAccount(u2).balance, userCollateral - optionPrice - takerFee);
     assertEq(mkt.getUserAccount(u2).liquidationQueued, false);
+  }
+
+  function testMaxPremiumPaidByRestingLimitOrder() public {
+    
   }
 
   // #######################################################################

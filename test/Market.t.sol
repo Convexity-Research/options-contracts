@@ -1348,7 +1348,7 @@ contract MarketSuite is Test {
   }
 
   function testLiquidationFromPriceFall_OrdersUnfilled() public {
-    uint256 traderDeposit = 6 * ONE_COIN + 100_000; // same as “filled” test
+    uint256 traderDeposit = 6 * ONE_COIN + 100_000; // same as "filled" test
     uint256 mmDeposit = 1_000 * ONE_COIN;
 
     // ---------------------------------------------------------------------
@@ -1434,7 +1434,7 @@ contract MarketSuite is Test {
     backendBalance += int256(traderDeposit);
 
     // ---------------------------------------------------------------------
-    // 1.  Provide resting liquidity so u1’s `short()` market order executes
+    // 1.  Provide resting liquidity so u1's `short()` market order executes
     //     short() = PUT_BUY  + CALL_SELL
     //               (taker)     (taker)
     // ---------------------------------------------------------------------
@@ -1696,7 +1696,7 @@ contract MarketSuite is Test {
     //  a) flag cleared (orders filled, no queue left)
     assertFalse(ua.liquidationQueued, "liq flag should be cleared");
 
-    //  b) protocol now owns the user’s confiscated long CALLs
+    //  b) protocol now owns the user's confiscated long CALLs
     uint32 longCallsAfter = mkt.getUserAccount(feeSink).longCalls;
     assertEq(longCallsAfter - longCallsBefore, uint32(orderSize), "protocol did not seize long CALLs");
 
@@ -1781,7 +1781,7 @@ contract MarketSuite is Test {
     assertEq(pnlUser, 0, "user PnL should be zero");
 
     // (d) liquidation fee paid equals the balance we observed pre-settlement
-    uint256 expectedLiqFee = ua.balance; // ‘ua’ captured before settlement
+    uint256 expectedLiqFee = ua.balance; // 'ua' captured before settlement
     assertEq(liqFeeAmt, expectedLiqFee, "liq fee amount mismatch");
   }
 
@@ -2575,5 +2575,100 @@ contract MarketSuite is Test {
       ) count++;
     }
     return count;
+  }
+
+  // Test how many price levels a crossing limit order can cross before running out of gas
+  function testMaxPriceLevelsCrossed() public {
+    console.log("Testing maximum price levels that can be crossed in a single transaction");
+    
+    // Fund multiple users to place limit orders
+    uint256 fundAmount = 100_000 * ONE_COIN; // Large amount for testing
+    for (uint256 i = 0; i < 50; i++) {
+      address user = address(uint160(0x1000 + i));
+      _fund(user, fundAmount);
+    }
+    
+    // Fund the crossing order placer
+    _fund(u1, 1_000_000 * ONE_COIN);
+    
+    console.log("Setting up orderbook with multiple price levels...");
+    
+    // Place sell orders at incrementally higher prices (creates ask levels)
+    // Starting from a low price and going up
+    uint256 basePrice = 1000e4; // 1000 USDT base price  
+    uint256 orderSize = 10; // 10 contracts per level
+    uint256 numLevels = 0;
+    
+    // Place orders at different price levels
+    for (uint256 i = 0; i < 40; i++) {
+      address seller = address(uint160(0x1000 + i));
+      uint256 price = basePrice + (i * 100e4); // Increment by 100 USDT per level
+      
+      vm.startPrank(seller);
+      try mkt.placeOrder(MarketSide.CALL_SELL, orderSize, price, cycleId) {
+        numLevels++;
+      } catch {
+        console.log("Failed to place order at level", i);
+        break;
+      }
+      vm.stopPrank();
+    }
+    
+    console.log("Successfully placed sell orders at", numLevels, "price levels");
+    
+    // Print the orderbook state
+    _printBook(MarketSide.CALL_SELL);
+    
+    // Now place a large buy order that will cross multiple levels
+    // Calculate total size needed to cross all levels
+    uint256 totalSize = numLevels * orderSize;
+    uint256 maxPrice = basePrice + ((numLevels - 1) * 100e4); // Price of highest level
+    
+    console.log("Placing crossing buy order:");
+    console.log("- Total size needed to cross all levels:", totalSize);
+    console.log("- Max price willing to pay:", maxPrice);
+    
+    // Record gas usage and events
+    uint256 gasBefore = gasleft();
+    vm.recordLogs();
+    
+    vm.startPrank(u1);
+    
+    // Try to place the crossing order and see how many levels it crosses
+    try mkt.placeOrder(MarketSide.CALL_BUY, totalSize, maxPrice, cycleId) {
+      console.log("Successfully placed crossing order");
+    } catch Error(string memory reason) {
+      console.log("Crossing order failed with error:", reason);
+    } catch {
+      console.log("Crossing order failed with unknown error");
+    }
+    
+    vm.stopPrank();
+    
+    uint256 gasAfter = gasleft();
+    uint256 gasUsed = gasBefore - gasAfter;
+    
+    // Get the logs to count how many fills occurred
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+    uint256 fillCount = _countLimitOrderFilledEvents(logs);
+    
+    console.log("Results:");
+    console.log("- Gas used:", gasUsed);
+    console.log("- Number of fills (levels crossed):", fillCount);
+    console.log("- Average gas per level crossed:", fillCount > 0 ? gasUsed / fillCount : 0);
+    
+    // Print final orderbook state to see what's left
+    console.log("\nOrderbook after crossing order:");
+    _printBook(MarketSide.CALL_SELL);
+    
+    // Assert that we crossed at least some levels
+    assertTrue(fillCount > 0, "Should have crossed at least one price level");
+    
+    // Log the theoretical maximum based on block gas limit
+    uint256 blockGasLimit = 2000000; // Typical block gas limit
+    uint256 avgGasPerLevel = fillCount > 0 ? gasUsed / fillCount : 0;
+    uint256 theoreticalMax = avgGasPerLevel > 0 ? blockGasLimit / avgGasPerLevel : 0;
+    
+    console.log("Theoretical maximum levels in one block:", theoreticalMax);
   }
 }

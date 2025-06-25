@@ -8,8 +8,8 @@ import {Market} from "../src/Market.sol";
 contract UpgradeProdMarket is Script {
   function run() external {
     vm.createSelectFork("hyperevm");
-    vm.startBroadcast(vm.envUint("OPT_FUN_DEPLOYER"));
-    address wallet = vm.addr(vm.envUint("OPT_FUN_DEPLOYER"));
+    vm.startBroadcast(vm.envUint("FRESH_RESCUER"));
+    address wallet = vm.addr(vm.envUint("FRESH_RESCUER"));
     console.log("Deploying with account:", wallet);
     console.log("Account balance:", wallet.balance);
 

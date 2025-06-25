@@ -83,7 +83,7 @@ contract Market is
   uint256 posSum; // total positive PnL (winners)
   uint256 badDebt; // grows whenever we meet an under-collateralised loser
   bool settlementPhase; // false = phase 1, true = phase 2
-  bool settlementOnlyMode; // true = only allow settlement, no new cycles
+  bool _gap1; // true = only allow settlement, no new cycles
 
   //------- Orderbook -------
   mapping(uint256 => OrderbookState) internal ob;
@@ -169,20 +169,17 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) whenNotPaused {
-    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     whitelist[trader] = true;
     _depositCollateral(amount, trader);
   }
 
   function depositCollateral(uint256 amount) external onlyWhitelisted whenNotPaused {
-    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     _depositCollateral(amount, trader);
   }
 
   function withdrawCollateral(uint256 amount) external whenNotPaused {
-    if (settlementOnlyMode) revert Errors.SettlementOnlyMode();
     address trader = _msgSender();
     _withdrawCollateral(amount, trader);
   }
@@ -315,10 +312,8 @@ contract Market is
     }
   }
 
-  function settleChunk(uint256 max) external {
+  function settleChunk(uint256 max) external whenNotPaused {
     if (activeCycle == 0) revert Errors.CycleNotStarted();
-    // Allow settlement when paused if in settlement-only mode
-    if (paused() && !settlementOnlyMode) revert EnforcedPause();
 
     uint256 cycleId = activeCycle;
     Cycle storage C = cycles[cycleId];
@@ -351,8 +346,7 @@ contract Market is
     }
   }
 
-  function startCycle() external {
-    if (paused() || settlementOnlyMode) revert EnforcedPause();
+  function startCycle() external whenNotPaused {
     _startCycle();
   }
 
@@ -1203,7 +1197,7 @@ contract Market is
       emit CycleSettled(cycleId);
 
       // Automatically start new cycle unless in settlement-only mode
-      if (!settlementOnlyMode && !paused()) _startCycle();
+      if (!paused()) _startCycle();
     }
   }
 
@@ -1259,14 +1253,12 @@ contract Market is
   //   _trustedForwarder = _forwarder;
   // }
 
-  function pauseNewCycles() external onlySecurityCouncil {
-    // Nothing truly paused, but we can't start new cycles
-    settlementOnlyMode = true;
+  function pause() external onlySecurityCouncil {
+    _pause();
   }
 
   function unpause() external onlySecurityCouncil {
-    if (paused()) _unpause();
-    settlementOnlyMode = false;
+    _unpause();
   }
 
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}

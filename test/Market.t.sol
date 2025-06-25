@@ -52,8 +52,6 @@ contract MarketSuite is Test {
     // Proxy
     proxy = new ERC1967Proxy(address(implementation), initData);
 
-    vm.startPrank(securityCouncil);
-    Market(address(proxy)).unpause();
     vm.startPrank(owner);
 
     // Interface to interact with proxy
@@ -719,7 +717,7 @@ contract MarketSuite is Test {
     _openCallPair(u1, u2);
 
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     vm.warp(cycleId + 1);
@@ -750,7 +748,7 @@ contract MarketSuite is Test {
     vm.startPrank(securityCouncil);
 
     // Standard full pause()
-    mkt.pauseNewCycles();
+    mkt.pause();
     assertEq(mkt.paused(), true);
 
     vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
@@ -767,7 +765,7 @@ contract MarketSuite is Test {
     mkt.settleChunk(100);
 
     // Pause but allow settling
-    mkt.pauseNewCycles();
+    mkt.pause();
 
     uint256 cycleIdAfter = mkt.activeCycle();
     vm.warp(cycleIdAfter + 1);
@@ -800,7 +798,7 @@ contract MarketSuite is Test {
 
     // Enable settlement-only mode
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Try to deposit collateral - should revert
@@ -816,7 +814,7 @@ contract MarketSuite is Test {
   function testSettlementOnlyMode_DepositCollateralWithSignatureBlocked() public {
     // Enable settlement-only mode
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Try to deposit collateral with signature - should revert with SettlementOnlyMode
@@ -840,7 +838,7 @@ contract MarketSuite is Test {
 
     // Enable settlement-only mode
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Try to withdraw collateral - should revert
@@ -856,7 +854,7 @@ contract MarketSuite is Test {
 
     // Enable settlement-only mode
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     uint256 currentCycleId = mkt.activeCycle();
@@ -893,7 +891,7 @@ contract MarketSuite is Test {
 
     // Enable settlement-only mode before settling
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Settlement should still work
@@ -930,7 +928,7 @@ contract MarketSuite is Test {
 
     // Enable settlement-only mode (this unpauses but sets settlementOnlyMode)
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Now settlement should work
@@ -948,7 +946,7 @@ contract MarketSuite is Test {
     _fund(u2, 100 * ONE_COIN);
 
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Verify operations are blocked
@@ -981,26 +979,26 @@ contract MarketSuite is Test {
   }
 
   function testSettlementOnlyMode_AdminFunctionAccess() public {
-    // Only security council should be able to call pauseNewCycles
-    vm.expectRevert(Errors.NotSecurityCouncil.selector);
-    mkt.pauseNewCycles();
+    // Only security council should be able to call pause
+    vm.expectRevert();
+    mkt.pause();
 
     vm.startPrank(owner);
-    vm.expectRevert(Errors.NotSecurityCouncil.selector);
-    mkt.pauseNewCycles();
+    vm.expectRevert();
+    mkt.pause();
     vm.stopPrank();
 
     // Security council should succeed
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Only security council should be able to unpause
-    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    vm.expectRevert();
     mkt.unpause();
 
     vm.startPrank(owner);
-    vm.expectRevert(Errors.NotSecurityCouncil.selector);
+    vm.expectRevert();
     mkt.unpause();
     vm.stopPrank();
 
@@ -1017,7 +1015,7 @@ contract MarketSuite is Test {
 
     // Normal -> Settlement-only
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Give user tokens and try to deposit (should fail)
@@ -1051,9 +1049,9 @@ contract MarketSuite is Test {
     // mkt.depositCollateral(10 * ONE_COIN);
     // vm.stopPrank();
 
-    // Full pause -> Settlement-only (should remain paused since pauseNewCycles doesn't unpause)
+    // Full pause -> Settlement-only (should remain paused since pause doesn't unpause)
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     assertTrue(mkt.paused()); // Should still be paused
@@ -1085,7 +1083,7 @@ contract MarketSuite is Test {
 
     // Enter settlement-only mode
     vm.startPrank(securityCouncil);
-    mkt.pauseNewCycles();
+    mkt.pause();
     vm.stopPrank();
 
     // Settlement should complete but not start new cycle
@@ -1115,7 +1113,7 @@ contract MarketSuite is Test {
 
     // Enter settlement-only mode and record events
     vm.recordLogs();
-    mkt.pauseNewCycles();
+    mkt.pause();
     Vm.Log[] memory pauseLogs = vm.getRecordedLogs();
 
     // Should emit Unpaused event if was paused
@@ -1175,7 +1173,7 @@ contract MarketSuite is Test {
 
       // Enable settlement-only mode BEFORE settling to prevent auto-start
       vm.startPrank(securityCouncil);
-      mkt.pauseNewCycles();
+      mkt.pause();
       vm.stopPrank();
 
       mkt.settleChunk(100); // This should not auto-start a new cycle

@@ -1454,6 +1454,7 @@ contract MarketSuite is Test {
     bool foundFillEvent = false;
 
     for (uint256 i = 0; i < entries.length; i++) {
+      console.logBytes32(entries[i].topics[0]);
       if (
         entries[i].topics[0]
           == keccak256(
@@ -1464,7 +1465,7 @@ contract MarketSuite is Test {
         if (taker == u1) {
           // u1 is the liquidated taker
           (,,,,, int256 cashTaker,,) =
-            abi.decode(entries[i].data, (uint256, uint256, uint256, uint256, uint8, int256, int256, uint256));
+            abi.decode(entries[i].data, (uint256, int256, uint256, uint256, uint8, int256, int256, uint256));
           emittedCashTaker = cashTaker;
           foundFillEvent = true;
           break;

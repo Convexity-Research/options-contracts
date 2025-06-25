@@ -188,20 +188,20 @@ contract Market is
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size, uint256 cycleId) external whenNotPaused {
+  function long(uint256 size, uint256 limitPrice,uint256 cycleId) external whenNotPaused {
     if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
     address trader = _msgSender();
 
-    _placeOrder(MarketSide.CALL_BUY, size, 0, trader);
-    _placeOrder(MarketSide.PUT_SELL, size, 0, trader);
+    _placeOrder(MarketSide.CALL_BUY, size, limitPrice, trader);
+    _placeOrder(MarketSide.PUT_SELL, size, limitPrice, trader);
   }
 
-  function short(uint256 size, uint256 cycleId) external whenNotPaused {
+  function short(uint256 size, uint256 limitPrice, uint256 cycleId) external whenNotPaused {
     if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
     address trader = _msgSender();
 
-    _placeOrder(MarketSide.PUT_BUY, size, 0, trader);
-    _placeOrder(MarketSide.CALL_SELL, size, 0, trader);
+    _placeOrder(MarketSide.PUT_BUY, size, limitPrice, trader);
+    _placeOrder(MarketSide.CALL_SELL, size, limitPrice, trader);
   }
 
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)

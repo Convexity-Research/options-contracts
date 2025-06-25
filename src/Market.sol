@@ -359,11 +359,17 @@ contract Market is
     if (price == 0) revert Errors.OraclePriceCallFailed();
 
     // Create new market
-    cycles[expiry] = Cycle({
-      isSettled: false,
-      strikePrice: price,
-      settlementPrice: 0 // Settlement price is set at cycle end time
-    });
+    assembly {
+      // Calculate storage slot for cycles[expiry]
+      mstore(0x00, expiry)
+      mstore(0x20, cycles.slot)
+      let slot := keccak256(0x00, 0x40)
+      
+      // Pack struct: isSettled(1 byte) + strikePrice(8 bytes) + settlementPrice(8 bytes)
+      // isSettled = false (0), strikePrice = price << 8, settlementPrice = 0
+      let packedValue := shl(8, price)
+      sstore(slot, packedValue)
+    }
 
     // Set expiry as current market
     activeCycle = expiry;
@@ -428,10 +434,29 @@ contract Market is
       // Market order
       _marketOrder(side, uint128(size), trader, takerId);
     } else if (isCrossing) {
-      // Market order for crossing amount
-      _marketOrder(side, uint128(orderbookLevelSize), trader, takerId);
-      // Limit order for remaining size
-      _limitOrder(side, size - orderbookLevelSize, limitPrice, trader);
+      // Consume orderbook levels until no longer crossing or fully filled
+      uint256 remainingSize = size;
+      
+      while (isCrossing && remainingSize > 0) {
+        // Consume this level (up to what's available and what we need)
+        uint256 consumeSize = remainingSize < orderbookLevelSize ? remainingSize : orderbookLevelSize;
+        
+        // Execute market order for this level
+        _marketOrder(side, uint128(consumeSize), trader, takerId);
+        
+        // Update remaining size
+        remainingSize -= consumeSize;
+        
+        // Check if we still cross after consuming this level (and if we have remaining size)
+        if (remainingSize > 0) {
+          (isCrossing, orderbookLevelSize) = _isCrossing(side, tick);
+        }
+      }
+      
+      // If there's remaining size that doesn't cross, place as limit order
+      if (remainingSize > 0) {
+        _limitOrder(side, remainingSize, limitPrice, trader);
+      }
     } else {
       // Limit order
       _limitOrder(side, size, limitPrice, trader);
@@ -1267,9 +1292,9 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  function setTrustedForwarder(address _forwarder) external onlyOwner {
-    _trustedForwarder = _forwarder;
-  }
+  // function setTrustedForwarder(address _forwarder) external onlyOwner {
+  //   _trustedForwarder = _forwarder;
+  // }
 
   function pause() external {
     _onlySecurityCouncil();

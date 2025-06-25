@@ -76,8 +76,8 @@ contract Market is
   mapping(address => uint32[]) userOrders; // Track all order IDs per user
   uint256 cursor; // settlement iterator
 
-  TakerQ[][4] internal takerQ; // 4 buckets
-  uint256[4] public tqHead; // cursor per bucket
+  TakerQ[][4] takerQ; // 4 buckets
+  uint256[4] tqHead; // cursor per bucket
 
   // Two-phase settlement for fair social loss distribution
   uint256 posSum; // total positive PnL (winners)
@@ -108,7 +108,6 @@ contract Market is
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
   event Liquidated(uint256 indexed cycleId, address indexed trader, uint256 liqFeeOwed);
-  event LiquidationCleared(uint256 indexed cycleId, address indexed trader);
   event LiquidationFeePaid(uint256 indexed cycleId, address indexed trader, uint256 liqFeePaid);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
@@ -612,7 +611,7 @@ contract Market is
     UserAccount storage uaTaker = userAccounts[taker];
 
     // Check if this is a liquidation order (taker is being liquidated)
-    bool isLiquidationOrder = uaTaker.liquidationQueued;
+    bool isLiquidationOrder = takerOrderId == 0;
 
     // Fees accounting
     int256 cashTaker;
@@ -710,8 +709,6 @@ contract Market is
 
         if (longCalls >= shortCalls && longPuts >= shortPuts) {
           uaTaker.liquidationQueued = false;
-
-          emit LiquidationCleared(activeCycle, taker);
         }
       }
     }

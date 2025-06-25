@@ -160,4 +160,8 @@ contract MarketWithViews is Market {
       }
     }
   }
+
+  function getTqHead(uint256 side) external view returns (uint256) {
+    return tqHead[uint256(side)];
+  }
 }

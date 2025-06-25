@@ -349,7 +349,7 @@ contract MarketSuite is Test {
 
     // Queue length won't be zero since we don't pop, but pointer should be equal to length
     (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
-    assertEq(mkt.tqHead(uint256(MarketSide.PUT_BUY)), qAfter.length, "queue head not at the end");
+    assertEq(mkt.getTqHead(uint256(MarketSide.PUT_BUY)), qAfter.length, "queue head not at the end");
   }
 
   // #######################################################################
@@ -406,7 +406,7 @@ contract MarketSuite is Test {
 
     // Queued taker entry zeroed
     (TakerQ[] memory qAfter) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
-    uint256 head = mkt.tqHead(uint256(MarketSide.PUT_BUY));
+    uint256 head = mkt.getTqHead(uint256(MarketSide.PUT_BUY));
     bool queueClean = qAfter.length == 0 || head >= qAfter.length || qAfter[head].size == 0;
     assertTrue(queueClean, "taker queue not cleaned");
 
@@ -1335,7 +1335,7 @@ contract MarketSuite is Test {
 
     //   no remaining queued PUT-buys
     (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
-    uint256 head = mkt.tqHead(uint256(MarketSide.PUT_BUY));
+    uint256 head = mkt.getTqHead(uint256(MarketSide.PUT_BUY));
     bool empty = q.length == 0 || head >= q.length || q[head].size == 0;
     assertTrue(empty, "taker queue should be empty");
 

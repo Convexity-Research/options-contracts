@@ -1106,37 +1106,17 @@ contract Market is
         }
       } else {
         //  ──------------------ Liquidation Account ────────────────────────
-        uint64 feeOwedBefore = ua.liquidationFeeOwed; // cache
 
-        if (pnl < 0) {
-          // 1) Loser: seize their entire balance, add |pnl| to badDebt
-          if (ua.balance > 0) {
-            userAccounts[feeRecipient].balance += ua.balance;
-            ua.balance = 0;
-            emit LiquidationFeePaid(activeCycle, trader, ua.balance);
-          }
-          badDebt += -pnl;
-        } else {
-          // 2) Winner (positive pnl): use pnl+balance to pay liquidation fee, surplus reduces badDebt
-          uint256 gain = uint256(pnl);
-          uint256 total = gain + ua.balance;
-
-          if (total >= feeOwedBefore) {
-            // Cover full fee first
-            userAccounts[feeRecipient].balance += feeOwedBefore;
-            emit LiquidationFeePaid(activeCycle, trader, feeOwedBefore);
-            uint256 excess = total - feeOwedBefore;
-
-            // Any excess reduces badDebt up to its size
-            badDebt -= int256(excess);
-          } else {
-            // Not enough – but take balance and +ve pnl
-            userAccounts[feeRecipient].balance += uint64(total);
-            emit LiquidationFeePaid(activeCycle, trader, total);
-          }
-          ua.balance = 0; // user never keeps anything
-          ua.liquidationFeeOwed = 0;
+        // Seize their entire balance, add |pnl| to badDebt
+        uint64 balance = ua.balance;
+        if (balance > 0) {
+          userAccounts[feeRecipient].balance += balance;
+          emit LiquidationFeePaid(activeCycle, trader, balance);
         }
+
+        badDebt += -pnl;
+        ua.balance = 0; // user never keeps anything
+        ua.liquidationFeeOwed = 0;
         emit Settled(cycleId, trader, 0);
       }
 

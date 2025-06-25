@@ -1610,7 +1610,178 @@ contract MarketSuite is Test {
     assertTrue(empty, "queue should be empty after settlement");
   }
 
-  function testLiquidationFromPremiumOverpayment_Long() public {}
+  /// @dev   Liquidation caused only by premium over-payment on a LIMIT long().
+  ///        After liquidation the protocol (feeSink) must hold the seized
+  ///        long CALLs.
+  function testLiquidationFromPremiumOverpayment_Long() public {
+    uint256 MM_BPS = 10;
+    uint256 denominator = 10000;
+    uint256 TAKER_FEE_BPS = 700;
+
+    //------------------------------------------------------------
+    // 0.  Constants & helpers
+    //------------------------------------------------------------
+    uint256 orderSize = 5; // contracts
+    uint256 callAskPrice = 1 * ONE_COIN; // 1 USDT premium per CALL
+    uint256 putBidPrice = 100; // 0.0001 USDT per PUT
+    uint64 strike = uint64(btcPrice * 1e6); // strike == spot
+
+    // maintenance-margin on 5 short-PUTs at strike:  0.1 % × (5 × strike /100)
+    uint256 mmNeeded = (orderSize * strike / CONTRACT_SIZE) * MM_BPS / denominator; // ≈ 5 USDT
+
+    // deposit JUST enough to satisfy margin **before** the trade,
+    // plus the premium that will later be paid (callAskPrice*5) and taker fees
+    uint256 premiumPay = orderSize * callAskPrice; // 5.000000
+    uint256 takerFeeCall = premiumPay * TAKER_FEE_BPS / denominator; // 0.350000
+    uint256 deposit = premiumPay + takerFeeCall + mmNeeded + 1; // ≈ 10.4 USDT
+
+    //------------------------------------------------------------
+    // 1.  Fund accounts, place long, and match liquidity
+    //------------------------------------------------------------
+    _fund(u1, deposit); // will be liquidated
+    _fund(u2, 1_000 * ONE_COIN); // liquidity provider
+
+    // 1-A.  u1 places a LIMIT long() that **rests**
+    vm.startPrank(u1);
+    mkt.long(
+      orderSize,
+      callAskPrice, // limit price for CALL buy
+      putBidPrice, // limit price for PUT sell
+      0 // current cycle
+    );
+    vm.stopPrank();
+
+    // at this point nothing is filled → account is still solvent
+    assertFalse(mkt.isLiquidatable(u1), "should be solvent while order resting");
+
+    // 1-B.  u2 now crosses the book – fills both CALL & PUT legs
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, orderSize, callAskPrice, 0); // crosses CALL bid
+    mkt.placeOrder(MarketSide.PUT_BUY, orderSize, putBidPrice, 0); // crosses PUT ask
+    vm.stopPrank();
+
+    //------------------------------------------------------------
+    // 2.  Premium was paid
+    //------------------------------------------------------------
+    assertFalse(mkt.isLiquidatable(u1), "u1 not liquidatable yet after fill");
+
+    _mockOracle(btcPrice - 15_000);
+    assertTrue(mkt.isLiquidatable(u1), "u1 must be liquidatable after adverse price move");
+
+    //------------------------------------------------------------
+    // 3.  Provide minimal PUT-SELL liquidity so the liquidation  *
+    //     closes the net-short PUTs instantly                     *
+    //------------------------------------------------------------
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.PUT_SELL, orderSize, putBidPrice, 0);
+    vm.stopPrank();
+
+    //------------------------------------------------------------
+    // 4.  Liquidate u1
+    //------------------------------------------------------------
+    uint32 longCallsBefore = mkt.getUserAccount(feeSink).longCalls;
+    uint256 balanceBefore = mkt.getUserAccount(u1).balance;
+
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+
+    //------------------------------------------------------------
+    // 5.  Assertions
+    //------------------------------------------------------------
+    MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
+
+    //  a) flag cleared (orders filled, no queue left)
+    assertFalse(ua.liquidationQueued, "liq flag should be cleared");
+
+    //  b) protocol now owns the user’s confiscated long CALLs
+    uint32 longCallsAfter = mkt.getUserAccount(feeSink).longCalls;
+    assertEq(longCallsAfter - longCallsBefore, uint32(orderSize), "protocol did not seize long CALLs");
+
+    //  c) user still has balance, as its confiscated in settlement
+    uint256 liqPremiumPay = orderSize * putBidPrice;
+    assertEq(
+      ua.balance,
+      balanceBefore - liqPremiumPay - liqPremiumPay * TAKER_FEE_BPS / denominator,
+      "user balance should be confiscated"
+    );
+
+    //  d) PUT-BUY taker queue empty
+    (TakerQ[] memory q) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    uint256 head = mkt.getTqHead(uint256(MarketSide.PUT_BUY));
+    bool empty = q.length == 0 || head >= q.length || q[head].size == 0;
+    assertTrue(empty, "taker queue should be empty");
+
+    //------------------------------------------------------------
+    // 6.  Pump price ABOVE strike *before* expiry so seized CALLs are ITM
+    //------------------------------------------------------------
+    _mockOracle(btcPrice + 20_000); // spot = strike + 20 000
+
+    // fast-forward one second past expiry
+    vm.warp(cycleId + 1);
+
+    //------------------------------------------------------------
+    // 7.  Run settlement & capture events
+    //------------------------------------------------------------
+    vm.recordLogs();
+    mkt.settleChunk(1000, false); // single-shot completion
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+
+    //------------------------------------------------------------
+    // 8.  Post-settlement checks
+    //------------------------------------------------------------
+    // (a) liquidated user balance & flags
+    assertEq(mkt.getUserAccount(u1).balance, 0, "user balance must be 0");
+    assertEq(mkt.getUserAccount(u1).liquidationFeeOwed, 0, "liq fee owed should be cleared");
+
+    // (b) event decoding
+    bool seenFeeSinkSettle;
+    bool seenUserSettle;
+    bool seenLiqFee;
+    int256 pnlFeeSink;
+    int256 pnlUser;
+    uint256 liqFeeAmt;
+
+    bytes32 SETTLED_SIG = keccak256("Settled(uint256,address,int256)");
+    bytes32 LIQ_FEE_SIG = keccak256("LiquidationFeePaid(uint256,address,uint256)");
+
+    for (uint256 i; i < logs.length; ++i) {
+      // Settled(...)
+      if (logs[i].topics[0] == SETTLED_SIG) {
+        address trader = address(uint160(uint256(logs[i].topics[2])));
+        int256 pnl = abi.decode(logs[i].data, (int256));
+        if (trader == feeSink) {
+          seenFeeSinkSettle = true;
+          pnlFeeSink = pnl;
+        }
+        if (trader == u1) {
+          seenUserSettle = true;
+          pnlUser = pnl;
+        }
+      }
+      // LiquidationFeePaid(...)
+      if (logs[i].topics[0] == LIQ_FEE_SIG && address(uint160(uint256(logs[i].topics[2]))) == u1) {
+        seenLiqFee = true;
+        liqFeeAmt = abi.decode(logs[i].data, (uint256));
+      }
+    }
+
+    require(seenFeeSinkSettle, "feeSink Settled evt missing");
+    require(seenUserSettle, "user Settled evt missing");
+    require(seenLiqFee, "LiquidationFeePaid evt missing");
+
+    // (c) feeSink PnL  = intrinsic of 5 long-CALLs, 20 000 USDT ITM
+    uint256 priceDiff = 20_000 * ONE_COIN; // 20 000 USDT (6-dp)
+    uint256 expectedPnL = priceDiff * orderSize / CONTRACT_SIZE; // 1 000 USDT
+    assertEq(uint256(pnlFeeSink), expectedPnL, "feeSink PnL mismatch");
+
+    //     liquidated user gets zero PnL
+    assertEq(pnlUser, 0, "user PnL should be zero");
+
+    // (d) liquidation fee paid equals the balance we observed pre-settlement
+    uint256 expectedLiqFee = ua.balance; // ‘ua’ captured before settlement
+    assertEq(liqFeeAmt, expectedLiqFee, "liq fee amount mismatch");
+  }
 
   function testLiquidationFromPremiumOverpayment_Short() public {}
 

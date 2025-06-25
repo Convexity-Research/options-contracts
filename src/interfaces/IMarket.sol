@@ -43,8 +43,8 @@ interface IMarket {
   function depositCollateral(uint256 amount) external;
   function withdrawCollateral(uint256 amount) external;
 
-  function long(uint256 size, uint256 cycleId) external;
-  function short(uint256 size, uint256 cycleId) external;
+  function long(uint256 size, uint256 limitPrice, uint256 cycleId) external;
+  function short(uint256 size, uint256 limitPrice, uint256 cycleId) external;
   function cancelOrder(uint256 orderId) external;
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
     external

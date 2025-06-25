@@ -72,7 +72,7 @@ contract Market is
   mapping(uint256 => Cycle) public cycles;
 
   //------- Trading/Settlement -------
-  address[] public traders;
+  address[] traders;
   mapping(address => uint32[]) userOrders; // Track all order IDs per user
   uint256 cursor; // settlement iterator
 
@@ -161,7 +161,6 @@ contract Market is
     feeRecipient = _feeRecipient;
     collateralToken = _collateralToken;
     _trustedForwarder = _forwarder;
-    _pause();
   }
 
   // #######################################################################
@@ -188,8 +187,8 @@ contract Market is
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size, uint256 limitPrice,uint256 cycleId) external whenNotPaused {
-    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
+  function long(uint256 size, uint256 limitPrice, uint256 cycleId) external whenNotPaused {
+    _checkActiveCycle(cycleId);
     address trader = _msgSender();
 
     _placeOrder(MarketSide.CALL_BUY, size, limitPrice, trader);
@@ -197,7 +196,7 @@ contract Market is
   }
 
   function short(uint256 size, uint256 limitPrice, uint256 cycleId) external whenNotPaused {
-    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
+    _checkActiveCycle(cycleId);
     address trader = _msgSender();
 
     _placeOrder(MarketSide.PUT_BUY, size, limitPrice, trader);
@@ -636,12 +635,20 @@ contract Market is
       // orderbook, or a market order if it ends up in the takerQueue. Either of these scenarios could lead to denial of
       // service, so we remove the resting orders completelyorders
       if (!isLiquidationOrder) {
-        if (isTakerQueue && isTakerBuy) {
-          if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
+        // premium that each party has to pay (<0 means paying out, >0 means receiving)
+        int256 premMaker = cashMaker; // from earlier calculation
+        int256 premTaker = cashTaker;
+
+        if (isTakerQueue) {
+          if (premTaker < 0 && uaTaker.balance < uint256(-premTaker)) {
+            // Not enough USDC – leave the queue entry untouched, skip this fill
             return 0;
-          } else if (!isTakerQueue && !isTakerBuy) {
+          }
+        } else {
+          if (premMaker < 0 && uaMaker.balance < uint256(-premMaker)) {
+            // Remove maker from the book so it cannot block the market
             ob[activeCycle].makerNodes[makerOrderId].size = 0;
-            if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) return 0;
+            return 0;
           }
         }
       }
@@ -1200,6 +1207,10 @@ contract Market is
     }
   }
 
+  function _checkActiveCycle(uint256 cycleId) internal view {
+    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
+  }
+
   // #######################################################################
   // #                                                                     #
   // #             Other helpers and views                                 #
@@ -1244,17 +1255,13 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  function setTrustedForwarder(address _forwarder) external onlyOwner {
-    _trustedForwarder = _forwarder;
-  }
+  // function setTrustedForwarder(address _forwarder) external onlyOwner {
+  //   _trustedForwarder = _forwarder;
+  // }
 
   function pauseNewCycles() external onlySecurityCouncil {
     // Nothing truly paused, but we can't start new cycles
     settlementOnlyMode = true;
-  }
-
-  function pause() external onlySecurityCouncil {
-    _pause();
   }
 
   function unpause() external onlySecurityCouncil {
@@ -1270,7 +1277,7 @@ contract Market is
   }
 
   modifier onlySecurityCouncil() {
-    if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
+    if (_msgSender() != SECURITY_COUNCIL) revert();
     _;
   }
 }

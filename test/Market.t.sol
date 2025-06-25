@@ -292,7 +292,7 @@ contract MarketSuite is Test {
     _fund(u2, userCollateral);
     vm.startPrank(u2);
     vm.recordLogs();
-    mkt.long(1, 0, cycleId);
+    mkt.long(1, 0, 0, cycleId);
 
     // Check if liquidatable.
     uint64 currentPrice = uint64(btcPrice * 1e6);
@@ -481,7 +481,7 @@ contract MarketSuite is Test {
     _mockOracle(btcPrice + 10_000); // +10 k → long wins 100 USDT
 
     // phase-1 + phase-2 in two txs
-    mkt.settleChunk(20);
+    mkt.settleChunk(20, false);
 
     // cycle closed
     Cycle memory cycle = mkt.getCycle(cycleId);
@@ -520,7 +520,7 @@ contract MarketSuite is Test {
 
     uint256 intrinsic = (10_000 * ONE_COIN) / CONTRACT_SIZE; // 100 USDT
 
-    mkt.settleChunk(10);
+    mkt.settleChunk(10, false);
 
     // u2 must be drained to zero, u1's scratchPnL should equal +100
     assertEq(mkt.getUserAccount(u2).balance, 0, "u2 balance not zero");
@@ -548,7 +548,7 @@ contract MarketSuite is Test {
     _mockOracle(btcPrice + 1000);
 
     vm.recordLogs();
-    mkt.settleChunk(1000);
+    mkt.settleChunk(1000, false);
     Vm.Log[] memory logs = vm.getRecordedLogs();
 
     // Should have CycleSettled and CycleStarted events
@@ -599,7 +599,7 @@ contract MarketSuite is Test {
 
     // 1st chunk — should NOT finish settlement
     vm.recordLogs();
-    mkt.settleChunk(6); // Choose a chunk size which would complete phase 1
+    mkt.settleChunk(6, false); // Choose a chunk size which would complete phase 1
     Vm.Log[] memory first = vm.getRecordedLogs();
 
     for (uint256 i; i < first.length; ++i) {
@@ -613,7 +613,7 @@ contract MarketSuite is Test {
 
     // 2nd chunk — must complete settlement and start new cycle
     vm.recordLogs();
-    mkt.settleChunk(100);
+    mkt.settleChunk(100, false);
     Vm.Log[] memory second = vm.getRecordedLogs();
 
     uint256 cycleIdAfter;
@@ -653,7 +653,7 @@ contract MarketSuite is Test {
 
     // 1st chunk — should NOT finish settlement
     vm.recordLogs();
-    mkt.settleChunk(3); // Choose a chunk size which would not complete phase 1
+    mkt.settleChunk(3, false); // Choose a chunk size which would not complete phase 1
     Vm.Log[] memory first = vm.getRecordedLogs();
 
     for (uint256 i; i < first.length; ++i) {
@@ -667,7 +667,7 @@ contract MarketSuite is Test {
 
     // 2nd chunk — must complete settlement and start new cycle
     vm.recordLogs();
-    mkt.settleChunk(100);
+    mkt.settleChunk(100, false);
     Vm.Log[] memory second = vm.getRecordedLogs();
 
     uint256 cycleIdAfter;
@@ -701,7 +701,7 @@ contract MarketSuite is Test {
 
     uint256 txCount;
     while (mkt.activeCycle() == cycleIdBefore) {
-      mkt.settleChunk(1); // deliberately small to force many txs
+      mkt.settleChunk(1, false); // deliberately small to force many txs
       ++txCount;
     }
 
@@ -763,10 +763,10 @@ contract MarketSuite is Test {
 
     vm.warp(cycleId + 1);
     vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
-    mkt.settleChunk(100);
+    mkt.settleChunk(100, false);
 
     mkt.unpause();
-    mkt.settleChunk(100);
+    mkt.settleChunk(100, false);
   }
 
   // #######################################################################
@@ -1275,7 +1275,7 @@ contract MarketSuite is Test {
     uint256 balBefore = mkt.getUserAccount(u1).balance;
     vm.startPrank(u1);
     vm.recordLogs();
-    mkt.long(orderSize, 0, 0); // market order
+    mkt.long(orderSize, 0, 0, 0); // market order
     Vm.Log[] memory lg = vm.getRecordedLogs();
     vm.stopPrank();
 
@@ -1329,7 +1329,7 @@ contract MarketSuite is Test {
     // Go to settlement
     vm.warp(cycleId + 1);
     vm.recordLogs();
-    mkt.settleChunk(100);
+    mkt.settleChunk(100, false);
     lg = vm.getRecordedLogs();
 
     uint256 liqFeePaid = _getLiquidationFeePaid(lg);
@@ -1393,7 +1393,7 @@ contract MarketSuite is Test {
 
     // Settlement
     vm.startPrank(owner);
-    mkt.settleChunk(100); // Use larger chunk to complete in one call
+    mkt.settleChunk(100, false); // Use larger chunk to complete in one call
     vm.stopPrank();
 
     // Check that liquidationFeeOwed is zeroed
@@ -1483,7 +1483,7 @@ contract MarketSuite is Test {
     _fund(u2, deposit);
 
     vm.startPrank(u1);
-    mkt.long(10, 0, cycleId); // 10 long calls + 10 short puts
+    mkt.long(10, 0, 0, cycleId); // 10 long calls + 10 short puts
     vm.stopPrank();
 
     uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
@@ -1497,7 +1497,7 @@ contract MarketSuite is Test {
     vm.warp(cycleId + 1);
     _mockOracle(btcPrice + 15_000); // 115 000 -> calls ITM by 15 000
 
-    mkt.settleChunk(20);
+    mkt.settleChunk(20, false);
 
     uint256 callPremAll = callPrem * 10; // 20 USDT0
     uint256 putPremAll = putPrem * 10; // 10 USDT0
@@ -1534,7 +1534,7 @@ contract MarketSuite is Test {
     _fund(u2, deposit);
 
     vm.startPrank(u1);
-    mkt.long(10, 0, cycleId); // 10 long calls + 10 short puts
+    mkt.long(10, 0, 0, cycleId); // 10 long calls + 10 short puts
     vm.stopPrank();
 
     uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
@@ -1547,7 +1547,7 @@ contract MarketSuite is Test {
     vm.warp(cycleId + 1);
     _mockOracle(btcPrice - 15_000); // 85 000 -> puts ITM by 15 000
 
-    mkt.settleChunk(20);
+    mkt.settleChunk(20, false);
 
     uint256 callPremAll = callPrem * 10; // 20 USDT0
     uint256 putPremAll = putPrem * 10; // 10 USDT0
@@ -1584,7 +1584,7 @@ contract MarketSuite is Test {
     _fund(u2, deposit);
 
     vm.startPrank(u1);
-    mkt.short(10, 0, cycleId); // 10 short calls + 10 long puts
+    mkt.short(10, 0, 0, cycleId); // 10 short calls + 10 long puts
     vm.stopPrank();
 
     uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
@@ -1598,7 +1598,7 @@ contract MarketSuite is Test {
     vm.warp(cycleId + 1);
     _mockOracle(btcPrice + 15_000); // 115 000 -> calls ITM by 15 000
 
-    mkt.settleChunk(20);
+    mkt.settleChunk(20, false);
 
     uint256 callPremAll = callPrem * 10; // 20 USDT0
     uint256 putPremAll = putPrem * 10; // 10 USDT0
@@ -1638,7 +1638,7 @@ contract MarketSuite is Test {
     _fund(u2, deposit);
 
     vm.startPrank(u1);
-    mkt.short(10, 0, cycleId); // 10 short calls + 10 long puts
+    mkt.short(10, 0, 0, cycleId); // 10 short calls + 10 long puts
     vm.stopPrank();
 
     uint256 callPrem = 2 * ONE_COIN; // 2 USDT0 / call
@@ -1652,7 +1652,7 @@ contract MarketSuite is Test {
     vm.warp(cycleId + 1);
     _mockOracle(btcPrice - 15_000); // 85 000 -> puts ITM by 15 000
 
-    mkt.settleChunk(20);
+    mkt.settleChunk(20, false);
 
     uint256 callPremAll = callPrem * 10; // 20 USDT0
     uint256 putPremAll = putPrem * 10; // 10 USDT0

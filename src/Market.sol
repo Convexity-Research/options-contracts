@@ -184,20 +184,20 @@ contract Market is
     _withdrawCollateral(amount, trader);
   }
 
-  function long(uint256 size, uint256 limitPrice, uint256 cycleId) external whenNotPaused {
+  function long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external whenNotPaused {
     _checkActiveCycle(cycleId);
     address trader = _msgSender();
 
-    _placeOrder(MarketSide.CALL_BUY, size, limitPrice, trader);
-    _placeOrder(MarketSide.PUT_SELL, size, limitPrice, trader);
+    _placeOrder(MarketSide.CALL_BUY, size, limitPriceBuy, trader);
+    _placeOrder(MarketSide.PUT_SELL, size, limitPriceSell, trader);
   }
 
-  function short(uint256 size, uint256 limitPrice, uint256 cycleId) external whenNotPaused {
+  function short(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external whenNotPaused {
     _checkActiveCycle(cycleId);
     address trader = _msgSender();
 
-    _placeOrder(MarketSide.PUT_BUY, size, limitPrice, trader);
-    _placeOrder(MarketSide.CALL_SELL, size, limitPrice, trader);
+    _placeOrder(MarketSide.PUT_BUY, size, limitPriceBuy, trader);
+    _placeOrder(MarketSide.CALL_SELL, size, limitPriceSell, trader);
   }
 
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
@@ -312,7 +312,10 @@ contract Market is
     }
   }
 
-  function settleChunk(uint256 max) external whenNotPaused {
+  function settleChunk(uint256 max, bool pauseNextCycle) external whenNotPaused {
+    if (pauseNextCycle) {
+      _onlySecurityCouncil();
+    }
     if (activeCycle == 0) revert Errors.CycleNotStarted();
 
     uint256 cycleId = activeCycle;
@@ -338,11 +341,11 @@ contract Market is
       // If phase 1 is complete and we have iterations left, proceed to phase 2
       if (settlementPhase && iterationsUsed < max) {
         uint256 remainingIterations = max - iterationsUsed;
-        _doPhase2(cycleId, remainingIterations);
+        _doPhase2(cycleId, remainingIterations, pauseNextCycle);
       }
     } else {
       // Phase 2: Credit winners pro-rata based on loss ratio
-      _doPhase2(cycleId, max);
+      _doPhase2(cycleId, max, pauseNextCycle);
     }
   }
 
@@ -355,7 +358,7 @@ contract Market is
     if (activeCycle != 0) revert Errors.CycleActive();
 
     uint64 price = _getOraclePrice();
-    if (price == 0) revert Errors.OraclePriceCallFailed();
+    if (price == 0) revert(); // Errors.OraclePriceCallFailed();
 
     // Create new market
     cycles[expiry] = Cycle({
@@ -850,7 +853,7 @@ contract Market is
 
   function _getOraclePrice() internal view returns (uint64) {
     (bool success, bytes memory result) = MARK_PX_PRECOMPILE.staticcall(abi.encode(0));
-    if (!success) revert Errors.OraclePriceCallFailed();
+    if (!success) revert(); // Errors.OraclePriceCallFailed();
     // Price always returned with 1 extra decimal, so subtract by 1 from USDT0 decimals.
     uint64 price = abi.decode(result, (uint64)) * uint64(10 ** (collateralDecimals - 1));
     return price;
@@ -1141,7 +1144,7 @@ contract Market is
     return i - startingI;
   }
 
-  function _doPhase2(uint256 cycleId, uint256 max) internal {
+  function _doPhase2(uint256 cycleId, uint256 max, bool pauseNextCycle) internal {
     Cycle storage C = cycles[cycleId];
     uint256 n = traders.length;
     uint256 i = cursor;
@@ -1195,9 +1198,9 @@ contract Market is
       activeCycle = 0;
 
       emit CycleSettled(cycleId);
-
+      
       // Automatically start new cycle unless in settlement-only mode
-      if (!paused()) _startCycle();
+      if (!pauseNextCycle) _startCycle();
     }
   }
 
@@ -1253,11 +1256,13 @@ contract Market is
   //   _trustedForwarder = _forwarder;
   // }
 
-  function pause() external onlySecurityCouncil {
+  function pause() external {
+    _onlySecurityCouncil();
     _pause();
   }
 
-  function unpause() external onlySecurityCouncil {
+  function unpause() external {
+    _onlySecurityCouncil();
     _unpause();
   }
 
@@ -1268,8 +1273,7 @@ contract Market is
     _;
   }
 
-  modifier onlySecurityCouncil() {
-    if (_msgSender() != SECURITY_COUNCIL) revert();
-    _;
+  function _onlySecurityCouncil() internal view {
+    if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
   }
 }

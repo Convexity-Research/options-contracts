@@ -418,17 +418,23 @@ contract Market is
     // Convert price to tick
     uint256 tick = limitPrice / TICK_SZ; // 1 tick = 0.01 USDT0
 
-    if (limitPrice == 0 || _isCrossing(side, tick)) {
+    bool isCrossing;
+    uint256 orderbookLevelSize;
+    (isCrossing, orderbookLevelSize) = _isCrossing(side, tick);
+
+    int32 takerId = _nextTakerId(ob[activeCycle]);
+
+    if (limitPrice == 0) {
       // Market order
-      int32 takerId = _nextTakerId(ob[activeCycle]);
-      emit TakerOrderPlaced(activeCycle, takerId, size, side, trader);
       _marketOrder(side, uint128(size), trader, takerId);
+    } else if (isCrossing) {
+      // Market order for crossing amount
+      _marketOrder(side, uint128(orderbookLevelSize), trader, takerId);
+      // Limit order for remaining size
+      _limitOrder(side, size - orderbookLevelSize, limitPrice, trader);
     } else {
       // Limit order
-      uint256 orderId = _nextMakerId(ob[activeCycle]);
-      emit LimitOrderPlaced(activeCycle, orderId, size, tick * TICK_SZ, side, trader);
-      uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
-      if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
+      _limitOrder(side, size, limitPrice, trader);
     }
 
     if (userAccounts[trader].balance < _requiredMargin(trader, _getOraclePrice(), false)) {
@@ -441,7 +447,16 @@ contract Market is
     }
   }
 
+  function _limitOrder(MarketSide side, uint256 size, uint256 limitPrice, address trader) private {
+    uint256 tick = limitPrice / TICK_SZ;
+    uint256 orderId = _nextMakerId(ob[activeCycle]);
+    emit LimitOrderPlaced(activeCycle, orderId, size, tick * TICK_SZ, side, trader);
+    uint256 qtyLeft = _matchQueuedTakers(side, size, uint256(tick) * TICK_SZ, uint32(orderId));
+    if (qtyLeft != 0) _insertLimit(side, uint32(tick), uint128(qtyLeft), trader, uint32(orderId));
+  }
+
   function _marketOrder(MarketSide side, uint128 want, address taker, int32 takerOrderId) private {
+    emit TakerOrderPlaced(activeCycle, takerOrderId, want, side, taker);
     uint128 left = want;
     uint256 ac = activeCycle;
     OrderbookState storage _ob = ob[ac];
@@ -800,17 +815,21 @@ contract Market is
     }
   }
 
-  function _isCrossing(MarketSide side, uint256 tick) internal view returns (bool) {
+  function _isCrossing(MarketSide side, uint256 tick) internal view returns (bool, uint256) {
     MarketSide oppSide = _oppositeSide(side);
 
+    bool isCrossing;
+    uint256 size;
+
     if (ob[activeCycle].summaries[uint256(oppSide)] != 0) {
-      (uint32 oppBest,) = _best(oppSide);
+      (uint32 oppBest, uint32 oppKey) = _best(oppSide);
 
       // Check crossing: even enum values (buys) use >=, odd enum values (sells) use <=
-      return (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
+      isCrossing = (uint256(side) & 1) == 0 ? (tick >= oppBest) : (tick <= oppBest);
+      if (isCrossing) size = ob[activeCycle].levels[oppKey].vol;
     }
 
-    return false;
+    return (isCrossing, size);
   }
 
   function _nextMakerId(OrderbookState storage _ob) private returns (uint32 id) {
@@ -1248,9 +1267,9 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  // function setTrustedForwarder(address _forwarder) external onlyOwner {
-  //   _trustedForwarder = _forwarder;
-  // }
+  function setTrustedForwarder(address _forwarder) external onlyOwner {
+    _trustedForwarder = _forwarder;
+  }
 
   function pause() external {
     _onlySecurityCouncil();

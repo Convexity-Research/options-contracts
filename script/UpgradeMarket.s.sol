@@ -8,7 +8,6 @@ import {Market} from "../src/Market.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 contract DeployUUPSProxy is Script {
-
   address marketProxy1 = 0xEaCCc2025Ee34Be0b6F1F8c8B18f074a1568335C;
   address marketProxy2 = 0xd7Fef464914551466d2c3DcD239F1670f2b77cb2;
 
@@ -19,7 +18,6 @@ contract DeployUUPSProxy is Script {
     address upgrader = vm.addr(vm.envUint("MARKET_OWNER"));
     console.log("Deploying with account:", upgrader);
     console.log("Account balance:", upgrader.balance);
-
 
     // 1. Deploy the implementation contract
     Market newImplementation = new Market();

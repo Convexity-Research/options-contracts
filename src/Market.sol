@@ -313,9 +313,7 @@ contract Market is
   }
 
   function settleChunk(uint256 max, bool pauseNextCycle) external whenNotPaused {
-    if (pauseNextCycle) {
-      _onlySecurityCouncil();
-    }
+    if (pauseNextCycle) _onlySecurityCouncil();
     if (activeCycle == 0) revert Errors.CycleNotStarted();
 
     uint256 cycleId = activeCycle;
@@ -1196,7 +1194,7 @@ contract Market is
       activeCycle = 0;
 
       emit CycleSettled(cycleId);
-      
+
       // Automatically start new cycle unless in settlement-only mode
       if (!pauseNextCycle) _startCycle();
     }

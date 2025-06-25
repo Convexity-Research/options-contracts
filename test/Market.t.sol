@@ -318,9 +318,7 @@ contract MarketSuite is Test {
     assertEq(mkt.getUserAccount(u2).liquidationQueued, false);
   }
 
-  function testMaxPremiumPaidByRestingLimitOrder() public {
-    
-  }
+  function testMaxPremiumPaidByRestingLimitOrder() public {}
 
   // #######################################################################
   // #                                                                     #
@@ -1347,7 +1345,78 @@ contract MarketSuite is Test {
     assertEq(pnl, 0, "pnl should be zero");
   }
 
-  function testLiquidationFromPriceFall_OrdersUnfilled() public {}
+  function testLiquidationFromPriceFall_OrdersUnfilled() public {
+    uint256 traderDeposit = 6 * ONE_COIN + 100_000; // same as “filled” test
+    uint256 mmDeposit = 1_000 * ONE_COIN;
+
+    // ---------------------------------------------------------------------
+    // 0. Fund & provide liquidity so the LONG opens
+    // ---------------------------------------------------------------------
+    _fund(u1, traderDeposit); // will be liquidated
+    _fund(u2, mmDeposit); // market-maker / liquidity
+
+    vm.startPrank(u2);
+    uint256 premiumPrice = 10_000; // 0.01 USDT premium-per-leg
+    uint256 orderSize = 5; // contracts
+    mkt.placeOrder(MarketSide.CALL_SELL, orderSize, premiumPrice, 0); // ask
+    mkt.placeOrder(MarketSide.PUT_BUY, orderSize, premiumPrice, 0); // bid
+    vm.stopPrank();
+
+    // u1 hits the book -> long CALL, short PUT
+    vm.startPrank(u1);
+    mkt.long(orderSize, 0, 0, 0); // market order
+    vm.stopPrank();
+
+    // ---------------------------------------------------------------------
+    // 1.  Price dumps —> u1 is liquidatable
+    // ---------------------------------------------------------------------
+    _mockOracle(btcPrice - 15_000);
+    assertTrue(mkt.isLiquidatable(u1), "should be liquidatable after price fall");
+
+    // ---------------------------------------------------------------------
+    // 2.  Liquidate WITHOUT providing offsetting PUT-SELL liquidity
+    // ---------------------------------------------------------------------
+    uint256 balBeforeLiq = mkt.getUserAccount(u1).balance;
+
+    vm.startPrank(owner);
+    mkt.liquidate(u1); // leaves 5 x PUT-BUY in taker-queue
+    vm.stopPrank();
+
+    // After liquidation: flag set, fee owed recorded, queue holds 5 contracts
+    MarketWithViews.UserAccount memory uaAfterLiq = mkt.getUserAccount(u1);
+    assertTrue(uaAfterLiq.liquidationQueued, "liq flag should be set (orders unfilled)");
+    assertEq(uaAfterLiq.liquidationFeeOwed, balBeforeLiq, "liqFeeOwed must equal current balance");
+
+    (TakerQ[] memory q1) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    assertEq(q1.length, 1, "one queue entry expected");
+    assertEq(q1[0].size, orderSize, "queued size wrong");
+
+    // ---------------------------------------------------------------------
+    // 3.  Fast-forward to expiry and settle – queue still unfilled
+    // ---------------------------------------------------------------------
+    vm.warp(cycleId + 1);
+    vm.recordLogs();
+    mkt.settleChunk(100, false); // run both phases in one call
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+
+    // a) liquidation fee was paid in full to feeRecipient
+    uint256 liqFeePaid = _getLiquidationFeePaid(logs);
+    assertEq(liqFeePaid, balBeforeLiq, "fee recipient should seize full balance");
+
+    // b) user keeps nothing, flags are cleared
+    MarketWithViews.UserAccount memory uaFinal = mkt.getUserAccount(u1);
+    assertEq(uaFinal.balance, 0, "user balance must be zero");
+    assertFalse(uaFinal.liquidationQueued, "liq flag should be cleared");
+    assertEq(uaFinal.liquidationFeeOwed, 0, "liqFeeOwed should be zeroed");
+
+    // c) PnL event for liquidated user must be zero
+    int256 pnl = _getPnl(logs, u1);
+    assertEq(pnl, 0, "liquidated user should record zero pnl");
+
+    // d) settlement wiped the taker queue
+    (TakerQ[] memory qFinal) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
+    assertTrue(qFinal.length == 0, "queue should be cleared after settlement");
+  }
 
   function testLiquidationFromPricePump_OrdersFilled() public {}
 

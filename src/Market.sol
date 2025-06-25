@@ -712,7 +712,7 @@ contract Market is
           uaTaker.liquidationQueued = false;
 
           emit LiquidationCleared(activeCycle, taker);
-        } 
+        }
       }
     }
 

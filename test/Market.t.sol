@@ -318,6 +318,8 @@ contract MarketSuite is Test {
     assertEq(mkt.getUserAccount(u2).liquidationQueued, false);
   }
 
+  function testMaximumPriceLevelsMatch() public {}
+
   function testMaxPremiumPaidByRestingLimitOrder() public {}
 
   // #######################################################################

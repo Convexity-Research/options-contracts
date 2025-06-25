@@ -364,7 +364,7 @@ contract Market is
       mstore(0x00, expiry)
       mstore(0x20, cycles.slot)
       let slot := keccak256(0x00, 0x40)
-      
+
       // Pack struct: isSettled(1 byte) + strikePrice(8 bytes) + settlementPrice(8 bytes)
       // isSettled = false (0), strikePrice = price << 8, settlementPrice = 0
       let packedValue := shl(8, price)
@@ -436,27 +436,23 @@ contract Market is
     } else if (isCrossing) {
       // Consume orderbook levels until no longer crossing or fully filled
       uint256 remainingSize = size;
-      
+
       while (isCrossing && remainingSize > 0) {
         // Consume this level (up to what's available and what we need)
         uint256 consumeSize = remainingSize < orderbookLevelSize ? remainingSize : orderbookLevelSize;
-        
+
         // Execute market order for this level
         _marketOrder(side, uint128(consumeSize), trader, takerId);
-        
+
         // Update remaining size
         remainingSize -= consumeSize;
-        
+
         // Check if we still cross after consuming this level (and if we have remaining size)
-        if (remainingSize > 0) {
-          (isCrossing, orderbookLevelSize) = _isCrossing(side, tick);
-        }
+        if (remainingSize > 0) (isCrossing, orderbookLevelSize) = _isCrossing(side, tick);
       }
-      
+
       // If there's remaining size that doesn't cross, place as limit order
-      if (remainingSize > 0) {
-        _limitOrder(side, remainingSize, limitPrice, trader);
-      }
+      if (remainingSize > 0) _limitOrder(side, remainingSize, limitPrice, trader);
     } else {
       // Limit order
       _limitOrder(side, size, limitPrice, trader);

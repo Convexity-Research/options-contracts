@@ -32,7 +32,7 @@ contract CheckBalances is Script {
   address constant MARKET = 0xB7C609cFfa0e47DB2467ea03fF3e598bF59361A5;
   address constant USDT = 0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb;
   address constant MULTICALL3 = 0xcA11bde05977b3631167028862bE2a173976CA11;
-  
+
   function getUsers() internal pure returns (address[] memory users) {
     string[122] memory userStrings = [
       "0x69835D480110e4919B7899f465aAB101e21c8A87",
@@ -179,7 +179,7 @@ contract CheckBalances is Script {
 
     uint256 totalUserBalance = 0;
     uint256 usersWithBalance = 0;
-    
+
     address[] memory users = getUsers();
 
     console.log("Fetching all user balances via multicall3...");
@@ -196,7 +196,7 @@ contract CheckBalances is Script {
 
     // Execute multicall3
     IMulticall3.Result[] memory results = multicall.aggregate3(calls);
-    
+
     console.log("Processing individual user balances...");
     console.log("");
 
@@ -208,9 +208,7 @@ contract CheckBalances is Script {
       UserAccount memory account = abi.decode(results[i].returnData, (UserAccount));
       uint256 balance = uint256(account.balance);
 
-      if (balance > 0) {
-        usersWithBalance++;
-      }
+      if (balance > 0) usersWithBalance++;
 
       totalUserBalance += balance;
     }

@@ -650,13 +650,10 @@ contract Market is
         }
       }
 
-      // Apply cash deltas - for liquidations, handle insufficient balance as bad debt
+      // Apply cash deltas - for liquidations. Max premium is user's balance, do not accrue bad debt
       if (isLiquidationOrder && uaTaker.balance < uint256(-cashTaker)) {
         // cashTaker is always negative (liquidatee is always buying)
-        // Liquidation order: taker doesn't have enough balance, add to bad debt
-        uint256 shortfall = uint256(-cashTaker) - uaTaker.balance;
-        badDebt += shortfall;
-        cashTaker += int256(shortfall);
+        cashMaker = int256(uint256(uaTaker.balance));
         uaTaker.balance = 0; // Zero out taker balance
         _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
       } else {

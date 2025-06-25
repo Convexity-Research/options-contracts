@@ -81,7 +81,7 @@ contract Market is
 
   // Two-phase settlement for fair social loss distribution
   uint256 posSum; // total positive PnL (winners)
-  int256 badDebt; // grows whenever we meet an under-collateralised loser
+  uint256 badDebt; // grows whenever we meet an under-collateralised loser
   bool settlementPhase; // false = phase 1, true = phase 2
   bool settlementOnlyMode; // true = only allow settlement, no new cycles
 
@@ -122,7 +122,7 @@ contract Market is
   event LimitOrderFilled(
     uint256 indexed cycleId,
     uint256 makerOrderId,
-    uint256 takerOrderId,
+    int256 takerOrderId,
     uint256 size,
     uint256 limitPrice,
     MarketSide side,
@@ -651,7 +651,7 @@ contract Market is
         // cashTaker is always negative (liquidatee is always buying)
         // Liquidation order: taker doesn't have enough balance, add to bad debt
         uint256 shortfall = uint256(-cashTaker) - uaTaker.balance;
-        badDebt += int256(shortfall);
+        badDebt += shortfall;
         cashTaker += int256(shortfall);
         uaTaker.balance = 0; // Zero out taker balance
         _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
@@ -695,8 +695,10 @@ contract Market is
       }
     }
 
+    int256 _takerOrderId = isLiquidationOrder ? -int256(uint256(takerOrderId)) : int256(uint256(takerOrderId));
+
     emit LimitOrderFilled(
-      activeCycle, makerOrderId, takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
+      activeCycle, makerOrderId, _takerOrderId, size, price, side, taker, maker, cashTaker, cashMaker, _getOraclePrice()
     );
 
     // Liquidation check
@@ -707,9 +709,7 @@ contract Market is
         uint256 longCalls = uaTaker.longCalls;
         uint256 longPuts = uaTaker.longPuts;
 
-        if (longCalls >= shortCalls && longPuts >= shortPuts) {
-          uaTaker.liquidationQueued = false;
-        }
+        if (longCalls >= shortCalls && longPuts >= shortPuts) uaTaker.liquidationQueued = false;
       }
     }
 
@@ -1083,6 +1083,8 @@ contract Market is
 
     uint256 startingI = i;
 
+    uint256 _posSum;
+
     while (i < upper) {
       address trader = traders[i];
       UserAccount storage ua = userAccounts[trader];
@@ -1097,11 +1099,11 @@ contract Market is
           uint256 debit = uint256(-pnl);
           uint256 paid = debit > ua.balance ? ua.balance : debit;
           ua.balance -= uint64(paid);
-          if (debit > paid) badDebt += int256(debit - paid);
+          if (debit > paid) badDebt += debit - paid;
           emit Settled(cycleId, trader, pnl);
         } else if (pnl > 0) {
           ua.scratchPnL = uint64(uint256(pnl));
-          posSum += uint256(pnl);
+          _posSum += uint256(pnl);
           emit Settled(cycleId, trader, pnl);
         } else {
           emit Settled(cycleId, trader, 0);
@@ -1116,7 +1118,8 @@ contract Market is
           emit LiquidationFeePaid(activeCycle, trader, balance);
         }
 
-        badDebt += -pnl;
+        // pnl can never be positive for liquidated accounts, since they never have leftover long exposure
+        badDebt += uint256(-pnl);
         ua.balance = 0; // user never keeps anything
         ua.liquidationFeeOwed = 0;
         emit Settled(cycleId, trader, 0);
@@ -1127,6 +1130,7 @@ contract Market is
         ++i;
       }
     }
+    posSum = _posSum;
     cursor = i;
 
     if (i == n) {
@@ -1148,13 +1152,12 @@ contract Market is
     // Calculate loss ratio once (using 1e12 precision)
     uint256 lossRatio;
 
-    if (posSum == 0) lossRatio = 1e12; // no winners
-
-    else if (badDebt >= int256(posSum)) lossRatio = 1e12; // losers can't cover → 100 %
-
-    else if (badDebt < 0) lossRatio = 0; // no losers
-
-    else lossRatio = (uint256(badDebt) * 1e12) / posSum; // proper fractional loss
+    if (posSum == 0 || badDebt >= posSum) {
+      lossRatio = denominator;
+    } else {
+      // partial social-loss haircut
+      lossRatio = (badDebt * denominator) / posSum;
+    }
 
     while (i < upper) {
       address trader = traders[i];
@@ -1162,7 +1165,7 @@ contract Market is
 
       if (rawPnl > 0) {
         // Credit winner pro-rata
-        uint256 credit = rawPnl * (1e12 - lossRatio) / 1e12;
+        uint256 credit = rawPnl * (denominator - lossRatio) / denominator;
         userAccounts[trader].balance += uint64(credit);
 
         // Emit event with the actual credited amount (after social loss)

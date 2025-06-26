@@ -288,7 +288,7 @@ contract MarketSuite is Test {
     mkt.placeOrder(MarketSide.CALL_SELL, 1, 1, cycleId);
 
     // Taker going long, to be liquidated
-    uint256 userCollateral = 1 * ONE_COIN;
+    uint256 userCollateral = 1 * ONE_COIN + 1000;
     _fund(u2, userCollateral);
     vm.startPrank(u2);
     vm.recordLogs();

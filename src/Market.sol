@@ -214,7 +214,7 @@ contract Market is
   function cancelOrder(uint256 orderId) external whenNotPaused {
     address trader = _msgSender();
     if (isLiquidatable(trader, _getOraclePrice())) revert Errors.TraderLiquidatable();
-    if (!_isMarketLive()) revert Errors.MarketNotLive();
+    // if (!_isMarketLive()) revert Errors.MarketNotLive();
 
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
     if (M.trader != trader) revert();
@@ -356,7 +356,6 @@ contract Market is
     if (activeCycle != 0) revert Errors.CycleActive();
 
     uint64 price = _getOraclePrice();
-    if (price == 0) revert Errors.OraclePriceCallFailed();
 
     // Create new market
     assembly {
@@ -1142,12 +1141,14 @@ contract Market is
           uint256 paid = debit > ua.balance ? ua.balance : debit;
           ua.balance -= uint64(paid);
           if (debit > paid) badDebt += debit - paid;
+          emit Settled(cycleId, trader, pnl);
         } else if (pnl > 0) {
           ua.scratchPnL = uint64(uint256(pnl));
           _posSum += uint256(pnl);
+        } else {
+          emit Settled(cycleId, trader, 0);
         }
 
-        emit Settled(cycleId, trader, pnl);
       } else {
         //  ──------------------ Liquidation Account ────────────────────────
 

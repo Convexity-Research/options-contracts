@@ -68,7 +68,7 @@ contract Market is
   }
 
   //------- Cycle state -------
-  uint256 public activeCycle; // expiry unix timestamp as ID
+  uint256 activeCycle; // expiry unix timestamp as ID
   mapping(uint256 => Cycle) cycles;
 
   //------- Trading/Settlement -------
@@ -382,6 +382,7 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function _depositCollateral(uint256 amount, address trader) private {
+    if (userAccounts[trader].liquidationQueued) revert();
     if (amount == 0) revert Errors.InvalidAmount();
 
     IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
@@ -410,7 +411,7 @@ contract Market is
     emit CollateralWithdrawn(trader, amount);
   }
 
-  function _checkPremiumPaymentBalance(address trader, uint256 size, uint256 limitPrice) private {
+  function _checkPremiumPaymentBalance(address trader, uint256 size, uint256 limitPrice) private view {
     if (size * limitPrice > userAccounts[trader].balance) revert Errors.InsufficientBalance();
   }
 
@@ -423,6 +424,7 @@ contract Market is
     if (!_isMarketLive()) revert Errors.MarketNotLive();
     if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
     if (size == 0) revert Errors.InvalidAmount();
+    userAccounts[trader].liquidationFeeOwed = 0;
 
     if (side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY) {
       _checkPremiumPaymentBalance(trader, size, limitPrice);
@@ -1243,7 +1245,7 @@ contract Market is
   }
 
   function _checkActiveCycle(uint256 cycleId) internal view {
-    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
+    if (cycleId != 0 && cycleId != activeCycle) revert();
   }
 
   // #######################################################################
@@ -1279,7 +1281,7 @@ contract Market is
 
   modifier isValidSignature(bytes memory signature) {
     if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      revert Errors.InvalidWhitelistSignature();
+      revert();
     }
     _;
   }
@@ -1307,11 +1309,11 @@ contract Market is
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
   modifier onlyWhitelisted() {
-    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
+    if (!whitelist[_msgSender()]) revert();
     _;
   }
 
   function _onlySecurityCouncil() internal view {
-    if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
+    if (_msgSender() != SECURITY_COUNCIL) revert();
   }
 }

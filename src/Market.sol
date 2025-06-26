@@ -1150,15 +1150,12 @@ contract Market is
         } else {
           emit Settled(cycleId, trader, 0);
         }
-
       } else {
         //  ──------------------ Liquidation Account ────────────────────────
 
         // Seize their entire balance, add |pnl| to badDebt
         uint64 balance = ua.balance;
-        if (balance > 0) {
-          userAccounts[feeRecipient].balance += balance;
-        }
+        if (balance > 0) userAccounts[feeRecipient].balance += balance;
 
         // pnl can never be positive for liquidated accounts, since they never have leftover long exposure
         badDebt += uint256(-pnl);

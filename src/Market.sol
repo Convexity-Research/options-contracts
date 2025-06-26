@@ -217,7 +217,7 @@ contract Market is
     if (!_isMarketLive()) revert Errors.MarketNotLive();
 
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
-    if (M.trader != trader) revert Errors.NotOrderOwner();
+    if (M.trader != trader) revert();
 
     uint32 tickKey = M.key;
     Level storage L = ob[activeCycle].levels[tickKey];
@@ -411,6 +411,10 @@ contract Market is
     emit CollateralWithdrawn(trader, amount);
   }
 
+  function _checkPremiumPaymentBalance(address trader, uint256 size, uint256 limitPrice) private {
+    if (size * limitPrice > userAccounts[trader].balance) revert Errors.InsufficientBalance();
+  }
+
   function _placeOrder(
     MarketSide side,
     uint256 size,
@@ -420,6 +424,10 @@ contract Market is
     if (!_isMarketLive()) revert Errors.MarketNotLive();
     if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
     if (size == 0) revert Errors.InvalidAmount();
+
+    if (side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY) {
+      _checkPremiumPaymentBalance(trader, size, limitPrice);
+    }
 
     // Convert price to tick
     uint256 tick = limitPrice / TICK_SZ; // 1 tick = 0.01 USDT0
@@ -666,17 +674,13 @@ contract Market is
       // orderbook, or a market order if it ends up in the takerQueue. Either of these scenarios could lead to denial of
       // service, so we remove the resting orders completelyorders
       if (!isLiquidationOrder) {
-        // premium that each party has to pay (<0 means paying out, >0 means receiving)
-        int256 premMaker = cashMaker; // from earlier calculation
-        int256 premTaker = cashTaker;
-
         if (isTakerQueue) {
-          if (premTaker < 0 && uaTaker.balance < uint256(-premTaker)) {
+          if (cashTaker < 0 && uaTaker.balance < uint256(-cashTaker)) {
             // Not enough USDC – leave the queue entry untouched, skip this fill
             return 0;
           }
         } else {
-          if (premMaker < 0 && uaMaker.balance < uint256(-premMaker)) {
+          if (cashMaker < 0 && uaMaker.balance < uint256(-cashMaker)) {
             // Remove maker from the book so it cannot block the market
             ob[activeCycle].makerNodes[makerOrderId].size = 0;
             return 0;
@@ -785,7 +789,7 @@ contract Market is
     if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint32(M.size);
     else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint32(M.size);
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint32(M.size);
-    else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint32(M.size);
+    else ua.pendingShortCalls -= uint32(M.size);
 
     delete ob[ac].makerNodes[orderId]; // free storage
 
@@ -811,7 +815,7 @@ contract Market is
           if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint32(size);
           else if (side == MarketSide.CALL_SELL) ua.pendingShortCalls -= uint32(size);
           else if (side == MarketSide.PUT_BUY) ua.pendingLongPuts -= uint32(size);
-          else if (side == MarketSide.PUT_SELL) ua.pendingShortPuts -= uint32(size);
+          else ua.pendingShortPuts -= uint32(size);
 
           // Set size to 0 but don't remove to preserve queue ordering
           queue[j].size = 0;
@@ -912,7 +916,7 @@ contract Market is
   }
 
   function _key(uint32 tick, MarketSide side) internal pure returns (uint32) {
-    if (tick >= 1 << 24) revert Errors.TickTooLarge();
+    if (tick >= 1 << 24) revert();
     return tick | (_isPut(side) ? 1 << 31 : 0) | (_isBuy(side) ? 1 << 30 : 0);
   }
 
@@ -1138,14 +1142,12 @@ contract Market is
           uint256 paid = debit > ua.balance ? ua.balance : debit;
           ua.balance -= uint64(paid);
           if (debit > paid) badDebt += debit - paid;
-          emit Settled(cycleId, trader, pnl);
         } else if (pnl > 0) {
           ua.scratchPnL = uint64(uint256(pnl));
           _posSum += uint256(pnl);
-          emit Settled(cycleId, trader, pnl);
-        } else {
-          emit Settled(cycleId, trader, 0);
         }
+
+        emit Settled(cycleId, trader, pnl);
       } else {
         //  ──------------------ Liquidation Account ────────────────────────
 

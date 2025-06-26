@@ -11,10 +11,7 @@ interface IERC20Mintable is IERC20 {
 }
 
 contract DepositCollateral is Script {
-
-
   Market mkt = Market(0xEaCCc2025Ee34Be0b6F1F8c8B18f074a1568335C);
-
 
   function run() external {
     vm.createSelectFork("hyperevm");
@@ -23,7 +20,6 @@ contract DepositCollateral is Script {
     console.log("Deploying with account:", wallet);
     console.log("Account balance:", wallet.balance);
 
-    
     console.log(mkt.collateralToken());
     IERC20Mintable token = IERC20Mintable(mkt.collateralToken());
     token.mint(wallet, 1000000 ether);
@@ -33,12 +29,12 @@ contract DepositCollateral is Script {
 
     uint256 balance;
 
-    (,, balance, , , , , , , , , , , ) = mkt.userAccounts(wallet);
+    (,, balance,,,,,,,,,,,) = mkt.userAccounts(wallet);
     console.log("balance", balance);
 
-    mkt.depositCollateral(5000 *1e6);
+    mkt.depositCollateral(5000 * 1e6);
 
-    (,, balance, , , , , , , , , , , ) = mkt.userAccounts(wallet);
+    (,, balance,,,,,,,,,,,) = mkt.userAccounts(wallet);
     console.log("balance", balance);
 
     vm.stopBroadcast();

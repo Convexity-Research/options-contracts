@@ -36,7 +36,7 @@ contract MarketSuite is Test {
   address signer;
   uint256 signerKey;
 
-  uint256 btcPrice = 100000;
+  uint256 btcPrice = 107370;
 
   uint256 cycleId;
 
@@ -2670,5 +2670,56 @@ contract MarketSuite is Test {
     uint256 theoreticalMax = avgGasPerLevel > 0 ? blockGasLimit / avgGasPerLevel : 0;
 
     console.log("Theoretical maximum levels in one block:", theoreticalMax);
+  }
+
+  function testNeelLoss() public {
+    _fund(u1, 1000 * ONE_COIN);
+    _fund(u2, 1000000000 * ONE_COIN);
+
+    vm.startPrank(u1);
+    mkt.long(161, 341300, 176700, cycleId);
+    vm.stopPrank();
+
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 161, 0, cycleId);
+    mkt.placeOrder(MarketSide.PUT_BUY, 161, 0, cycleId);
+    vm.stopPrank();
+
+    console.log("Neel balance before:", _getNeelBalance(u1));
+
+    vm.warp(cycleId + 1);
+    _mockOracle(107344); // 85 000 -> puts ITM by 15 000
+
+    mkt.settleChunk(20, false);
+
+    console.log("Neel balance after:", _getNeelBalance(u1));
+  }
+
+  function _getNeelBalance(address neel) internal view returns (uint256) {
+    (
+      bool active,
+      bool liquidationQueued,
+      uint64 balance,
+      uint64 liquidationFeeOwed,
+      uint64 scratchPnL,
+      uint48 _gap,
+      uint32 longCalls,
+      uint32 shortCalls,
+      uint32 longPuts,
+      uint32 shortPuts,
+      uint32 pendingLongCalls,
+      uint32 pendingShortCalls,
+      uint32 pendingLongPuts,
+      uint32 pendingShortPuts
+    ) = mkt.userAccounts(neel);
+    return balance;
+  }
+
+  function testPlaceOrderNoBalance() public {
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, 291020, cycleId);
+    vm.stopPrank();
+
+    console.log("Neel balance:", _getNeelBalance(u1));
   }
 }

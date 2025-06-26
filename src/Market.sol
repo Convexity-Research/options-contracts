@@ -1156,14 +1156,13 @@ contract Market is
         uint64 balance = ua.balance;
         if (balance > 0) {
           userAccounts[feeRecipient].balance += balance;
-          emit LiquidationFeePaid(activeCycle, trader, balance);
         }
 
         // pnl can never be positive for liquidated accounts, since they never have leftover long exposure
         badDebt += uint256(-pnl);
         ua.balance = 0; // user never keeps anything
         ua.liquidationFeeOwed = 0;
-        emit Settled(cycleId, trader, 0);
+        emit Settled(cycleId, trader, -int256(uint256(balance)));
       }
 
       _clearAllPositions(trader);

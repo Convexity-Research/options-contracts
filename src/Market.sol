@@ -26,7 +26,7 @@ contract Market is
 
   //------- Meta -------
   string public name;
-  address public feeRecipient;
+  address feeRecipient;
   address public collateralToken;
   uint256 constant collateralDecimals = 6;
   address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
@@ -1245,7 +1245,7 @@ contract Market is
   }
 
   function _checkActiveCycle(uint256 cycleId) internal view {
-    if (cycleId != 0 && cycleId != activeCycle) revert();
+    if (cycleId != 0 && cycleId != activeCycle) revert Errors.InvalidCycle();
   }
 
   // #######################################################################
@@ -1281,7 +1281,7 @@ contract Market is
 
   modifier isValidSignature(bytes memory signature) {
     if (WHITELIST_SIGNER != ECDSA.recover(keccak256(abi.encodePacked(_msgSender())), signature)) {
-      revert();
+      revert Errors.InvalidWhitelistSignature();
     }
     _;
   }
@@ -1309,7 +1309,7 @@ contract Market is
   function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
   modifier onlyWhitelisted() {
-    if (!whitelist[_msgSender()]) revert();
+    if (!whitelist[_msgSender()]) revert Errors.NotWhitelisted();
     _;
   }
 

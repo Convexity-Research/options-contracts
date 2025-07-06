@@ -168,4 +168,8 @@ contract MarketWithViews is Market {
   function getCycle(uint256 cycleId) external view returns (Cycle memory) {
     return cycles[cycleId];
   }
+
+  function getActiveCycle() external view returns (uint256) {
+    return activeCycle;
+  }
 }

@@ -5,6 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {console} from "forge-std/console.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Market} from "../src/Market.sol";
+import {MarketExtension} from "../src/MarketExtension.sol";
 import {Deployer} from "../src/Deployer.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -29,13 +30,13 @@ contract DeployUUPSProxy is Script {
     address implementation = address(new Market());
     address proxy = contractDeployer.deployMarket("BTC Market", feeRecipient, usdt0, forwarder, implementation, salt);
 
-    console.log("Market name:", Market(proxy).name());
+    console.log("Market name:", MarketExtension(proxy).getName());
 
     vm.stopBroadcast();
 
     console.log("\n=== Deployment Summary ===");
     console.log("Implementation:", address(implementation));
     console.log("Proxy:", address(proxy));
-    console.log("Market name:", Market(proxy).name());
+    console.log("Market name:", MarketExtension(proxy).getName());
   }
 }

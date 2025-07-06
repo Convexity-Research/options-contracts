@@ -36,7 +36,7 @@ struct TakerQ {
 }
 
 interface IMarket {
-  function name() external view returns (string memory);
+  // function name() external view returns (string memory);
   function startCycle() external;
   // function activeCycle() external view returns (uint256);
 
@@ -46,6 +46,8 @@ interface IMarket {
   function long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external;
   function short(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external;
   function cancelOrder(uint256 orderId) external;
+  function cancelAndClose(uint256 buyCallPrice, uint256 sellCallPrice, uint256 buyPutPrice, uint256 sellPutPrice)
+    external;
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
     external
     returns (uint256 orderId);

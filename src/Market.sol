@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {SharedStorage} from "./SharedStorage.sol";
 import {BitScan} from "./lib/Bitscan.sol";
 import {Errors} from "./lib/Errors.sol";
 import {IMarket, Cycle, Level, Maker, TakerQ, MarketSide} from "./interfaces/IMarket.sol";
@@ -15,6 +16,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract Market is
+  SharedStorage,
   IMarket,
   Initializable,
   UUPSUpgradeable,
@@ -24,91 +26,12 @@ contract Market is
 {
   using SafeERC20 for IERC20;
 
-  //------- Meta -------
-  string public name;
-  address feeRecipient;
-  address public collateralToken;
-  uint256 constant collateralDecimals = 6;
-  address constant MARK_PX_PRECOMPILE = 0x0000000000000000000000000000000000000806;
-  uint256 constant TICK_SZ = 1e2; // 0.0001 USDT0 → 100 wei (only works for 6-decimals tokens)
-  uint256 public constant MM_BPS = 10; // 0.10 % Maintenance Margin (also used in place of an initial margin)
-  uint256 constant CONTRACT_SIZE = 100; // Divide by this factor for 0.01BTC
-  int256 constant makerFeeBps = -200; // -2.00 %, basis points. Negative means its a fee rebate, so pay out to makers
-  int256 constant takerFeeBps = 700; // +7.00 %, basis points
-  uint256 constant liquidationFeeBps = 10; // 0.1 %, basis points
-  uint256 constant denominator = 10_000;
-  uint256 constant DEFAULT_EXPIRY = 1 minutes;
-  address constant SECURITY_COUNCIL = 0xAd8997fAaAc3DA36CA0aA88a0AAf948A6C3a5338;
-
-  //------- Gasless TX -------
-  address private _trustedForwarder;
-
-  //------- Whitelist -------
-  address private constant WHITELIST_SIGNER = 0x988EeB53b37f5418aCdaD66cF09B60991ED01f45;
-  mapping(address => bool) public whitelist;
-
-  //------- user account -------
-  mapping(address => UserAccount) public userAccounts;
-
-  struct UserAccount {
-    bool activeInCycle;
-    bool liquidationQueued;
-    uint64 balance;
-    uint64 liquidationFeeOwed;
-    uint64 scratchPnL;
-    uint48 _gap; // 48 remaining bits for future use. Packs position data into next slot
-    uint32 longCalls;
-    uint32 shortCalls;
-    uint32 longPuts;
-    uint32 shortPuts;
-    uint32 pendingLongCalls;
-    uint32 pendingShortCalls;
-    uint32 pendingLongPuts;
-    uint32 pendingShortPuts;
-  }
-
-  //------- Cycle state -------
-  uint256 activeCycle; // expiry unix timestamp as ID
-  mapping(uint256 => Cycle) cycles;
-
-  //------- Trading/Settlement -------
-  address[] traders;
-  mapping(address => uint32[]) userOrders; // Track all order IDs per user
-  uint256 cursor; // settlement iterator
-
-  TakerQ[][4] takerQ; // 4 buckets
-  uint256[4] tqHead; // cursor per bucket
-
-  // Two-phase settlement for fair social loss distribution
-  uint256 posSum; // total positive PnL (winners)
-  uint256 badDebt; // grows whenever we meet an under-collateralised loser
-  bool settlementPhase; // false = phase 1, true = phase 2
-  bool _gap1; // true = only allow settlement, no new cycles
-
-  //------- Orderbook -------
-  mapping(uint256 => OrderbookState) internal ob;
-
-  struct OrderbookState {
-    // summary level of orderbook (L1): which [256*256] blocks have liquidity
-    uint256[4] summaries;
-    // mid level of orderbook (L2): which [256] block has liquidity
-    mapping(MarketSide => mapping(uint8 => uint256)) mids;
-    // detail level of orderbook (L3): which tick has liquidity
-    mapping(MarketSide => mapping(uint16 => uint256)) dets;
-    // mappings to fetch relevant orderbook data
-    mapping(uint32 => Level) levels; // tickKey ⇒ Level
-    mapping(uint32 => Maker) makerNodes; // nodeId  ⇒ Maker
-    uint32 limitOrderPtr; // auto-increment id for limit orders
-    int32 takerOrderPtr; // auto-increment id for taker orders
-  }
-
   //------- Events -------
   event CycleStarted(uint256 indexed cycleId, uint256 strike);
   event CycleSettled(uint256 indexed cycleId);
   event CollateralDeposited(address indexed trader, uint256 amount);
   event CollateralWithdrawn(address indexed trader, uint256 amount);
   event Liquidated(uint256 indexed cycleId, address indexed trader, uint256 liqFeeOwed);
-  event LiquidationFeePaid(uint256 indexed cycleId, address indexed trader, uint256 liqFeePaid);
   event PriceFixed(uint256 indexed cycleId, uint64 price);
   event Settled(uint256 indexed cycleId, address indexed trader, int256 pnl);
   event LimitOrderPlaced(
@@ -168,6 +91,7 @@ contract Market is
   // #                  Public functions                                   #
   // #                                                                     #
   // #######################################################################
+
   function depositCollateral(uint256 amount, bytes memory signature) external isValidSignature(signature) whenNotPaused {
     address trader = _msgSender();
     whitelist[trader] = true;
@@ -175,13 +99,25 @@ contract Market is
   }
 
   function depositCollateral(uint256 amount) external onlyWhitelisted whenNotPaused {
-    address trader = _msgSender();
-    _depositCollateral(amount, trader);
+    _depositCollateral(amount, _msgSender());
   }
 
   function withdrawCollateral(uint256 amount) external whenNotPaused {
     address trader = _msgSender();
-    _withdrawCollateral(amount, trader);
+    if (amount == 0) revert Errors.InvalidAmount();
+    if (_hasOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
+
+    uint256 balance = userAccounts[trader].balance;
+    if (balance < amount) revert Errors.InsufficientBalance();
+
+    unchecked {
+      // We check amount above, and this saves some gas + code size
+      userAccounts[trader].balance -= uint64(amount);
+    }
+
+    IERC20(collateralToken).safeTransfer(trader, amount);
+
+    emit CollateralWithdrawn(trader, amount);
   }
 
   function long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId) external whenNotPaused {
@@ -198,6 +134,19 @@ contract Market is
 
     _placeOrder(MarketSide.PUT_BUY, size, limitPriceBuy, trader);
     _placeOrder(MarketSide.CALL_SELL, size, limitPriceSell, trader);
+  }
+
+  function placeMultiOrder(
+    MarketSide[] memory sides,
+    uint256[] memory sizes,
+    uint256[] memory limitPrices,
+    uint256 cycleId
+  ) external whenNotPaused {
+    address trader = _msgSender();
+    uint256 length = sides.length;
+    for (uint256 i = 0; i < length; i++) {
+      _placeOrder(sides[i], sizes[i], limitPrices[i], trader);
+    }
   }
 
   function placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)
@@ -217,43 +166,29 @@ contract Market is
     // if (!_isMarketLive()) revert Errors.MarketNotLive();
 
     Maker storage M = ob[activeCycle].makerNodes[uint32(orderId)];
-    if (M.trader != trader) revert();
+    if (M.trader != trader) revert Errors.NotOrderOwner();
 
-    uint32 tickKey = M.key;
-    Level storage L = ob[activeCycle].levels[tickKey];
+    _cancelOrder(uint32(orderId));
+  }
 
-    mapping(uint32 => Maker) storage makerNodes = ob[activeCycle].makerNodes;
+  function cancelAndClose(uint256 buyCallPrice, uint256 sellCallPrice, uint256 buyPutPrice, uint256 sellPutPrice)
+    external
+    whenNotPaused
+  {
+    address trader = _msgSender();
+    _cancelAllOrders(trader);
+    UserAccount memory ua = userAccounts[trader];
 
-    uint32 p = M.prev;
-    uint32 n = M.next;
+    // Calculate net positions
+    int256 netCalls = int256(uint256(ua.longCalls)) - int256(uint256(ua.shortCalls));
+    int256 netPuts = int256(uint256(ua.longPuts)) - int256(uint256(ua.shortPuts));
 
-    // unlink from neighbours
-    if (p == 0) L.head = n; // cancelled head
+    // If net long, place sell orders to neutralize. If net short, place buy orders to neutralize
+    if (netCalls > 0) _placeOrder(MarketSide.CALL_SELL, uint256(netCalls), sellCallPrice, trader);
+    else if (netCalls < 0) _placeOrder(MarketSide.CALL_BUY, uint256(-netCalls), buyCallPrice, trader);
 
-    else makerNodes[p].next = n;
-
-    if (n == 0) L.tail = p; // cancelled tail
-
-    else makerNodes[n].prev = p;
-
-    // adjust volume
-    L.vol -= M.size;
-
-    (uint32 tick, MarketSide side) = BitScan.splitKey(tickKey);
-    if (L.vol == 0) _clearLevel(side, tick);
-
-    UserAccount storage P = userAccounts[M.trader];
-
-    if (side == MarketSide.PUT_BUY) P.pendingLongPuts -= uint32(M.size);
-    else if (side == MarketSide.PUT_SELL) P.pendingShortPuts -= uint32(M.size);
-    else if (side == MarketSide.CALL_BUY) P.pendingLongCalls -= uint32(M.size);
-    else P.pendingShortCalls -= uint32(M.size);
-
-    // Remove from user's order tracking
-    _removeOrderFromTracking(M.trader, uint32(orderId));
-
-    emit LimitOrderCancelled(activeCycle, orderId, M.size, tick * TICK_SZ, M.trader);
-    delete makerNodes[uint32(orderId)];
+    if (netPuts > 0) _placeOrder(MarketSide.PUT_SELL, uint256(netPuts), sellPutPrice, trader);
+    else if (netPuts < 0) _placeOrder(MarketSide.PUT_BUY, uint256(-netPuts), buyPutPrice, trader);
   }
 
   function liquidate(address trader) external whenNotPaused {
@@ -262,19 +197,7 @@ contract Market is
     if (!isLiquidatable(trader, price)) revert Errors.StillSolvent();
 
     // Cancel limit orders and taker queue entries
-    {
-      uint32[] memory orderIds = userOrders[trader];
-      for (uint256 k; k < orderIds.length; ++k) {
-        uint32 id = orderIds[k];
-        if (ob[activeCycle].makerNodes[id].trader == trader) _forceCancel(id);
-      }
-
-      // Clear all taker queue entries for this trader
-      _clearTakerQueueEntries(trader);
-
-      // Clear user's order tracking
-      _clearUserOrders(trader);
-    }
+    _cancelAllOrders(trader);
 
     UserAccount storage ua = userAccounts[trader];
     UserAccount storage house = userAccounts[feeRecipient];
@@ -382,7 +305,7 @@ contract Market is
   // #                                                                     #
   // #######################################################################
   function _depositCollateral(uint256 amount, address trader) private {
-    if (userAccounts[trader].liquidationQueued) revert();
+    if (userAccounts[trader].liquidationQueued) revert Errors.AccountInLiquidation();
     if (amount == 0) revert Errors.InvalidAmount();
 
     IERC20(collateralToken).safeTransferFrom(trader, address(this), amount);
@@ -392,23 +315,6 @@ contract Market is
     }
 
     emit CollateralDeposited(trader, amount);
-  }
-
-  function _withdrawCollateral(uint256 amount, address trader) private {
-    if (amount == 0) revert Errors.InvalidAmount();
-    if (_hasOpenPositionsOrOrders(trader)) revert Errors.InTraderList();
-
-    uint256 balance = userAccounts[trader].balance;
-    if (balance < amount) revert Errors.InsufficientBalance();
-
-    unchecked {
-      // We check amount above, and this saves some gas + code size
-      userAccounts[trader].balance -= uint64(amount);
-    }
-
-    IERC20(collateralToken).safeTransfer(trader, amount);
-
-    emit CollateralWithdrawn(trader, amount);
   }
 
   function _checkPremiumPaymentBalance(address trader, uint256 size, uint256 limitPrice) private view {
@@ -616,7 +522,40 @@ contract Market is
       if (firstInL1) _ob.summaries[uint256(side)] |= BitScan.mask(l1);
     }
 
-    _ob.makerNodes[makerOrderId] = Maker(trader, size, 0, key, levels[key].tail);
+    uint32 prev = levels[key].tail;
+
+    // Assembly block which does:
+    // _ob.makerNodes[makerOrderId] = Maker(trader, size, 0, key, prev);
+
+    assembly {
+      // Storage slot of ob[activeCycle]
+      // keccak256(mapping key, mapping slot)
+      mstore(0x00, ac) // key
+      mstore(0x20, ob.slot) // mapping slot of `ob`
+      let orderbookPos := keccak256(0x00, 0x40)
+
+      // MakerNodes mapping inside OrderbookState, 7th slot inside OrderbookState
+      let makerNodesPos := add(orderbookPos, 7)
+
+      // Compute the slot of makerNodes[makerOrderId]
+      // slot = keccak256(makerOrderId, makerNodesPos)
+      mstore(0x00, makerOrderId)
+      mstore(0x20, makerNodesPos)
+      let nodeSlot := keccak256(0x00, 0x40)
+
+      // Write the Maker struct (uses two storage words)
+      // slot 0 : address trader
+      sstore(nodeSlot, trader)
+
+      // slot 1 -- size | next | key | prev
+      // layout offsets (bytes): size[0-15] , next[16-19] , key[20-23] , prev[24-27]
+      // next is zero, so we don’t OR it in.
+      let packed := size // uint128  (16 bytes)
+      // packed := next <---- is zero, so skip
+      packed := or(packed, shl(160, key)) // key   @ byte 20
+      packed := or(packed, shl(192, prev)) // prev  @ byte 24
+      sstore(add(nodeSlot, 1), packed)
+    }
 
     // Track order for user
     userOrders[trader].push(makerOrderId);
@@ -692,19 +631,34 @@ contract Market is
       // Apply cash deltas - for liquidations. Max premium is user's balance, do not accrue bad debt
       if (isLiquidationOrder && uaTaker.balance < uint256(-cashTaker)) {
         // cashTaker is always negative (liquidatee is always buying)
-        cashMaker = int256(uint256(uaTaker.balance));
-        cashTaker = -int256(uint256(uaTaker.balance));
+        uint256 actualPremium = uaTaker.balance;
+
+        // Calculate fees based on actual premium paid
+        int256 adjustedMakerFee = int256(actualPremium) * makerFeeBps / int256(denominator);
+        int256 adjustedTakerFee = int256(actualPremium) * takerFeeBps / int256(denominator);
+        int256 houseFee = adjustedTakerFee + adjustedMakerFee;
+
+        // Update price to how much user effectively paid. This should take into account the taker fees
+        price = (actualPremium - uint256(adjustedTakerFee)) / size;
+
+        // Maker gets the premium minus the net house fee
+        int256 netToMaker = int256(actualPremium) - houseFee;
+
+        cashMaker = netToMaker;
+        cashTaker = -int256(actualPremium);
         uaTaker.balance = 0; // Zero out taker balance
-        _applyCashDelta(maker, cashMaker); // Maker still gets paid normally
+
+        _applyCashDelta(maker, cashMaker);
+        if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
       } else {
         // Normal case: both parties have sufficient balance
         _applyCashDelta(maker, cashMaker);
         _applyCashDelta(taker, cashTaker);
-      }
 
-      // Net to fee recipient. This should always be positive (unless makerFeeBps + takerFeeBps are set incorrectly)
-      int256 houseFee = takerFee + makerFee;
-      if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+        // Net to fee recipient. This should always be positive (unless makerFeeBps + takerFeeBps are set incorrectly)
+        int256 houseFee = takerFee + makerFee;
+        if (houseFee != 0) _applyCashDelta(feeRecipient, houseFee);
+      }
     }
 
     // Position accounting
@@ -769,7 +723,7 @@ contract Market is
     emit TakerOrderRemaining(activeCycle, takerId, qty, side, trader);
   }
 
-  function _forceCancel(uint32 orderId) internal {
+  function _cancelOrder(uint32 orderId) internal {
     uint256 ac = activeCycle;
     Maker memory M = ob[ac].makerNodes[orderId];
     uint32 key = M.key;
@@ -792,11 +746,27 @@ contract Market is
     else if (side == MarketSide.CALL_BUY) ua.pendingLongCalls -= uint32(M.size);
     else ua.pendingShortCalls -= uint32(M.size);
 
+    _removeOrderFromTracking(M.trader, orderId);
+
     delete ob[ac].makerNodes[orderId]; // free storage
 
     if (L.vol == 0) _clearLevel(side, key);
 
     emit LimitOrderCancelled(ac, orderId, M.size, tick * TICK_SZ, M.trader);
+  }
+
+  function _cancelAllOrders(address trader) internal {
+    uint32[] memory orderIds = userOrders[trader];
+    for (uint256 k; k < orderIds.length; ++k) {
+      uint32 id = orderIds[k];
+      if (ob[activeCycle].makerNodes[id].trader == trader) _cancelOrder(id);
+    }
+
+    // Clear all taker queue entries for this trader
+    _clearTakerQueueEntries(trader);
+
+    // Clear user's order tracking
+    _clearUserOrders(trader);
   }
 
   function _clearTakerQueueEntries(address trader) internal {
@@ -1247,13 +1217,31 @@ contract Market is
 
   // #######################################################################
   // #                                                                     #
-  // #             Other helpers and views                                 #
+  // #             Extension functions                                     #
   // #                                                                     #
   // #######################################################################
 
-  function getNumTraders() public view returns (uint256) {
-    return traders.length;
+  function setExtension(address ext) external onlyOwner {
+    extensionContract = ext;
   }
+
+  /// @dev delegate everything we don’t recognise
+  fallback() external {
+    address ext = extensionContract;
+    assembly {
+      calldatacopy(0, 0, calldatasize())
+      let result := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
+      returndatacopy(0, 0, returndatasize())
+      if iszero(result) { revert(0, returndatasize()) }
+      return(0, returndatasize())
+    }
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #             Other helpers and views                                 #
+  // #                                                                     #
+  // #######################################################################
 
   function trustedForwarder() public view override returns (address) {
     return _trustedForwarder;
@@ -1289,10 +1277,6 @@ contract Market is
   // #                                                                     #
   // #######################################################################
 
-  // function setTrustedForwarder(address _forwarder) external onlyOwner {
-  //   _trustedForwarder = _forwarder;
-  // }
-
   function pause() external {
     _onlySecurityCouncil();
     _pause();
@@ -1311,6 +1295,6 @@ contract Market is
   }
 
   function _onlySecurityCouncil() internal view {
-    if (_msgSender() != SECURITY_COUNCIL) revert();
+    if (_msgSender() != SECURITY_COUNCIL) revert Errors.NotSecurityCouncil();
   }
 }

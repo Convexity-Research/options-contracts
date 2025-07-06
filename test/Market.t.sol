@@ -8,6 +8,8 @@ import {BitScan} from "../src/lib/Bitscan.sol";
 import {Token} from "./mocks/Token.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {MarketExtension} from "../src/MarketExtension.sol";
+import {IMarket} from "../src/interfaces/IMarket.sol";
 
 contract MarketSuite is Test {
   using BitScan for uint256;
@@ -26,6 +28,7 @@ contract MarketSuite is Test {
   MarketWithViews implementation;
   ERC1967Proxy proxy;
   MarketWithViews mkt;
+  MarketExtension extension;
 
   address owner = makeAddr("owner");
   address u1 = makeAddr("user1");
@@ -36,7 +39,7 @@ contract MarketSuite is Test {
   address signer;
   uint256 signerKey;
 
-  uint256 btcPrice = 107370;
+  uint256 btcPrice = 100000;
 
   uint256 cycleId;
 
@@ -56,6 +59,18 @@ contract MarketSuite is Test {
 
     // Interface to interact with proxy
     mkt = MarketWithViews(address(proxy));
+
+    // Deploy MarketExtension
+    extension = new MarketExtension();
+
+    vm.stopPrank();
+
+    // Set up the fallback pattern by setting the extension contract (as governance/owner)
+    vm.startPrank(gov);
+    mkt.setExtension(address(extension));
+    vm.stopPrank();
+
+    vm.startPrank(owner);
 
     _mockOracle(btcPrice);
 
@@ -82,6 +97,38 @@ contract MarketSuite is Test {
 
     assertEq(ua.balance, depositAmount - withdrawAmount);
     assertEq(usdt.balanceOf(address(mkt)), depositAmount - withdrawAmount);
+  }
+
+  function testPlaceMultiOrder() public {
+    _fund(u1, 1000 * ONE_COIN);
+
+    MarketSide[] memory sides = new MarketSide[](3);
+    uint256[] memory sizes = new uint256[](3);
+    uint256[] memory limitPrices = new uint256[](3);
+
+    sides[0] = MarketSide.CALL_BUY;
+    sizes[0] = 10;
+    limitPrices[0] = ONE_COIN;
+
+    sides[1] = MarketSide.PUT_SELL;
+    sizes[1] = 20;
+    limitPrices[1] = 2 * ONE_COIN;
+
+    sides[2] = MarketSide.CALL_SELL;
+    sizes[2] = 15;
+    limitPrices[2] = 3 * ONE_COIN;
+
+    vm.startPrank(u1);
+    mkt.placeMultiOrder(sides, sizes, limitPrices, cycleId);
+    vm.stopPrank();
+
+    uint32 callBuyKey = _key(_tick(ONE_COIN), false, true);
+    uint32 putSellKey = _key(_tick(2 * ONE_COIN), true, false);
+    uint32 callSellKey = _key(_tick(3 * ONE_COIN), false, false);
+
+    assertEq(mkt.levels(callBuyKey).vol, 10);
+    assertEq(mkt.levels(putSellKey).vol, 20);
+    assertEq(mkt.levels(callSellKey).vol, 15);
   }
 
   function testInsertCallBidPriceAtLowestBitmap() public {
@@ -288,7 +335,7 @@ contract MarketSuite is Test {
     mkt.placeOrder(MarketSide.CALL_SELL, 1, 1, cycleId);
 
     // Taker going long, to be liquidated
-    uint256 userCollateral = 1 * ONE_COIN + 1000;
+    uint256 userCollateral = 1 * ONE_COIN;
     _fund(u2, userCollateral);
     vm.startPrank(u2);
     vm.recordLogs();
@@ -297,17 +344,16 @@ contract MarketSuite is Test {
     // Check if liquidatable.
     uint64 currentPrice = uint64(btcPrice * 1e6);
     assertEq(mkt.isLiquidatable(u2, currentPrice), false); // current price is 100000, where user opened position
-    currentPrice -= uint64(CONTRACT_SIZE);
-    assertEq(mkt.isLiquidatable(u2, currentPrice), true); // Becomes liquidatable as just 1 tick below strike
+    currentPrice -= uint64(TICK_SIZE);
+    assertEq(mkt.isLiquidatable(u2, currentPrice), true); // Becomes liquidatable at just 1 tick below strike
 
-    // Liquidate
-    _mockOracle(btcPrice - 1); // Oracle only reports price in whole dollar moves. There are no cents in the oracle
-      // price.
+    // Oracle only reports price in whole dollar moves. There are no cents in the oracle (1$ = 10000 * TICK_SIZE)
+    _mockOracle(btcPrice - 1);
+
     vm.startPrank(owner);
     mkt.liquidate(u2);
 
     // In this case, liquidated user's market order goes to the takerQueue, so fill it
-
     vm.startPrank(u1);
     uint256 optionPrice = TICK_SIZE;
     mkt.placeOrder(MarketSide.PUT_SELL, 1, optionPrice, cycleId);
@@ -541,7 +587,7 @@ contract MarketSuite is Test {
     // Open a call pair
     _openCallPair(u1, u2);
 
-    uint256 initialCycleId = mkt.activeCycle();
+    uint256 initialCycleId = mkt.getActiveCycle();
     assertGt(initialCycleId, 0, "Should have active cycle");
 
     vm.warp(initialCycleId + 1);
@@ -572,7 +618,7 @@ contract MarketSuite is Test {
     assertGt(newCycleId, initialCycleId, "New cycle should have later expiry");
 
     // Verify new cycle is active
-    assertEq(mkt.activeCycle(), newCycleId, "New cycle should be active");
+    assertEq(mkt.getActiveCycle(), newCycleId, "New cycle should be active");
 
     // Verify old cycle is marked as settled
     Cycle memory cycle = mkt.getCycle(initialCycleId);
@@ -591,7 +637,7 @@ contract MarketSuite is Test {
     _openCallPair(users[0], users[1]);
     _openCallPair(users[2], users[3]);
 
-    uint256 cycleIdBefore = mkt.activeCycle();
+    uint256 cycleIdBefore = mkt.getActiveCycle();
 
     // Expire cycle and settle in two chunks
     vm.warp(cycleIdBefore + 1);
@@ -609,7 +655,7 @@ contract MarketSuite is Test {
         "cycle should not finish in first chunk"
       );
     }
-    assertEq(mkt.activeCycle(), cycleIdBefore, "cycle should remain active");
+    assertEq(mkt.getActiveCycle(), cycleIdBefore, "cycle should remain active");
 
     // 2nd chunk — must complete settlement and start new cycle
     vm.recordLogs();
@@ -630,7 +676,7 @@ contract MarketSuite is Test {
 
     assertTrue(settled && started, "cycle should complete and next start");
     assertGt(cycleIdAfter, cycleIdBefore, "new cycle id should increase");
-    assertEq(mkt.activeCycle(), cycleIdAfter);
+    assertEq(mkt.getActiveCycle(), cycleIdAfter);
   }
 
   function testSettlementCompleteInTwoPhasesWithIncompleteFirstPhase() public {
@@ -645,7 +691,7 @@ contract MarketSuite is Test {
     _openCallPair(users[0], users[1]);
     _openCallPair(users[2], users[3]);
 
-    uint256 cycleIdBefore = mkt.activeCycle();
+    uint256 cycleIdBefore = mkt.getActiveCycle();
 
     // Expire cycle and settle in two chunks
     vm.warp(cycleIdBefore + 1);
@@ -663,7 +709,7 @@ contract MarketSuite is Test {
         "cycle should not finish in first chunk"
       );
     }
-    assertEq(mkt.activeCycle(), cycleIdBefore, "cycle should remain active");
+    assertEq(mkt.getActiveCycle(), cycleIdBefore, "cycle should remain active");
 
     // 2nd chunk — must complete settlement and start new cycle
     vm.recordLogs();
@@ -684,7 +730,7 @@ contract MarketSuite is Test {
 
     assertTrue(settled && started, "cycle should complete and next start");
     assertGt(cycleIdAfter, cycleIdBefore, "new cycle id should increase");
-    assertEq(mkt.activeCycle(), cycleIdAfter);
+    assertEq(mkt.getActiveCycle(), cycleIdAfter);
   }
 
   function testSettlementCompleteInMultipleTransactions() public {
@@ -695,12 +741,12 @@ contract MarketSuite is Test {
       if (i & 1 == 1) _openCallPair(makeAddr(string(abi.encodePacked("multi", vm.toString(i - 1)))), user);
     }
 
-    uint256 cycleIdBefore = mkt.activeCycle();
+    uint256 cycleIdBefore = mkt.getActiveCycle();
     vm.warp(cycleIdBefore + 1);
     _mockOracle(btcPrice + 1_000);
 
     uint256 txCount;
-    while (mkt.activeCycle() == cycleIdBefore) {
+    while (mkt.getActiveCycle() == cycleIdBefore) {
       mkt.settleChunk(1, false); // deliberately small to force many txs
       ++txCount;
     }
@@ -709,7 +755,7 @@ contract MarketSuite is Test {
     Cycle memory cycle = mkt.getCycle(cycleIdBefore);
     bool settled = cycle.isSettled;
     assertTrue(settled, "previous cycle not settled");
-    assertGt(mkt.activeCycle(), cycleIdBefore, "new cycle should start");
+    assertGt(mkt.getActiveCycle(), cycleIdBefore, "new cycle should start");
   }
 
   // function testSettlementWithPausePreventsAutoCycle() public {
@@ -733,7 +779,7 @@ contract MarketSuite is Test {
   //   Cycle memory cycle = mkt.getCycle(cycleId);
   //   bool settled = cycle.isSettled;
   //   assertTrue(settled, "cycle should settle");
-  //   assertEq(mkt.activeCycle(), 0, "no active cycle in settlement only mode");
+  //   assertEq(mkt.getActiveCycle(), 0, "no active cycle in settlement only mode");
 
   //   // Attempting to start a cycle must revert
   //   vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
@@ -745,7 +791,7 @@ contract MarketSuite is Test {
   //   vm.stopPrank();
 
   //   mkt.startCycle();
-  //   assertGt(mkt.activeCycle(), cycleId, "new cycle should start after unpause");
+  //   assertGt(mkt.getActiveCycle(), cycleId, "new cycle should start after unpause");
   // }
 
   function testPauseUnpause() public {
@@ -840,7 +886,7 @@ contract MarketSuite is Test {
   //   mkt.pause();
   //   vm.stopPrank();
 
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
 
   //   // Trading functions should still work in settlement-only mode
   //   // Only deposits/withdrawals are blocked
@@ -869,7 +915,7 @@ contract MarketSuite is Test {
   //   _fund(u2, 100 * ONE_COIN);
   //   _openCallPair(u1, u2);
 
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
   //   vm.warp(currentCycleId + 1);
 
   //   // Enable settlement-only mode before settling
@@ -884,7 +930,7 @@ contract MarketSuite is Test {
   //   Cycle memory cycle = mkt.getCycle(currentCycleId);
   //   bool settled = cycle.isSettled;
   //   assertTrue(settled, "cycle should be settled");
-  //   assertEq(mkt.activeCycle(), 0, "no new cycle should start in settlement-only mode");
+  //   assertEq(mkt.getActiveCycle(), 0, "no new cycle should start in settlement-only mode");
 
   //   // Try to manually start cycle - should revert
   //   vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
@@ -897,7 +943,7 @@ contract MarketSuite is Test {
   //   _fund(u2, 100 * ONE_COIN);
   //   _openCallPair(u1, u2);
 
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
   //   vm.warp(currentCycleId + 1);
 
   //   // Full pause (not just settlement-only)
@@ -955,9 +1001,9 @@ contract MarketSuite is Test {
   //   vm.stopPrank();
 
   //   // New cycle should start automatically if none active
-  //   if (mkt.activeCycle() == 0) {
+  //   if (mkt.getActiveCycle() == 0) {
   //     mkt.startCycle();
-  //     assertGt(mkt.activeCycle(), 0, "new cycle should start after unpause");
+  //     assertGt(mkt.getActiveCycle(), 0, "new cycle should start after unpause");
   //   }
   // }
 
@@ -1061,7 +1107,7 @@ contract MarketSuite is Test {
   //   _fund(u2, 100 * ONE_COIN);
   //   _openCallPair(u1, u2);
 
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
   //   vm.warp(currentCycleId + 1);
 
   //   // Enter settlement-only mode
@@ -1071,7 +1117,7 @@ contract MarketSuite is Test {
 
   //   // Settlement should complete but not start new cycle
   //   mkt.settleChunk(100);
-  //   assertEq(mkt.activeCycle(), 0, "no new cycle in settlement-only mode");
+  //   assertEq(mkt.getActiveCycle(), 0, "no new cycle in settlement-only mode");
 
   //   // Exit settlement-only mode
   //   vm.startPrank(securityCouncil);
@@ -1080,7 +1126,7 @@ contract MarketSuite is Test {
 
   //   // Manually starting a cycle should work now
   //   mkt.startCycle();
-  //   assertGt(mkt.activeCycle(), 0, "new cycle should start after exiting settlement-only mode");
+  //   assertGt(mkt.getActiveCycle(), 0, "new cycle should start after exiting settlement-only mode");
   // }
 
   // function testSettlementOnlyMode_EventsEmitted() public {
@@ -1089,7 +1135,7 @@ contract MarketSuite is Test {
   //   _fund(u2, 100 * ONE_COIN);
   //   _openCallPair(u1, u2);
 
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
   //   vm.warp(currentCycleId + 1);
 
   //   vm.startPrank(securityCouncil);
@@ -1145,7 +1191,7 @@ contract MarketSuite is Test {
   //   // Test settlement-only mode when no cycle is active
 
   //   // First, settle any existing cycle and prevent auto-start
-  //   uint256 currentCycleId = mkt.activeCycle();
+  //   uint256 currentCycleId = mkt.getActiveCycle();
   //   if (currentCycleId != 0) {
   //     // Set up some positions first so settlement actually happens
   //     _fund(u1, 100 * ONE_COIN);
@@ -1162,7 +1208,7 @@ contract MarketSuite is Test {
   //     mkt.settleChunk(100); // This should not auto-start a new cycle
   //   }
 
-  //   assertEq(mkt.activeCycle(), 0, "no cycle should be active");
+  //   assertEq(mkt.getActiveCycle(), 0, "no cycle should be active");
 
   //   // Settlement operations should revert with CycleNotStarted when no active cycle
   //   vm.expectRevert(Errors.CycleNotStarted.selector);
@@ -1178,7 +1224,7 @@ contract MarketSuite is Test {
   //   vm.stopPrank();
 
   //   mkt.startCycle();
-  //   assertGt(mkt.activeCycle(), 0, "new cycle should start");
+  //   assertGt(mkt.getActiveCycle(), 0, "new cycle should start");
   // }
 
   // #######################################################################
@@ -1223,6 +1269,22 @@ contract MarketSuite is Test {
     assert(BitScan.msb(1 << bit) == bit);
   }
 
+  function testTakerQueueThenLimitOrder() public {
+    _fund(u1, 1000 * ONE_COIN);
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.PUT_BUY, 2, 0, cycleId); // book is blank
+
+    _fund(u2, 1000 * ONE_COIN);
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
+  }
+
+  // #######################################################################
+  // #                                                                     #
+  // #                    Order Cancellation and Closing                   #
+  // #                                                                     #
+  // #######################################################################
+
   function testCancelOrderNonExistentOrder() public {
     _fund(u1, 1000 * ONE_COIN);
     vm.startPrank(u1);
@@ -1233,14 +1295,157 @@ contract MarketSuite is Test {
     mkt.cancelOrder(123);
   }
 
-  function testTakerQueueThenLimitOrder() public {
-    _fund(u1, 1000 * ONE_COIN);
-    vm.startPrank(u1);
-    mkt.placeOrder(MarketSide.PUT_BUY, 2, 0, cycleId); // book is blank
+  function testCancelAllOrders() public {
+    _fund(u1, 10000 * ONE_COIN);
+    uint256 currentCycleId = mkt.getActiveCycle();
 
-    _fund(u2, 1000 * ONE_COIN);
+    vm.startPrank(u1);
+
+    mkt.long(50, 2 * ONE_COIN, 8 * ONE_COIN, currentCycleId);
+
+    mkt.placeOrder(MarketSide.CALL_BUY, 15, 0, currentCycleId);
+    mkt.placeOrder(MarketSide.PUT_SELL, 20, 0, currentCycleId);
+
+    vm.stopPrank();
+
+    // Verify limit orders are in the orderbook
+    uint32 callBuyKey = _key(_tick(2 * ONE_COIN), false, true); // CALL_BUY from long()
+    uint32 putSellKey = _key(_tick(8 * ONE_COIN), true, false); // PUT_SELL from long()
+
+    assertEq(mkt.levels(callBuyKey).vol, 50, "Call buy order from long() should be in book");
+    assertEq(mkt.levels(putSellKey).vol, 50, "Put sell order from long() should be in book");
+
+    // Verify market orders are in taker queues
+    (TakerQ[] memory callBuyQueue) = mkt.viewTakerQueue(MarketSide.CALL_BUY);
+    (TakerQ[] memory putSellQueue) = mkt.viewTakerQueue(MarketSide.PUT_SELL);
+
+    uint256 callBuyHead = mkt.getTqHead(uint256(MarketSide.CALL_BUY));
+    uint256 putSellHead = mkt.getTqHead(uint256(MarketSide.PUT_SELL));
+
+    assertTrue(callBuyQueue.length > callBuyHead, "Call buy queue should have orders");
+    assertTrue(putSellQueue.length > putSellHead, "Put sell queue should have orders");
+    assertEq(callBuyQueue[callBuyHead].trader, u1, "Call buy queue should have u1's order");
+    assertEq(putSellQueue[putSellHead].trader, u1, "Put sell queue should have u1's order");
+
+    // Cancel all orders
+    vm.startPrank(u1);
+    mkt.cancelAndClose(0, 0, 0, 0);
+
+    // Verify all limit orders are removed from orderbook
+    assertEq(mkt.levels(callBuyKey).vol, 0, "Call buy order should be cancelled");
+    assertEq(mkt.levels(putSellKey).vol, 0, "Put sell order should be cancelled");
+
+    // Verify taker queues are cleared (head should be at or past length)
+    (TakerQ[] memory callBuyQueueAfter) = mkt.viewTakerQueue(MarketSide.CALL_BUY);
+    (TakerQ[] memory putSellQueueAfter) = mkt.viewTakerQueue(MarketSide.PUT_SELL);
+
+    uint256 callBuyHeadAfter = mkt.getTqHead(uint256(MarketSide.CALL_BUY));
+    uint256 putSellHeadAfter = mkt.getTqHead(uint256(MarketSide.PUT_SELL));
+
+    bool callBuyQueueEmpty = callBuyQueueAfter.length == 0 || callBuyHeadAfter >= callBuyQueueAfter.length
+      || callBuyQueueAfter[callBuyHeadAfter].size == 0;
+    bool putSellQueueEmpty = putSellQueueAfter.length == 0 || putSellHeadAfter >= putSellQueueAfter.length
+      || putSellQueueAfter[putSellHeadAfter].size == 0;
+
+    assertTrue(callBuyQueueEmpty, "Call buy queue should be empty after cancelAllOrders");
+    assertTrue(putSellQueueEmpty, "Put sell queue should be empty after cancelAllOrders");
+  }
+
+  function testCancelAndClose() public {
+    _fund(u1, 10000 * ONE_COIN);
+    _fund(u2, 10000 * ONE_COIN);
+
+    uint256 currentCycleId = mkt.getActiveCycle();
+
+    uint256 tradeSize = 100;
+
+    // Step 1: Create positions - u1 goes long, u2 provides liquidity
+    // u2 provides liquidity first (opposite side)
     vm.startPrank(u2);
-    mkt.placeOrder(MarketSide.PUT_SELL, 1, ONE_COIN, cycleId);
+    mkt.placeOrder(MarketSide.CALL_SELL, tradeSize, 5 * ONE_COIN, currentCycleId); // Sell 100 calls at 5 USDT
+    mkt.placeOrder(MarketSide.PUT_BUY, tradeSize, 3 * ONE_COIN, currentCycleId); // Buy 100 puts at 3 USDT
+    vm.stopPrank();
+
+    // u1 goes long (CALL_BUY + PUT_SELL) and hits u2's liquidity
+    vm.startPrank(u1);
+    mkt.long(
+      tradeSize, // size: 100 contracts (both calls and puts)
+      5 * ONE_COIN, // callBuyPrice: 5 USDT (matches u2's ask)
+      3 * ONE_COIN, // putSellPrice: 3 USDT (matches u2's bid)
+      currentCycleId
+    );
+    vm.stopPrank();
+
+    // Verify positions were created
+    MarketWithViews.UserAccount memory ua1 = mkt.getUserAccount(u1);
+
+    assertEq(ua1.longCalls, tradeSize, "u1 should have 100 long calls");
+    assertEq(ua1.shortPuts, tradeSize, "u1 should have 100 short puts");
+
+    // Step 2: u1 places additional orders (same direction as their long position)
+    vm.startPrank(u1);
+
+    // Place limit orders that won't cross (consistent direction: CALL_BUY and PUT_SELL)
+    mkt.placeOrder(MarketSide.CALL_BUY, 50, 1 * ONE_COIN, currentCycleId); // Low buy - won't cross
+    mkt.placeOrder(MarketSide.PUT_SELL, 30, 10 * ONE_COIN, currentCycleId); // High sell - won't cross
+
+    // Place market orders that will go to taker queue (no matching liquidity)
+    mkt.placeOrder(MarketSide.CALL_BUY, 20, 0, currentCycleId); // Market buy - no asks available
+    mkt.placeOrder(MarketSide.PUT_SELL, 15, 0, currentCycleId); // Market sell - no bids available
+
+    vm.stopPrank();
+
+    // Verify orders are in book and queue
+    uint32 callBuyKey = _key(_tick(1 * ONE_COIN), false, true);
+    uint32 putSellKey = _key(_tick(10 * ONE_COIN), true, false);
+
+    assertEq(mkt.levels(callBuyKey).vol, 50, "Call buy order should be in book");
+    assertEq(mkt.levels(putSellKey).vol, 30, "Put sell order should be in book");
+
+    // Step 3: Call cancelAndClose with specific amounts
+    // These amounts should match the positions to close them
+    uint256 callCloseSize = tradeSize; // Close 100 long calls (need CALL_SELL)
+    uint256 callClosePrice = 8 * ONE_COIN; // Willing to sell calls for at least 8 USDT
+    uint256 putCloseSize = tradeSize; // Close 100 short puts (need PUT_BUY)
+    uint256 putClosePrice = 6 * ONE_COIN; // Willing to pay up to 6 USDT per put
+
+    vm.startPrank(u1);
+    mkt.cancelAndClose(0, callClosePrice, putClosePrice, 0);
+    vm.stopPrank();
+
+    // Step 4: Verify old orders were cancelled
+    assertEq(mkt.levels(callBuyKey).vol, 0, "Old call buy order should be cancelled");
+    assertEq(mkt.levels(putSellKey).vol, 0, "Old put sell order should be cancelled");
+
+    // Verify taker queues are cleared
+    (TakerQ[] memory callBuyQueueAfter) = mkt.viewTakerQueue(MarketSide.CALL_BUY);
+    (TakerQ[] memory putSellQueueAfter) = mkt.viewTakerQueue(MarketSide.PUT_SELL);
+
+    // Check if old market orders' sizes are zero
+
+    bool callBuyQueueCleared = callBuyQueueAfter[0].size == 0;
+    bool putSellQueueCleared = putSellQueueAfter[0].size == 0;
+
+    assertTrue(callBuyQueueCleared, "Call buy queue should be cleared");
+    assertTrue(putSellQueueCleared, "Put sell queue should be cleared");
+
+    // Step 5: Verify new closing orders were placed
+    uint32 newCallSellKey = _key(_tick(callClosePrice), false, false); // CALL_SELL
+    uint32 newPutBuyKey = _key(_tick(putClosePrice), true, true); // PUT_BUY
+
+    // Check if the new orders are in the book
+    uint256 newCallSellVol = mkt.levels(newCallSellKey).vol;
+    uint256 newPutBuyVol = mkt.levels(newPutBuyKey).vol;
+
+    assertTrue(newCallSellVol > 0, "New call sell order should be placed");
+    assertTrue(newPutBuyVol > 0, "New put buy order should be placed");
+
+    // Verify the final positions
+    ua1 = mkt.getUserAccount(u1);
+    assertEq(tradeSize, ua1.longCalls, "Trade size should match long calls");
+    assertEq(tradeSize, ua1.pendingShortCalls, "Trade size should match pending short calls");
+    assertEq(tradeSize, ua1.pendingLongPuts, "Trade size should match pending long puts");
+    assertEq(tradeSize, ua1.shortPuts, "Trade size should match short puts");
   }
 
   // #######################################################################
@@ -1332,7 +1537,8 @@ contract MarketSuite is Test {
     mkt.settleChunk(100, false);
     lg = vm.getRecordedLogs();
 
-    uint256 liqFeePaid = _getLiquidationFeePaid(lg);
+    // The liq fee paid is emitted in the Settled event, so will show as the user's 'pnl' int he events
+    uint256 liqFeePaid = _getLiquidationFeePaidFromSettledEvent(lg, u1);
 
     // The liquidation fee we recoup will be less than that first calculated, as we wait until after taker fees +
     // premiums are paid
@@ -1341,10 +1547,6 @@ contract MarketSuite is Test {
       liqFeeOwed - fee - (premiumPrice * orderSize),
       "liquidation fee paid should be equal to liquidation fee owed"
     );
-
-    // Check user doesn't get any pnl on settlement. In this case, as liquidation orders are filled, pnl should be zero
-    int256 pnl = _getPnl(lg, u1);
-    assertEq(pnl, 0, "pnl should be zero");
   }
 
   function testLiquidationFromPriceFall_OrdersUnfilled() public {
@@ -1402,7 +1604,7 @@ contract MarketSuite is Test {
     Vm.Log[] memory logs = vm.getRecordedLogs();
 
     // a) liquidation fee was paid in full to feeRecipient
-    uint256 liqFeePaid = _getLiquidationFeePaid(logs);
+    uint256 liqFeePaid = _getLiquidationFeePaidFromSettledEvent(logs, u1);
     assertEq(liqFeePaid, balBeforeLiq, "fee recipient should seize full balance");
 
     // b) user keeps nothing, flags are cleared
@@ -1411,11 +1613,7 @@ contract MarketSuite is Test {
     assertFalse(uaFinal.liquidationQueued, "liq flag should be cleared");
     assertEq(uaFinal.liquidationFeeOwed, 0, "liqFeeOwed should be zeroed");
 
-    // c) PnL event for liquidated user must be zero
-    int256 pnl = _getPnl(logs, u1);
-    assertEq(pnl, 0, "liquidated user should record zero pnl");
-
-    // d) settlement wiped the taker queue
+    // c) settlement wiped the taker queue
     (TakerQ[] memory qFinal) = mkt.viewTakerQueue(MarketSide.PUT_BUY);
     assertTrue(qFinal.length == 0, "queue should be cleared after settlement");
   }
@@ -1508,13 +1706,9 @@ contract MarketSuite is Test {
     mkt.settleChunk(100, false); // both phases
     lg = vm.getRecordedLogs();
 
-    uint256 liqFeePaid = _getLiquidationFeePaid(lg);
+    uint256 liqFeePaid = _getLiquidationFeePaidFromSettledEvent(lg, u1);
     // liquidation-fee paid = fee owed – (premium + takerFee) consumed inside liquidate
     assertEq(liqFeePaid, liqFeeOwed - fee - (premiumPrice * orderSize), "liquidation fee paid incorrect");
-
-    // liquidated trader should get **zero** pnl
-    int256 pnl = _getPnl(lg, u1);
-    assertEq(pnl, 0, "pnl should be zero for liquidated trader");
   }
 
   function testLiquidationFromPricePump_OrdersUnfilled() public {
@@ -1566,12 +1760,13 @@ contract MarketSuite is Test {
     // ---------------------------------------------------------------------
     vm.startPrank(owner);
     vm.recordLogs();
+    uint256 balBeforeLiqCall = mkt.getUserAccount(u1).balance;
     mkt.liquidate(u1);
     lg = vm.getRecordedLogs();
     vm.stopPrank();
 
     uint256 liqFeeOwed = _getLiquidationFeeOwed(lg);
-    assertEq(liqFeeOwed, mkt.getUserAccount(u1).balance, "liqFeeOwed != remaining balance");
+    assertEq(liqFeeOwed, balBeforeLiqCall, "liqFeeOwed != remaining balance");
 
     // Liquidation flag must still be set (positions not yet closed)
     assertTrue(mkt.getUserAccount(u1).liquidationQueued, "liq flag should stay true");
@@ -1592,13 +1787,9 @@ contract MarketSuite is Test {
     lg = vm.getRecordedLogs();
 
     // Entire balance seized as liquidation fee
-    uint256 liqFeePaid = _getLiquidationFeePaid(lg);
+    uint256 liqFeePaid = _getLiquidationFeePaidFromSettledEvent(lg, u1);
     assertEq(liqFeePaid, liqFeeOwed, "liqFeePaid mismatch");
     assertEq(mkt.getUserAccount(u1).balance, 0, "u1 balance should be zero");
-
-    // Settled event for u1 must carry 0 PnL
-    int256 pnl = _getPnl(lg, u1);
-    assertEq(pnl, 0, "pnl should be zero for liquidated trader");
 
     // Flags & fee-owed cleared after settlement
     MarketWithViews.UserAccount memory ua = mkt.getUserAccount(u1);
@@ -1618,7 +1809,6 @@ contract MarketSuite is Test {
   function testLiquidationFromPremiumOverpayment_Long() public {
     uint256 MM_BPS = 10;
     uint256 denominator = 10000;
-    uint256 TAKER_FEE_BPS = 700;
 
     //------------------------------------------------------------
     // 0.  Constants & helpers
@@ -1634,7 +1824,7 @@ contract MarketSuite is Test {
     // deposit JUST enough to satisfy margin **before** the trade,
     // plus the premium that will later be paid (callAskPrice*5) and taker fees
     uint256 premiumPay = orderSize * callAskPrice; // 5.000000
-    uint256 takerFeeCall = premiumPay * TAKER_FEE_BPS / denominator; // 0.350000
+    uint256 takerFeeCall = premiumPay * uint256(TAKER_FEE_BPS) / denominator; // 0.350000
     uint256 deposit = premiumPay + takerFeeCall + mmNeeded + 1; // ≈ 10.4 USDT
 
     //------------------------------------------------------------
@@ -1704,7 +1894,7 @@ contract MarketSuite is Test {
     uint256 liqPremiumPay = orderSize * putBidPrice;
     assertEq(
       ua.balance,
-      balanceBefore - liqPremiumPay - liqPremiumPay * TAKER_FEE_BPS / denominator,
+      balanceBefore - liqPremiumPay - liqPremiumPay * uint256(TAKER_FEE_BPS) / denominator,
       "user balance should be confiscated"
     );
 
@@ -1739,7 +1929,6 @@ contract MarketSuite is Test {
     // (b) event decoding
     bool seenFeeSinkSettle;
     bool seenUserSettle;
-    bool seenLiqFee;
     int256 pnlFeeSink;
     int256 pnlUser;
     uint256 liqFeeAmt;
@@ -1758,19 +1947,13 @@ contract MarketSuite is Test {
         }
         if (trader == u1) {
           seenUserSettle = true;
-          pnlUser = pnl;
+          liqFeeAmt = uint256(-pnl);
         }
-      }
-      // LiquidationFeePaid(...)
-      if (logs[i].topics[0] == LIQ_FEE_SIG && address(uint160(uint256(logs[i].topics[2]))) == u1) {
-        seenLiqFee = true;
-        liqFeeAmt = abi.decode(logs[i].data, (uint256));
       }
     }
 
     require(seenFeeSinkSettle, "feeSink Settled evt missing");
     require(seenUserSettle, "user Settled evt missing");
-    require(seenLiqFee, "LiquidationFeePaid evt missing");
 
     // (c) feeSink PnL  = intrinsic of 5 long-CALLs, 20 000 USDT ITM
     uint256 priceDiff = 20_000 * ONE_COIN; // 20 000 USDT (6-dp)
@@ -1785,6 +1968,105 @@ contract MarketSuite is Test {
     assertEq(liqFeeAmt, expectedLiqFee, "liq fee amount mismatch");
   }
 
+  function testLiquidationLimitPriceAdjustmentInEvent() public {
+    uint256 smallBalance = 4 * ONE_COIN;
+    uint256 largeBalance = 100000 * ONE_COIN;
+
+    _fund(u1, smallBalance); // Victim (will be liquidated)
+    _fund(u2, largeBalance); // Counterparty and liquidity provider
+
+    uint256 currentCycleId = mkt.getActiveCycle();
+    uint256 orderSize = 2;
+    uint256 premiumPrice = ONE_COIN;
+
+    // u1 sells call options
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, orderSize, premiumPrice, currentCycleId);
+    vm.stopPrank();
+
+    // u2 buys the call options
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, orderSize, premiumPrice, currentCycleId);
+    vm.stopPrank();
+
+    // BTC price pumps massively, making u1's short call position liquidatable
+    _mockOracle(btcPrice + 50000); // +50k USD pump
+
+    // Verify u1 is now liquidatable
+    assertTrue(mkt.isLiquidatable(u1), "u1 should be liquidatable after price pump");
+
+    // Record u1's balance before liquidation
+    uint256 u1BalanceBeforeLiq = mkt.getUserAccount(u1).balance;
+    console.log("u1 balance before liquidation:", u1BalanceBeforeLiq);
+
+    // Liquidate u1 (this creates market orders to close their short calls)
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+    vm.stopPrank();
+
+    // u2 provides liquidity at a very high price to fill the liquidation order
+    uint256 highPrice = 10000 * ONE_COIN; // Can't afford this
+
+    vm.recordLogs();
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, orderSize, highPrice, currentCycleId);
+    vm.stopPrank();
+
+    Vm.Log[] memory logs = vm.getRecordedLogs();
+
+    // Find the LimitOrderFilled event and check the limitPrice parameter
+    bool foundLimitOrderFilled = false;
+    uint256 eventLimitPrice = 0;
+    int256 eventCashTaker = 0;
+
+    for (uint256 i = 0; i < logs.length; i++) {
+      if (
+        logs[i].topics[0]
+          == keccak256(
+            "LimitOrderFilled(uint256,uint256,int256,uint256,uint256,uint8,address,address,int256,int256,uint256)"
+          )
+      ) {
+        // Decode the event data
+        (
+          ,
+          int256 takerOrderId,
+          ,
+          uint256 limitPrice, // This is actually the adjusted price
+          ,
+          int256 cashTaker,
+          ,
+        ) = abi.decode(logs[i].data, (uint256, int256, uint256, uint256, uint8, int256, int256, uint256));
+
+        // Check if this is the liquidation order (negative taker order ID)
+        if (takerOrderId < 0) {
+          foundLimitOrderFilled = true;
+          eventLimitPrice = limitPrice; // This should be the adjusted price
+          eventCashTaker = cashTaker;
+
+          console.log("  Event limit price:", eventLimitPrice);
+          break;
+        }
+      }
+    }
+
+    assertTrue(foundLimitOrderFilled, "LimitOrderFilled event should be found for liquidation order");
+
+    // The key assertion: event limit price should be the adjusted price (user's balance / size)
+    // NOT the obscenely high limit price that the maker posted
+    uint256 expectedAdjustedPrice =
+      (u1BalanceBeforeLiq - (u1BalanceBeforeLiq * uint256(TAKER_FEE_BPS) / 10_000)) / orderSize;
+
+    assertEq(eventLimitPrice, expectedAdjustedPrice, "Event limit price should be adjusted to actual amount paid");
+    assertNotEq(eventLimitPrice, highPrice, "Event limit price should NOT be the maker's high limit price");
+
+    // Additional verification: cash flows should match the adjusted price
+    uint256 actualPremiumPaid = uint256(-eventCashTaker); // cashTaker is negative when buying
+    assertEq(actualPremiumPaid, u1BalanceBeforeLiq, "Actual premium paid should equal user's remaining balance");
+
+    // Verify u1's balance is now zero
+    assertEq(mkt.getUserAccount(u1).balance, 0, "u1 balance should be zero after liquidation order execution");
+  }
+
   function testLiquidationFromPremiumOverpayment_Short() public {}
 
   function testLiquidationFeeNotZeroedBug() public {
@@ -1793,7 +2075,7 @@ contract MarketSuite is Test {
     _fund(u2, 1000 * ONE_COIN);
 
     // u1 goes short calls
-    uint256 currentCycleId = mkt.activeCycle();
+    uint256 currentCycleId = mkt.getActiveCycle();
     vm.startPrank(u2);
     mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
@@ -1838,7 +2120,7 @@ contract MarketSuite is Test {
     _fund(u1, collateral);
     _fund(u2, 1000 * ONE_COIN);
 
-    uint256 currentCycleId = mkt.activeCycle();
+    uint256 currentCycleId = mkt.getActiveCycle();
     vm.startPrank(u2);
     mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, currentCycleId);
     vm.stopPrank();
@@ -1909,7 +2191,7 @@ contract MarketSuite is Test {
     _fund(u1, user1Collateral);
     _fund(u2, user2Collateral);
 
-    uint256 currentCycleId = mkt.activeCycle();
+    uint256 currentCycleId = mkt.getActiveCycle();
     uint256 callBuyPrice = 4 * ONE_COIN; // 4 USDT for calls
     uint256 callSellPrice = 3 * ONE_COIN; // 3 USDT for calls (lower, so orders will cross)
     uint256 putBuyPrice = 2 * ONE_COIN; // 2 USDT for puts
@@ -2063,7 +2345,7 @@ contract MarketSuite is Test {
     _fund(u1, user1Collateral);
     _fund(u2, user2Collateral);
 
-    uint256 currentCycleId = mkt.activeCycle();
+    uint256 currentCycleId = mkt.getActiveCycle();
     uint256 callBuyPrice = 4 * ONE_COIN; // 4 USDT for calls
     uint256 callSellPrice = 3 * ONE_COIN; // 3 USDT for calls (lower, so orders will cross)
     uint256 putBuyPrice = 2 * ONE_COIN; // 2 USDT for puts
@@ -2151,29 +2433,12 @@ contract MarketSuite is Test {
     mkt.settleChunk(100, false);
     Vm.Log[] memory settlementLogs = vm.getRecordedLogs();
 
-    // Check if LiquidationFeePaid event was emitted for User 1
-    // In this case, the user's balance was NOT consumed by liquidation order execution,
-    // so the liquidation fee should be paid during settlement
-    bool foundLiquidationFeePaid = false;
-    uint256 liquidationFeePaid = 0;
-
-    for (uint256 i = 0; i < settlementLogs.length; i++) {
-      if (settlementLogs[i].topics[0] == keccak256("LiquidationFeePaid(uint256,address,uint256)")) {
-        address liquidatedUser = address(uint160(uint256(settlementLogs[i].topics[2])));
-        if (liquidatedUser == u1) {
-          foundLiquidationFeePaid = true;
-          (liquidationFeePaid) = abi.decode(settlementLogs[i].data, (uint256));
-          break;
-        }
-      }
-    }
+    // Get liquidation fee paid from Settled event
+    uint256 liquidationFeePaid = _getLiquidationFeePaidFromSettledEvent(settlementLogs, u1);
 
     // In this test case, the liquidation orders were NOT filled, so the user's balance
     // should be available during settlement to pay the liquidation fee
-    assertTrue(
-      foundLiquidationFeePaid, "LiquidationFeePaid event should be emitted when liquidation orders remain unfilled"
-    );
-    console.log("Liquidation fee paid during settlement:", liquidationFeePaid);
+    assertEq(liquidationFeePaid, u1BalanceBeforeLiq, "Liquidation fee should be paid during settlement");
 
     // Verify User 1's final state after settlement
     ua1 = mkt.getUserAccount(u1);
@@ -2445,7 +2710,7 @@ contract MarketSuite is Test {
 
   // helper: open a 1-contract CALL long/short pair at 1 USDT premium
   function _openCallPair(address longAddr, address shortAddr) internal {
-    uint256 currentCycleId = mkt.activeCycle();
+    uint256 currentCycleId = mkt.getActiveCycle();
     // shortAddr posts ask
     vm.startPrank(shortAddr);
     mkt.placeOrder(MarketSide.CALL_SELL, 1, ONE_COIN, currentCycleId);
@@ -2510,11 +2775,12 @@ contract MarketSuite is Test {
     return side == MarketSide.CALL_BUY || side == MarketSide.PUT_BUY;
   }
 
-  function _getLiquidationFeePaid(Vm.Log[] memory logs) internal pure returns (uint256) {
+  function _getLiquidationFeePaidFromSettledEvent(Vm.Log[] memory logs, address trader) internal pure returns (uint256) {
     for (uint256 i; i < logs.length; ++i) {
-      if (logs[i].topics[0] == keccak256("LiquidationFeePaid(uint256,address,uint256)")) {
-        (uint256 liqFeePaid) = abi.decode(logs[i].data, (uint256));
-        return liqFeePaid;
+      if (logs[i].topics[0] == keccak256("Settled(uint256,address,int256)")) {
+        address t = address(uint160(uint256(logs[i].topics[2])));
+        int256 pnl = abi.decode(logs[i].data, (int256));
+        if (trader == t) return uint256(-pnl);
       }
     }
     return 0;
@@ -2696,30 +2962,153 @@ contract MarketSuite is Test {
   }
 
   function _getNeelBalance(address neel) internal view returns (uint256) {
-    (
-      bool active,
-      bool liquidationQueued,
-      uint64 balance,
-      uint64 liquidationFeeOwed,
-      uint64 scratchPnL,
-      uint48 _gap,
-      uint32 longCalls,
-      uint32 shortCalls,
-      uint32 longPuts,
-      uint32 shortPuts,
-      uint32 pendingLongCalls,
-      uint32 pendingShortCalls,
-      uint32 pendingLongPuts,
-      uint32 pendingShortPuts
-    ) = mkt.userAccounts(neel);
-    return balance;
+    return mkt.getUserAccount(neel).balance;
   }
 
   function testPlaceOrderNoBalance() public {
     vm.startPrank(u1);
+    vm.expectRevert(abi.encodeWithSelector(Errors.InsufficientBalance.selector));
     mkt.placeOrder(MarketSide.CALL_BUY, 1, 291020, cycleId);
     vm.stopPrank();
+  }
 
-    console.log("Neel balance:", _getNeelBalance(u1));
+  // #######################################################################
+  // #                                                                     #
+  // #                      MarketExtension Tests                          #
+  // #                                                                     #
+  // #######################################################################
+
+  function testGetNumTradersReturnsOne() public {
+    // Fund one user and have them place an order to add them to traders array
+    _fund(u1, 10 * ONE_COIN);
+
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_BUY, 1, ONE_COIN, cycleId);
+    vm.stopPrank();
+
+    // Call getNumTraders through the fallback pattern
+    uint256 numTraders = MarketExtension(address(mkt)).getNumTraders();
+
+    // Should return 1 since we have one active trader
+    assertEq(numTraders, 1, "getNumTraders should return 1");
+  }
+
+  function testLiquidationFeeAccountingBug() public {
+    console.log("=== Testing Liquidation Fee Accounting Bug ===");
+
+    // Setup: User with small balance goes short, then gets liquidated when price moves against them
+    uint256 smallBalance = 700e6; // 700 USDT - small balance
+    uint256 largeBalance = 100000e6; // 100,000 USDT for counterparty
+
+    _fund(u1, smallBalance); // Victim (will be liquidated)
+    _fund(u2, largeBalance); // Counterparty with large balance
+
+    // u1 sells 100 call options for 1 USDT premium each (100 USDT total premium)
+    vm.startPrank(u1);
+    mkt.placeOrder(MarketSide.CALL_SELL, 100, 1e6, cycleId); // Sell 100 calls at 1 USDT each
+
+    // u2 buys the call options
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_BUY, 100, 1e6, cycleId);
+
+    // Check initial balances after trade
+    uint256 u1BalanceAfterTrade = mkt.getUserAccount(u1).balance;
+    uint256 feeRecipientBalanceAfterTrade = mkt.getUserAccount(feeSink).balance;
+
+    console.log("u1 balance after trade:", u1BalanceAfterTrade);
+    console.log("Fee recipient balance after trade:", feeRecipientBalanceAfterTrade);
+
+    // BTC price pumps massively, making u1's short call position underwater
+    uint256 newBtcPrice = btcPrice + 50000; // +50k USD pump
+    _mockOracle(newBtcPrice);
+
+    // u1 is now liquidatable
+    assertTrue(mkt.isLiquidatable(u1), "u1 should be liquidatable after price pump");
+
+    // Record balances before liquidation
+    uint256 u1BalanceBeforeLiq = mkt.getUserAccount(u1).balance;
+    uint256 feeBalanceBeforeLiq = mkt.getUserAccount(feeSink).balance;
+    uint256 contractUsdtBalanceBeforeLiq = usdt.balanceOf(address(mkt));
+
+    console.log("Before liquidation:");
+    console.log("  u1 balance:", u1BalanceBeforeLiq);
+    console.log("  Fee recipient balance:", feeBalanceBeforeLiq);
+    console.log("  Contract USDT balance:", contractUsdtBalanceBeforeLiq);
+
+    // Liquidate u1
+    vm.startPrank(owner);
+    mkt.liquidate(u1);
+
+    // u2 provides liquidity to fill the liquidation order at a high premium
+    // The premium should be much higher than u1's remaining balance per contract
+    uint256 liquidationPremium = 20e6; // 20 USDT premium per contract - much higher than u1 can afford
+    vm.startPrank(u2);
+    mkt.placeOrder(MarketSide.CALL_SELL, 100, liquidationPremium, cycleId);
+
+    // Record balances after liquidation
+    uint256 u1BalanceAfterLiq = mkt.getUserAccount(u1).balance;
+    uint256 feeBalanceAfterLiq = mkt.getUserAccount(feeSink).balance;
+    uint256 u2BalanceAfterLiq = mkt.getUserAccount(u2).balance;
+    uint256 contractUsdtBalanceAfterLiq = usdt.balanceOf(address(mkt));
+
+    console.log("After liquidation:");
+    console.log("  u1 balance:", u1BalanceAfterLiq);
+    console.log("  u2 balance:", u2BalanceAfterLiq);
+    console.log("  Fee recipient balance:", feeBalanceAfterLiq);
+    console.log("  Contract USDT balance:", contractUsdtBalanceAfterLiq);
+
+    // Calculate expected vs actual fee amounts
+    uint256 actualPremiumPaid = u1BalanceBeforeLiq; // u1's balance was zeroed, so this is what they actually paid
+    // Net house fee = taker fee (7%) + maker fee (-2%) = 5% of premium
+    uint256 netHouseFeeBps = 500; // 700 + (-200) = 500 basis points = 5%
+    uint256 expectedFeesOnActualPremium = actualPremiumPaid * netHouseFeeBps / 10_000;
+    uint256 expectedFeesOnFullPremium = (liquidationPremium * 100) * netHouseFeeBps / 10_000;
+
+    uint256 actualFeesCollected = feeBalanceAfterLiq - feeBalanceBeforeLiq;
+
+    console.log("Premium analysis:");
+    console.log("  Liquidation order premium per contract:", liquidationPremium);
+    console.log("  Total liquidation order premium:", liquidationPremium * 100);
+    console.log("  Actual premium paid by u1:", actualPremiumPaid);
+    console.log("  Expected fees on actual premium:", expectedFeesOnActualPremium);
+    console.log("  Expected fees on full premium:", expectedFeesOnFullPremium);
+    console.log("  Actual fees collected:", actualFeesCollected);
+
+    // Verify the fix: Fees should now be calculated on actual premium paid
+    console.log("FIX VERIFICATION:");
+    if (actualFeesCollected == expectedFeesOnActualPremium) {
+      console.log("  [OK] FIX WORKING: Fees correctly calculated on actual premium");
+    } else {
+      console.log("  [X] ISSUE: Fee calculation still incorrect");
+      console.log("  Expected fees on actual premium:", expectedFeesOnActualPremium);
+      console.log("  Actual fees collected:", actualFeesCollected);
+    }
+
+    // Calculate total accounting vs actual tokens
+    uint256 totalAccountingBalances =
+      mkt.getUserAccount(u1).balance + mkt.getUserAccount(u2).balance + mkt.getUserAccount(feeSink).balance;
+
+    console.log("Accounting vs Reality:");
+    console.log("  Total user account balances:", totalAccountingBalances);
+    console.log("  Actual USDT tokens in contract:", contractUsdtBalanceAfterLiq);
+    console.log(
+      "  Discrepancy:",
+      totalAccountingBalances > contractUsdtBalanceAfterLiq ? totalAccountingBalances - contractUsdtBalanceAfterLiq : 0
+    );
+
+    // Verify accounting balance matches actual tokens
+    if (totalAccountingBalances <= contractUsdtBalanceAfterLiq) {
+      console.log("  [OK] ACCOUNTING FIXED: Balances match actual tokens");
+    } else {
+      console.log("  [X] ACCOUNTING ISSUE: Phantom value still exists");
+    }
+
+    // Assert that the fix works
+    assertEq(actualFeesCollected, expectedFeesOnActualPremium, "Fees should be calculated on actual premium paid");
+
+    assertTrue(
+      totalAccountingBalances <= contractUsdtBalanceAfterLiq,
+      "Total accounting balances should not significantly exceed actual tokens"
+    );
   }
 }

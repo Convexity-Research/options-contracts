@@ -5,6 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {console} from "forge-std/console.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Market} from "../src/Market.sol";
+import {MarketExtension} from "../src/MarketExtension.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 contract DeployUUPSProxy is Script {
@@ -19,14 +20,22 @@ contract DeployUUPSProxy is Script {
     console.log("Deploying with account:", upgrader);
     console.log("Account balance:", upgrader.balance);
 
-    // 1. Deploy the implementation contract
-    Market newImplementation = new Market();
-    console.log("Implementation deployed at:", address(newImplementation));
+    // 1. Deploy Market and MarketExtension impl
+    Market newMarket = new Market();
+    MarketExtension newMarketExtension = new MarketExtension();
 
-    // 2. Upgrade
-    UUPSUpgradeable(address(marketProxy1)).upgradeToAndCall(address(newImplementation), "");
-    UUPSUpgradeable(address(marketProxy2)).upgradeToAndCall(address(newImplementation), "");
-    console.log("Proxy upgraded");
+    console.log("Market impl deployed at:", address(newMarket));
+    console.log("MarketExtension impl deployed at:", address(newMarketExtension));
+
+    // 3. Upgrade
+    UUPSUpgradeable(address(marketProxy1)).upgradeToAndCall(address(newMarket), "");
+    UUPSUpgradeable(address(marketProxy2)).upgradeToAndCall(address(newMarket), "");
+    console.log("Market upgraded");
+
+    // 4. Set market extension
+    Market(address(marketProxy1)).setExtension(address(newMarketExtension));
+    Market(address(marketProxy2)).setExtension(address(newMarketExtension));
+    console.log("Market extension set");
 
     vm.stopBroadcast();
   }

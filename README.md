@@ -75,8 +75,6 @@ Uses a precompile at address `0x0000000000000000000000000000000000000806` for pr
 uint256 constant TICK_SZ = 1e4;              // 0.01 USDT tick size
 uint256 constant MM_BPS = 10;                 // 0.10% Maintenance Margin
 uint256 constant CONTRACT_SIZE = 100;         // Position size divisor
-int256 constant makerFeeBps = -200;          // -2.00% (rebate to makers)
-int256 constant takerFeeBps = 700;           // +7.00% (fee from takers)
 uint256 constant liquidationFeeBps = 10;     // 0.1% liquidation fee
 uint256 constant DEFAULT_EXPIRY = 1 minutes; // Cycle duration
 ```
@@ -109,20 +107,24 @@ Withdraws USDT collateral from the platform.
 
 ### Trading Functions
 
-#### `long(uint256 size, uint256 cycleId)`
+#### `long(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId)`
 Places a "long" position (buy call + sell put) for directional upward exposure.
 - **Parameters**:
   - `size`: Number of contracts (scaled by CONTRACT_SIZE)
+  - `limitPriceBuy`: Limit price for the call buy order
+  - `limitPriceSell`: Limit price for the put sell order
   - `cycleId`: Target cycle (0 for current active cycle)
-- **Effects**: Places market orders for CALL_BUY and PUT_SELL
+- **Effects**: Places limit orders for CALL_BUY and PUT_SELL
 - **Use Case**: Betting that price will go up
 
-#### `short(uint256 size, uint256 cycleId)`
+#### `short(uint256 size, uint256 limitPriceBuy, uint256 limitPriceSell, uint256 cycleId)`
 Places a "short" position (buy put + sell call) for directional downward exposure.
 - **Parameters**:
   - `size`: Number of contracts
+  - `limitPriceBuy`: Limit price for the put buy order
+  - `limitPriceSell`: Limit price for the call sell order
   - `cycleId`: Target cycle (0 for current active cycle)
-- **Effects**: Places market orders for PUT_BUY and CALL_SELL
+- **Effects**: Places limit orders for PUT_BUY and CALL_SELL
 - **Use Case**: Betting that price will go down
 
 #### `placeOrder(MarketSide side, uint256 size, uint256 limitPrice, uint256 cycleId)`
@@ -137,6 +139,16 @@ Places individual orders with full control over side and price.
   - Market orders: Immediately matched against orderbook, remainder queued
   - Limit orders: Added to orderbook if not crossing
 
+#### `placeMultiOrder(MarketSide[] memory sides, uint256[] memory sizes, uint256[] memory limitPrices, uint256 cycleId)`
+Places multiple orders in a single transaction.
+- **Parameters**:
+  - `sides`: Array of market sides for each order
+  - `sizes`: Array of order sizes
+  - `limitPrices`: Array of limit prices
+  - `cycleId`: Target cycle
+- **Effects**: Executes multiple `placeOrder` calls atomically
+- **Use Case**: Efficiently placing complex multi-leg strategies
+
 #### `cancelOrder(uint256 orderId)`
 Cancels an existing limit order.
 - **Parameters**: `orderId`: ID of order to cancel
@@ -146,6 +158,18 @@ Cancels an existing limit order.
   - User cannot be liquidatable
 - **Effects**: Removes order from orderbook and updates position tracking
 - **Events**: `LimitOrderCancelled`
+
+#### `cancelAndClose(uint256 buyCallPrice, uint256 sellCallPrice, uint256 buyPutPrice, uint256 sellPutPrice)`
+Cancels all existing orders and places neutralizing orders to close net positions.
+- **Parameters**:
+  - `buyCallPrice`: Limit price for buying calls (if net short calls)
+  - `sellCallPrice`: Limit price for selling calls (if net long calls)
+  - `buyPutPrice`: Limit price for buying puts (if net short puts)
+  - `sellPutPrice`: Limit price for selling puts (if net long puts)
+- **Effects**: 
+  - Cancels all maker orders and taker queue entries
+  - Places orders to neutralize net call and put positions
+- **Use Case**: Emergency position closure and risk management
 
 ### Risk Management
 
@@ -162,14 +186,6 @@ Liquidates an undercollateralized trader.
   - Queues liquidation fee collection
 - **Events**: `Liquidated`
 
-#### `isLiquidatable(address trader)` / `isLiquidatable(address trader, uint64 price)`
-Checks if a trader can be liquidated.
-- **Parameters**: 
-  - `trader`: Address to check
-  - `price`: Oracle price (optional, fetches current if not provided)
-- **Returns**: Boolean indicating liquidation eligibility
-- **Formula**: `balance < requiredMargin(netShortExposure * maintenanceMargin + currentLoss)`
-
 ### Cycle Management
 
 #### `startCycle()`
@@ -183,14 +199,75 @@ Initiates a new 1-minute trading cycle.
   - Resets settlement state
 - **Events**: `CycleStarted`
 
-#### `settleChunk(uint256 max)`
+#### `settleChunk(uint256 max, bool pauseNextCycle)`
 Processes settlement for a batch of traders.
-- **Parameters**: `max`: Maximum number of traders to process
+- **Parameters**: 
+  - `max`: Maximum number of traders to process
+  - `pauseNextCycle`: If true, prevents automatic cycle start after settlement (always false unless you are Security Council)
 - **Two-Phase Process**:
   - **Phase 1**: Calculate PnL, debit losers, accumulate winners' PnL
   - **Phase 2**: Credit winners proportionally after social loss calculation
 - **Effects**: Updates trader balances and positions
 - **Events**: `PriceFixed`, `Settled`, `CycleSettled`
+
+### View Functions
+
+#### `getName()`
+Returns the market name.
+- **Returns**: String market name
+
+#### `getCollateralToken()`
+Returns the address of the collateral token.
+- **Returns**: Address of the collateral token (USDT)
+
+#### `getWhitelist(address account)`
+Checks if an address is whitelisted.
+- **Parameters**: `account`: Address to check
+- **Returns**: Boolean indicating whitelist status
+
+#### `getMmBps()`
+Returns the maintenance margin in basis points.
+- **Returns**: Maintenance margin (MM_BPS constant)
+
+#### `getActiveCycle()`
+Returns the current active cycle ID.
+- **Returns**: Active cycle timestamp/ID
+
+#### `getCycles(uint256 cycleId)`
+Returns cycle information for a given cycle ID.
+- **Parameters**: `cycleId`: Cycle to query
+- **Returns**: Cycle struct with strike price, settlement price, and settled status
+
+#### `getUserAccounts(address trader)`
+Returns complete user account information.
+- **Parameters**: `trader`: Address to query
+- **Returns**: UserAccount struct with all position and balance data
+
+#### `getUserOrders(address trader)`
+Returns all order IDs for a given trader.
+- **Parameters**: `trader`: Address to query
+- **Returns**: Array of order IDs
+
+#### `getLevels(uint32 key)`
+Returns orderbook level information for a given key.
+- **Parameters**: `key`: Level key to query
+- **Returns**: Level struct with volume, head, and tail order IDs
+
+#### `getTakerQ(uint256 side)`
+Returns the taker queue for a given market side.
+- **Parameters**: `side`: Market side (0-3 for CALL_BUY, CALL_SELL, PUT_BUY, PUT_SELL)
+- **Returns**: Array of queued taker orders
+
+#### `getNumTraders()`
+Returns the number of active traders in the current cycle.
+- **Returns**: Number of traders
+
+#### `isLiquidatable(address trader)` / `isLiquidatable(address trader, uint64 price)`
+Checks if a trader can be liquidated.
+- **Parameters**: 
+  - `trader`: Address to check
+  - `price`: Oracle price (optional, fetches current if not provided)
+- **Returns**: Boolean indicating liquidation eligibility
 
 ## Settlement Mechanics
 
@@ -201,16 +278,7 @@ For each trader, PnL is calculated based on the intrinsic value of their positio
 
 **Put Options**: `max(strikePrice - settlementPrice, 0) * longPuts - max(strikePrice - settlementPrice, 0) * shortPuts`
 
-### Social Loss Distribution
-When total losses exceed available collateral:
-1. **Phase 1**: Debit all losers immediately, accumulate total positive PnL
-2. **Phase 2**: Calculate loss ratio = `badDebt / totalPositivePnL`
-3. Credit winners: `winnerPnL * (1 - lossRatio)`
 
-### Fee Structure
-- **Maker Fee**: -2.00% (rebate - makers get paid)
-- **Taker Fee**: +7.00% (fee - takers pay)
-- **Liquidation Fee**: 0.1% of notional value being liquidated
 
 ## Risk Parameters
 
